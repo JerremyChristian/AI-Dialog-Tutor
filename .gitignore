@@ -15,6 +15,11 @@ out/
 
 # OS/editor files
 .DS_Store
+Thumbs.db
 
 # PowerShell/Codex-generated cache
 Microsoft/
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
