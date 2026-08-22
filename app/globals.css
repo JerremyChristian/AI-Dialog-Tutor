@@ -8,6 +8,7 @@
   --accent: #2557d6;
   --accent-hover: #1948bc;
   --inactive: #a8b1bc;
+  --active: #16875d;
 }
 
 * {
@@ -118,6 +119,11 @@ h1 {
   box-shadow: 0 0 0 4px rgb(168 177 188 / 18%);
 }
 
+.status-dot-active {
+  background: var(--active);
+  box-shadow: 0 0 0 4px rgb(22 135 93 / 18%);
+}
+
 .start-button {
   width: 100%;
   padding: 14px 20px;
@@ -141,6 +147,11 @@ h1 {
 .start-button:focus-visible {
   outline: 3px solid rgb(37 87 214 / 28%);
   outline-offset: 3px;
+}
+
+.start-button:disabled {
+  cursor: wait;
+  opacity: 0.7;
 }
 
 .transcript {
@@ -180,6 +191,20 @@ h1 {
 
 .transcript-body p {
   margin-bottom: 0;
+}
+
+.debug-messages {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.debug-messages li + li {
+  margin-top: 6px;
+}
+
+.debug-messages time {
+  color: var(--text);
 }
 
 @media (max-width: 560px) {
