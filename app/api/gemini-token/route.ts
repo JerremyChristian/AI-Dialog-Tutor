@@ -1,14 +1,14 @@
 import { GoogleGenAI, Modality } from "@google/genai";
 import { NextResponse } from "next/server";
+import {
+  buildLessonInstruction,
+  GEMINI_LIVE_MODEL,
+} from "../../../lib/lesson-state";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const MODEL = "gemini-3.1-flash-live-preview";
-const SYSTEM_INSTRUCTION =
-  "You are a friendly conversational tutor. Have a natural spoken conversation with the learner. Keep responses concise and conversational. Do not start teaching a structured course yet.";
-
-export async function POST() {
+export async function POST(request: Request) {
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
@@ -19,6 +19,16 @@ export async function POST() {
   }
 
   try {
+    const body = (await request.json()) as { topic?: unknown };
+    const topic = typeof body.topic === "string" ? body.topic.trim() : "";
+    if (!topic || topic.length > 160) {
+      return NextResponse.json(
+        { error: "Lesson topic must be between 1 and 160 characters" },
+        { status: 400 },
+      );
+    }
+
+    const systemInstruction = buildLessonInstruction(topic);
     const client = new GoogleGenAI({ apiKey });
     const now = Date.now();
     const token = await client.authTokens.create({
@@ -27,10 +37,12 @@ export async function POST() {
         newSessionExpireTime: new Date(now + 60_000).toISOString(),
         expireTime: new Date(now + 30 * 60_000).toISOString(),
         liveConnectConstraints: {
-          model: MODEL,
+          model: GEMINI_LIVE_MODEL,
           config: {
             responseModalities: [Modality.AUDIO],
-            systemInstruction: SYSTEM_INSTRUCTION,
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            systemInstruction,
           },
         },
       },

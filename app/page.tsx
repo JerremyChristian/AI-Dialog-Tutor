@@ -13,10 +13,16 @@ import {
   PcmAudioPlayer,
   arrayBufferToBase64,
 } from "../lib/realtime-audio";
-
-const MODEL = "gemini-3.1-flash-live-preview";
-const SYSTEM_INSTRUCTION =
-  "You are a friendly conversational tutor. Have a natural spoken conversation with the learner. Keep responses concise and conversational. Do not start teaching a structured course yet.";
+import {
+  buildLessonInstruction,
+  createLessonState,
+  DEFAULT_LESSON_TOPIC,
+  deriveConcept,
+  deriveResumePoint,
+  GEMINI_LIVE_MODEL,
+  mergeTranscript,
+  type LessonState,
+} from "../lib/lesson-state";
 
 type MicrophoneStatus =
   | "Not active"
@@ -62,6 +68,10 @@ export default function Home() {
   const [aiConnectionStatus, setAiConnectionStatus] =
     useState<AiConnectionStatus>("Not connected");
   const [debugMessages, setDebugMessages] = useState<DebugMessage[]>([]);
+  const [topicInput, setTopicInput] = useState(DEFAULT_LESSON_TOPIC);
+  const [lessonState, setLessonState] = useState<LessonState>(() =>
+    createLessonState(DEFAULT_LESSON_TOPIC),
+  );
 
   const streamRef = useRef<MediaStream | null>(null);
   const sessionRef = useRef<Session | null>(null);
@@ -71,6 +81,11 @@ export default function Home() {
   const isMountedRef = useRef(true);
   const conversationRunRef = useRef(0);
   const assistantSpeakingRef = useRef(false);
+  const assistantTurnActiveRef = useRef(false);
+  const userTranscriptRef = useRef("");
+  const assistantTranscriptRef = useRef("");
+  const lessonStateRef = useRef(lessonState);
+  const resumptionPendingRef = useRef(false);
   const nextMessageIdRef = useRef(0);
 
   const addDebugMessage = (text: string) => {
@@ -84,6 +99,14 @@ export default function Home() {
         text,
       },
     ]);
+  };
+
+  const updateLessonState = (
+    update: (current: LessonState) => LessonState,
+  ) => {
+    const next = update(lessonStateRef.current);
+    lessonStateRef.current = next;
+    setLessonState(next);
   };
 
   const disposeResources = async (sendAudioStreamEnd: boolean) => {
@@ -114,6 +137,8 @@ export default function Home() {
     playerRef.current = null;
     await player?.close();
     assistantSpeakingRef.current = false;
+    assistantTurnActiveRef.current = false;
+    resumptionPendingRef.current = false;
   };
 
   useEffect(() => {
@@ -127,21 +152,89 @@ export default function Home() {
   }, []);
 
   const handleLiveMessage = (message: LiveServerMessage) => {
+    const serverContent = message.serverContent;
+    if (serverContent?.inputTranscription?.text) {
+      const wasInterrupted = lessonStateRef.current.status === "interrupted";
+      userTranscriptRef.current = mergeTranscript(
+        userTranscriptRef.current,
+        serverContent.inputTranscription.text,
+      );
+      updateLessonState((current) => ({
+        ...current,
+        status:
+          current.status === "interrupted"
+            ? "resolving-interruption"
+            : current.status,
+        lastUserTranscript: userTranscriptRef.current,
+      }));
+
+      if (wasInterrupted) {
+        addDebugMessage("Resolving learner interruption");
+      }
+    }
+
+    if (serverContent?.outputTranscription?.text) {
+      if (!assistantTurnActiveRef.current) {
+        assistantTurnActiveRef.current = true;
+        assistantTranscriptRef.current = "";
+      }
+      assistantTranscriptRef.current = mergeTranscript(
+        assistantTranscriptRef.current,
+        serverContent.outputTranscription.text,
+      );
+      updateLessonState((current) => ({
+        ...current,
+        lastAssistantTranscript: assistantTranscriptRef.current,
+      }));
+    }
+
+    if (serverContent?.interrupted) {
+      // Gemini cuts playback immediately. Smoothing a mid-phoneme cutoff is a
+      // later UX refinement; yielding to the learner remains the priority.
+      playerRef.current?.clear();
+      assistantSpeakingRef.current = false;
+      assistantTurnActiveRef.current = false;
+
+      const current = lessonStateRef.current;
+      const interruptedTranscript =
+        assistantTranscriptRef.current || current.lastAssistantTranscript;
+      const currentConcept = deriveConcept(
+        interruptedTranscript,
+        current.currentConcept,
+      );
+      const resumePoint = deriveResumePoint(
+        interruptedTranscript,
+        currentConcept,
+      );
+      updateLessonState((state) => ({
+        ...state,
+        status: "interrupted",
+        currentConcept,
+        resumePoint,
+        interruptionCount: state.interruptionCount + 1,
+        lastAssistantTranscript: interruptedTranscript,
+      }));
+      resumptionPendingRef.current = true;
+      addDebugMessage("Assistant interrupted");
+      addDebugMessage(`Resume point saved: ${resumePoint}`);
+    }
+
     const voiceActivity = message.voiceActivity?.voiceActivityType;
     if (voiceActivity === VoiceActivityType.ACTIVITY_START) {
+      userTranscriptRef.current = "";
       addDebugMessage("User speech started");
+      if (lessonStateRef.current.status === "interrupted") {
+        updateLessonState((current) => ({
+          ...current,
+          status: "resolving-interruption",
+        }));
+        addDebugMessage("Resolving learner interruption");
+      }
     } else if (voiceActivity === VoiceActivityType.ACTIVITY_END) {
       addDebugMessage("User speech ended");
     }
 
-    const serverContent = message.serverContent;
     if (!serverContent) return;
-
-    if (serverContent.interrupted) {
-      playerRef.current?.clear();
-      assistantSpeakingRef.current = false;
-      addDebugMessage("Assistant response interrupted");
-    }
 
     for (const part of serverContent.modelTurn?.parts ?? []) {
       const audio = part.inlineData;
@@ -149,6 +242,17 @@ export default function Home() {
 
       if (!assistantSpeakingRef.current) {
         assistantSpeakingRef.current = true;
+        if (!assistantTurnActiveRef.current) {
+          assistantTurnActiveRef.current = true;
+          assistantTranscriptRef.current = "";
+        }
+        if (resumptionPendingRef.current) {
+          updateLessonState((current) => ({
+            ...current,
+            status: "resuming",
+          }));
+          addDebugMessage("Lesson resuming");
+        }
         addDebugMessage("Assistant response started");
       }
       playerRef.current?.play(audio.data);
@@ -156,11 +260,38 @@ export default function Home() {
 
     if (serverContent.generationComplete) {
       assistantSpeakingRef.current = false;
+      assistantTurnActiveRef.current = false;
+      const current = lessonStateRef.current;
+      const nextConcept = deriveConcept(
+        assistantTranscriptRef.current,
+        current.currentConcept,
+      );
+      updateLessonState((state) => ({
+        ...state,
+        status: state.status === "idle" ? "idle" : "teaching",
+        currentConcept: nextConcept,
+        lastAssistantTranscript:
+          assistantTranscriptRef.current || state.lastAssistantTranscript,
+      }));
+      if (nextConcept !== current.currentConcept) {
+        addDebugMessage(`Current concept updated: ${nextConcept}`);
+      }
+      resumptionPendingRef.current = false;
       addDebugMessage("Assistant response completed");
     }
   };
 
   const startConversation = async () => {
+    const lessonTopic = topicInput.trim() || DEFAULT_LESSON_TOPIC;
+    const initialLessonState = createLessonState(lessonTopic);
+    lessonStateRef.current = initialLessonState;
+    setLessonState(initialLessonState);
+    setTopicInput(lessonTopic);
+    userTranscriptRef.current = "";
+    assistantTranscriptRef.current = "";
+    resumptionPendingRef.current = false;
+    addDebugMessage(`Lesson initialized: ${lessonTopic}`);
+
     const run = ++conversationRunRef.current;
     setMicrophoneStatus("Requesting permission");
     setAiConnectionStatus("Not connected");
@@ -195,6 +326,8 @@ export default function Home() {
         method: "POST",
         cache: "no-store",
         signal: tokenRequest.signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topic: lessonTopic }),
       });
       const tokenBody = (await tokenResponse.json()) as {
         token?: string;
@@ -209,16 +342,19 @@ export default function Home() {
       tokenRequestRef.current = null;
       addDebugMessage("Gemini token received");
       addDebugMessage("Live connection opening");
+      const systemInstruction = buildLessonInstruction(lessonTopic);
 
       const ai = new GoogleGenAI({
         apiKey: tokenBody.token,
         httpOptions: { apiVersion: "v1beta" },
       });
       const session = await ai.live.connect({
-        model: MODEL,
+        model: GEMINI_LIVE_MODEL,
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: SYSTEM_INSTRUCTION,
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          systemInstruction,
         },
         callbacks: {
           onopen: () => {
@@ -247,6 +383,10 @@ export default function Home() {
               void disposeResources(false).then(() => {
                 if (isMountedRef.current && hadMicrophone) {
                   setMicrophoneStatus("Not active");
+                  updateLessonState((current) => ({
+                    ...current,
+                    status: "idle",
+                  }));
                   addDebugMessage("Microphone stopped");
                 }
               });
@@ -280,6 +420,14 @@ export default function Home() {
       }
 
       addDebugMessage("Microphone streaming started");
+      updateLessonState((current) => ({
+        ...current,
+        status: "teaching",
+      }));
+      addDebugMessage("Lesson started");
+      session.sendRealtimeInput({
+        text: `Begin the spoken lesson about ${lessonTopic} now. Briefly preview the lesson, then teach the first concept.`,
+      });
     } catch (error) {
       if (!isMountedRef.current || run !== conversationRunRef.current) return;
 
@@ -299,6 +447,7 @@ export default function Home() {
         addDebugMessage(`Realtime error: ${getRealtimeErrorMessage(error)}`);
         await disposeResources(false);
         setMicrophoneStatus("Not active");
+        updateLessonState((current) => ({ ...current, status: "idle" }));
         addDebugMessage("Microphone stopped");
       } else {
         setMicrophoneStatus("Error");
@@ -314,6 +463,7 @@ export default function Home() {
     const hadSession = Boolean(sessionRef.current);
     setMicrophoneStatus("Not active");
     setAiConnectionStatus("Not connected");
+    updateLessonState((current) => ({ ...current, status: "idle" }));
     await disposeResources(true);
 
     if (hadMicrophone) addDebugMessage("Microphone stopped");
@@ -334,6 +484,17 @@ export default function Home() {
             A simple workspace for realtime, voice-guided conversation.
           </p>
         </header>
+
+        <label className="topic-field">
+          <span>Lesson topic</span>
+          <input
+            type="text"
+            value={topicInput}
+            onChange={(event) => setTopicInput(event.target.value)}
+            maxLength={160}
+            disabled={microphoneActive || requestingPermission}
+          />
+        </label>
 
         <div className="status-row" aria-label="Conversation status">
           <div className="status-item" aria-live="polite">
@@ -370,6 +531,43 @@ export default function Home() {
               ? "Requesting Permission..."
               : "Start Conversation"}
         </button>
+
+        <section className="lesson-state" aria-labelledby="lesson-state-title">
+          <div className="panel-heading">
+            <h2 id="lesson-state-title">Lesson State</h2>
+            <span>Development</span>
+          </div>
+          <dl>
+            <div>
+              <dt>Topic</dt>
+              <dd>{lessonState.topic}</dd>
+            </div>
+            <div>
+              <dt>Status</dt>
+              <dd>{lessonState.status}</dd>
+            </div>
+            <div>
+              <dt>Current concept</dt>
+              <dd>{lessonState.currentConcept || "-"}</dd>
+            </div>
+            <div>
+              <dt>Resume point</dt>
+              <dd>{lessonState.resumePoint || "-"}</dd>
+            </div>
+            <div>
+              <dt>Interruptions</dt>
+              <dd>{lessonState.interruptionCount}</dd>
+            </div>
+            <div>
+              <dt>Latest learner transcript</dt>
+              <dd>{lessonState.lastUserTranscript || "-"}</dd>
+            </div>
+            <div>
+              <dt>Latest tutor transcript</dt>
+              <dd>{lessonState.lastAssistantTranscript || "-"}</dd>
+            </div>
+          </dl>
+        </section>
 
         <section className="transcript" aria-labelledby="transcript-title">
           <div className="panel-heading">

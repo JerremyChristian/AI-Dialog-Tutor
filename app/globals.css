@@ -80,6 +80,38 @@ h1 {
   line-height: 1.6;
 }
 
+.topic-field {
+  display: block;
+  margin-bottom: 24px;
+}
+
+.topic-field span {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.topic-field input {
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+}
+
+.topic-field input:focus {
+  border-color: var(--accent);
+  outline: 3px solid rgb(37 87 214 / 12%);
+}
+
+.topic-field input:disabled {
+  color: var(--muted);
+  background: #f8fafb;
+}
+
 .status-row {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -154,11 +186,40 @@ h1 {
   opacity: 0.7;
 }
 
+.lesson-state,
 .transcript {
   margin-top: 24px;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 12px;
+}
+
+.lesson-state dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 24px;
+  margin: 0;
+  padding: 16px;
+}
+
+.lesson-state dl div:nth-last-child(-n + 2) {
+  grid-column: 1 / -1;
+}
+
+.lesson-state dt {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.lesson-state dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.82rem;
+  line-height: 1.45;
 }
 
 .panel-heading {
@@ -219,5 +280,13 @@ h1 {
 
   .status-row {
     grid-template-columns: 1fr;
+  }
+
+  .lesson-state dl {
+    grid-template-columns: 1fr;
+  }
+
+  .lesson-state dl div:nth-last-child(-n + 2) {
+    grid-column: auto;
   }
 }
