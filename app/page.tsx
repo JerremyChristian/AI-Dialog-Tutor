@@ -1,6 +1,6 @@
 "use client";
 
-import type { LiveServerMessage } from "@google/genai";
+import type { FunctionCall, LiveServerMessage } from "@google/genai";
 import { useEffect, useRef, useState } from "react";
 import { LearningSourceUpload } from "../components/learning-source-upload";
 import { GeminiLiveWebSocket } from "../lib/gemini-live-websocket";
@@ -15,11 +15,16 @@ import {
 } from "../lib/realtime-audio";
 import {
   buildLessonInstruction,
+  completeLessonConcept,
   createLessonState,
-  deriveConcept,
   deriveResumePoint,
   GEMINI_LIVE_MODEL,
+  getCurrentConcept,
+  getLessonTreeRows,
   mergeTranscript,
+  navigateLessonState,
+  queryLessonState,
+  skipLessonNode,
   type LessonState,
 } from "../lib/lesson-state";
 
@@ -88,6 +93,8 @@ export default function Home() {
   const lessonStateRef = useRef(lessonState);
   const resumptionPendingRef = useRef(false);
   const sourceGroundingPendingRef = useRef(false);
+  const toolResultsRef = useRef(new Map<string, Record<string, unknown>>());
+  const cancelledToolCallIdsRef = useRef(new Set<string>());
   const nextMessageIdRef = useRef(0);
 
   const addDebugMessage = (text: string) => {
@@ -142,6 +149,8 @@ export default function Home() {
     assistantTurnActiveRef.current = false;
     resumptionPendingRef.current = false;
     sourceGroundingPendingRef.current = false;
+    toolResultsRef.current.clear();
+    cancelledToolCallIdsRef.current.clear();
   };
 
   useEffect(() => {
@@ -155,6 +164,17 @@ export default function Home() {
   }, []);
 
   const handleLiveMessage = (message: LiveServerMessage) => {
+    if (message.toolCallCancellation?.ids) {
+      for (const id of message.toolCallCancellation.ids) {
+        cancelledToolCallIdsRef.current.add(id);
+      }
+    }
+
+    if (message.toolCall?.functionCalls?.length) {
+      handleLessonToolCalls(message.toolCall.functionCalls);
+      return;
+    }
+
     const serverContent = message.serverContent;
     if (serverContent?.inputTranscription?.text) {
       const wasInterrupted = lessonStateRef.current.status === "interrupted";
@@ -201,10 +221,7 @@ export default function Home() {
       const current = lessonStateRef.current;
       const interruptedTranscript =
         assistantTranscriptRef.current || current.lastAssistantTranscript;
-      const currentConcept = deriveConcept(
-        interruptedTranscript,
-        current.currentConcept,
-      );
+      const currentConcept = getCurrentConcept(current)?.title || "current concept";
       const resumePoint = deriveResumePoint(
         interruptedTranscript,
         currentConcept,
@@ -212,7 +229,6 @@ export default function Home() {
       updateLessonState((state) => ({
         ...state,
         status: "interrupted",
-        currentConcept,
         resumePoint,
         interruptionCount: state.interruptionCount + 1,
         lastAssistantTranscript: interruptedTranscript,
@@ -265,23 +281,86 @@ export default function Home() {
     if (serverContent.generationComplete) {
       assistantSpeakingRef.current = false;
       assistantTurnActiveRef.current = false;
-      const current = lessonStateRef.current;
-      const nextConcept = deriveConcept(
-        assistantTranscriptRef.current,
-        current.currentConcept,
-      );
       updateLessonState((state) => ({
         ...state,
         status: state.status === "idle" ? "idle" : "teaching",
-        currentConcept: nextConcept,
         lastAssistantTranscript:
           assistantTranscriptRef.current || state.lastAssistantTranscript,
       }));
-      if (nextConcept !== current.currentConcept) {
-        addDebugMessage(`Current concept updated: ${nextConcept}`);
-      }
       resumptionPendingRef.current = false;
       addDebugMessage("Assistant response completed");
+    }
+  };
+
+  const handleLessonToolCalls = (calls: FunctionCall[]) => {
+    const functionResponses: Array<Record<string, unknown>> = [];
+
+    for (const call of calls) {
+      const id = call.id;
+      if (!id || cancelledToolCallIdsRef.current.has(id)) continue;
+
+      const cached = toolResultsRef.current.get(id);
+      if (cached) {
+        functionResponses.push({ id, name: call.name || "lesson_state", response: cached });
+        continue;
+      }
+
+      addDebugMessage("Lesson tool call received");
+      let result;
+      let events: string[] = [];
+      const args = call.args ?? {};
+      const action = args.action;
+      const conceptId = args.conceptId;
+
+      if (call.name !== "lesson_state") {
+        result = { ok: false, error: `Unknown function: ${call.name || "missing"}` };
+      } else if (action === "query") {
+        result = queryLessonState(lessonStateRef.current);
+        addDebugMessage("Lesson state queried");
+      } else if (
+        (action === "navigate" || action === "complete" || action === "skip") &&
+        typeof conceptId === "string" && conceptId
+      ) {
+        if (action === "complete") {
+          const requestedNode = lessonStateRef.current.nodes[conceptId];
+          addDebugMessage(
+            `Atomic concept completion requested: ${requestedNode?.title || conceptId}`,
+          );
+        }
+        const transition = action === "navigate"
+          ? navigateLessonState(lessonStateRef.current, conceptId)
+          : action === "complete"
+            ? completeLessonConcept(lessonStateRef.current, conceptId)
+            : skipLessonNode(lessonStateRef.current, conceptId);
+        result = transition.result;
+        events = transition.events;
+        if (transition.state !== lessonStateRef.current) {
+          lessonStateRef.current = transition.state;
+          setLessonState(transition.state);
+        }
+      } else {
+        const snapshot = queryLessonState(lessonStateRef.current);
+        result = {
+          ...snapshot,
+          ok: false,
+          message:
+            action === "navigate" || action === "complete" || action === "skip"
+              ? `conceptId is required for ${action}`
+              : "action must be navigate, complete, skip, or query",
+        };
+      }
+
+      for (const event of events) addDebugMessage(event);
+      const response = { result };
+      toolResultsRef.current.set(id, response);
+      functionResponses.push({ id, name: "lesson_state", response });
+    }
+
+    if (functionResponses.length === 0) return;
+    if (sessionRef.current?.sendToolResponse(functionResponses)) {
+      addDebugMessage("Lesson state tool response sent");
+    } else {
+      addDebugMessage("Realtime error: Live connection closed before lesson state response");
     }
   };
 
@@ -298,7 +377,10 @@ export default function Home() {
     const preparedSource = preparedSourceRef.current;
     const lessonFocus = topicInput.trim();
     const lessonTopic = lessonFocus || `Main topics in ${activeSource.name}`;
-    const initialLessonState = createLessonState(lessonTopic);
+    const initialLessonState = createLessonState(
+      lessonTopic,
+      preparedSource.lessonTree,
+    );
     lessonStateRef.current = initialLessonState;
     setLessonState(initialLessonState);
     setTopicInput(lessonFocus);
@@ -306,6 +388,14 @@ export default function Home() {
     assistantTranscriptRef.current = "";
     resumptionPendingRef.current = false;
     addDebugMessage(`Lesson initialized from source: ${activeSource.name}`);
+    addDebugMessage("Lesson tree initialized");
+    const firstConcept = getCurrentConcept(initialLessonState);
+    if (firstConcept) {
+      if (firstConcept.teaching) {
+        addDebugMessage(`Teaching contract loaded: ${firstConcept.title}`);
+      }
+      addDebugMessage(`Atomic concept started: ${firstConcept.title}`);
+    }
 
     const run = ++conversationRunRef.current;
     setMicrophoneStatus("Requesting permission");
@@ -514,6 +604,7 @@ export default function Home() {
   const microphoneActive = microphoneStatus === "Active";
   const aiConnected = aiConnectionStatus === "Connected";
   const requestingPermission = microphoneStatus === "Requesting permission";
+  const currentTeachingContract = getCurrentConcept(lessonState)?.teaching;
 
   return (
     <main className="page-shell">
@@ -532,6 +623,11 @@ export default function Home() {
           onChange={setLearningSource}
           onPreparedChange={(source) => {
             preparedSourceRef.current = source;
+            if (!source) {
+              const resetState = createLessonState("Uploaded material");
+              lessonStateRef.current = resetState;
+              setLessonState(resetState);
+            }
           }}
           onDebug={addDebugMessage}
         />
@@ -603,7 +699,7 @@ export default function Home() {
             </div>
             <div>
               <dt>Current concept</dt>
-              <dd>{lessonState.currentConcept || "-"}</dd>
+              <dd>{getCurrentConcept(lessonState)?.title || "-"}</dd>
             </div>
             <div>
               <dt>Resume point</dt>
@@ -622,6 +718,77 @@ export default function Home() {
               <dd>{lessonState.lastAssistantTranscript || "-"}</dd>
             </div>
           </dl>
+          <div className="coverage-map">
+            <h3>Lesson Coverage</h3>
+            {lessonState.rootNodeIds.length === 0 ? (
+              <p>No lesson tree loaded.</p>
+            ) : (
+              <ol>
+                {getLessonTreeRows(lessonState).map(({ node, depth }) => (
+                  <li
+                    key={node.id}
+                    className={
+                      node.id === lessonState.currentNodeId
+                        ? "coverage-current"
+                        : undefined
+                    }
+                    style={{ paddingLeft: `${depth * 16}px` }}
+                  >
+                    <span aria-hidden="true">
+                      {node.id === lessonState.currentNodeId
+                        ? "▶"
+                        : node.status === "taught"
+                          ? "✓"
+                          : node.status === "partial"
+                            ? "◐"
+                            : node.status === "skipped"
+                              ? "○"
+                              : "·"}
+                    </span>
+                    <strong>{node.title}</strong>
+                    <small>{node.status.replace("-", " ")}</small>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </div>
+          {currentTeachingContract && (
+            <div className="teaching-contract">
+              <h3>Current Teaching Contract</h3>
+              <p className="contract-meta">
+                {currentTeachingContract.type.replace("-", " ")} · {currentTeachingContract.importance}
+                {currentTeachingContract.sourceConfidence
+                  ? ` · ${currentTeachingContract.sourceConfidence}`
+                  : ""}
+              </p>
+              <h4>Objective</h4>
+              <p>{currentTeachingContract.objective}</p>
+              <h4>Teaching points</h4>
+              <ul>
+                {currentTeachingContract.teachingPoints.map((point) => (
+                  <li key={point}>{point}</li>
+                ))}
+              </ul>
+              <h4>Completion criteria</h4>
+              <ul>
+                {currentTeachingContract.completionCriteria.map((criterion) => (
+                  <li key={criterion}>{criterion}</li>
+                ))}
+              </ul>
+              {currentTeachingContract.sourceReferences?.length ? (
+                <p><strong>Source:</strong> {currentTeachingContract.sourceReferences.join(", ")}</p>
+              ) : null}
+              {currentTeachingContract.keyTerms?.length ? (
+                <p><strong>Terms:</strong> {currentTeachingContract.keyTerms.join(", ")}</p>
+              ) : null}
+              {currentTeachingContract.notation?.length ? (
+                <p><strong>Notation:</strong> {currentTeachingContract.notation.join(", ")}</p>
+              ) : null}
+              {currentTeachingContract.uncertaintyNote ? (
+                <p><strong>Uncertainty:</strong> {currentTeachingContract.uncertaintyNote}</p>
+              ) : null}
+            </div>
+          )}
         </section>
 
         <section className="transcript" aria-labelledby="transcript-title">

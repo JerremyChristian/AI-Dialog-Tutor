@@ -1,5 +1,6 @@
 import type { LiveServerMessage } from "@google/genai";
 import type { PreparedLearningSource } from "./learning-source";
+import { createLessonState, queryLessonState } from "./lesson-state";
 
 const LIVE_WEBSOCKET_URL =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained";
@@ -44,6 +45,33 @@ export class GeminiLiveWebSocket {
             inputAudioTranscription: {},
             outputAudioTranscription: {},
             historyConfig: { initialHistoryInClientContent: true },
+            tools: [
+              {
+                functionDeclarations: [
+                  {
+                    name: "lesson_state",
+                    description:
+                      "Synchronize authoritative hierarchical lesson coverage. Use navigate for movement, skip for explicit subtree skipping, complete only after meaningfully finishing the current atomic concept, and query for coverage questions. Navigate before teaching a new atomic concept after complete or skip.",
+                    parametersJsonSchema: {
+                      type: "object",
+                      properties: {
+                        action: {
+                          type: "string",
+                          enum: ["navigate", "complete", "skip", "query"],
+                        },
+                        conceptId: {
+                          type: "string",
+                          description:
+                            "Stable node ID from LESSON_TREE. Required for navigate, complete, and skip.",
+                        },
+                      },
+                      required: ["action"],
+                      additionalProperties: false,
+                    },
+                  },
+                ],
+              },
+            ],
           },
         });
       };
@@ -103,9 +131,12 @@ export class GeminiLiveWebSocket {
         ? `The learner's requested focus is: ${source.focus}.`
         : "Teach the source's main topics."
     } This is initial history context; do not answer it as a standalone request.`;
+    const initialCoverage = queryLessonState(
+      createLessonState(source.focus || source.name, source.lessonTree),
+    );
     const parts = [
       {
-        text: `${sourceIdentity}\n\nSOURCE_FILENAME:\n${source.name}\n\nSOURCE_TYPE:\n${sourceType}\n\nSOURCE_POLICY:\nTreat this as the authoritative course reference. Use reliable general knowledge when it helps explain relevant gaps, identify when doing so where useful, and follow the source when conventions differ.\n\nBEGIN SOURCE_CONTENT\n${source.text}\nEND SOURCE_CONTENT`,
+        text: `${sourceIdentity}\n\nSOURCE_FILENAME:\n${source.name}\n\nSOURCE_TYPE:\n${sourceType}\n\nSOURCE_POLICY:\nTreat this as the authoritative course reference. Use reliable general knowledge when it helps explain relevant gaps, identify when doing so where useful, and follow the source when conventions differ.\n\nLESSON_TREE:\n${JSON.stringify(source.lessonTree)}\n\nINITIAL_LESSON_COVERAGE:\n${JSON.stringify(initialCoverage)}\n\nBEGIN SOURCE_CONTENT\n${source.text}\nEND SOURCE_CONTENT`,
       },
     ];
 
@@ -128,6 +159,12 @@ export class GeminiLiveWebSocket {
   sendRealtimeInput(input: Record<string, unknown>) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false;
     this.socket.send(JSON.stringify({ realtimeInput: input }));
+    return true;
+  }
+
+  sendToolResponse(functionResponses: Array<Record<string, unknown>>) {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(JSON.stringify({ toolResponse: { functionResponses } }));
     return true;
   }
 

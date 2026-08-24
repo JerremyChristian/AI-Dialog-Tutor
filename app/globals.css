@@ -346,6 +346,96 @@ h1 {
   line-height: 1.45;
 }
 
+.coverage-map {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.coverage-map h3 {
+  margin-bottom: 8px;
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.coverage-map p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.coverage-map ol {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.coverage-map li {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.coverage-map li strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.coverage-map li small {
+  font-size: 0.68rem;
+}
+
+.coverage-map .coverage-current,
+.coverage-map .coverage-current strong {
+  color: var(--accent);
+}
+
+.teaching-contract {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.teaching-contract h3,
+.teaching-contract h4 {
+  color: var(--text);
+}
+
+.teaching-contract h3 {
+  margin-bottom: 4px;
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.teaching-contract h4 {
+  margin: 10px 0 3px;
+  font-size: 0.73rem;
+}
+
+.teaching-contract p {
+  margin: 4px 0;
+}
+
+.teaching-contract ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.teaching-contract .contract-meta {
+  margin-top: 0;
+  text-transform: capitalize;
+}
+
 .panel-heading {
   display: flex;
   align-items: center;

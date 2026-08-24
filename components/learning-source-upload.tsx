@@ -5,6 +5,7 @@ import {
   MAX_SOURCE_BYTES,
   SUPPORTED_SOURCE_TYPES,
   type LearningSource,
+  type LessonTreeItem,
   type PreparedLearningSource,
   type SupportedSourceType,
 } from "../lib/learning-source";
@@ -19,6 +20,7 @@ type Props = {
 
 type PdfSourceResponse = {
   structuredText?: string;
+  lessonTree?: LessonTreeItem[];
   error?: string;
 };
 
@@ -134,7 +136,35 @@ export function LearningSourceUpload({
         if (!text.trim()) throw new Error("The selected text source is empty");
         if (operation !== operationRef.current) return;
 
-        onPreparedChange({ name: file.name, mimeType, text });
+        onChange({
+          name: file.name,
+          mimeType,
+          sizeBytes: file.size,
+          status: "processing",
+        });
+        onDebug("TXT outline extraction started");
+        const controller = new AbortController();
+        requestRef.current = controller;
+        const formData = new FormData();
+        formData.append("source", file);
+        const response = await fetch("/api/text-outline", {
+          method: "POST",
+          body: formData,
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(await getResponseError(response, "TXT outline extraction failed"));
+        }
+        const body = (await response.json()) as { lessonTree?: LessonTreeItem[] };
+        if (!body.lessonTree?.length) throw new Error("TXT lesson tree is empty");
+        if (operation !== operationRef.current) return;
+
+        onPreparedChange({
+          name: file.name,
+          mimeType,
+          text,
+          lessonTree: body.lessonTree,
+        });
         onChange({
           name: file.name,
           mimeType,
@@ -189,7 +219,7 @@ export function LearningSourceUpload({
       }
 
       const body = (await response.json()) as PdfSourceResponse;
-      if (!body.structuredText?.trim()) {
+      if (!body.structuredText?.trim() || !body.lessonTree?.length) {
         throw new Error("The document model returned an empty source representation");
       }
       if (operation !== operationRef.current) return;
@@ -198,6 +228,7 @@ export function LearningSourceUpload({
         name: file.name,
         mimeType,
         text: body.structuredText,
+        lessonTree: body.lessonTree,
       });
       onChange({
         name: file.name,

@@ -1,6 +1,7 @@
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { NextResponse } from "next/server";
 import { MAX_SOURCE_BYTES } from "../../../lib/learning-source";
+import { normalizeLessonTree } from "../../../lib/lesson-outline";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -50,7 +51,24 @@ Diagram/visual description:
 Warnings/exceptions:
 Teaching significance:
 
-Continue through all relevant material. Output only the faithful structured source representation.`;
+Continue through all relevant material.
+
+Return JSON with exactly two fields:
+- structuredSource: the complete faithful representation described above
+- lessonTree: a concise hierarchical tree represented as a flat node array. Each node has id, title, parentId (null for roots), sibling order, and optional sourceReference. Include meaningful teachable units, not every bullet. Parent IDs must reference another node ID. Preserve arbitrary source depth.
+
+Every atomic node (a node with no children) MUST have a compact teaching contract. Structural parents must not have a teaching contract. If a parent has substantial introductory teaching content, add a real atomic Overview child; do not create meaningless Overview nodes.
+
+Each teaching contract must contain:
+- type: overview, concept, definition, procedure, worked-example, comparison, or summary
+- importance: core, supporting, or optional
+- one short objective describing what the tutor should explain, never learner understanding
+- 3-7 source-derived teachingPoints where appropriate
+- 2-5 completionCriteria describing what the tutor must have covered, never what the learner understands
+- concise sourceReferences, keyTerms, and notation only when useful
+- sourceConfidence clear or uncertain; add uncertaintyNote only for genuinely unclear source material
+
+Contracts are compact teaching plans, not summaries or mini-textbooks. Core completion criteria must not be blocked by optional enrichment. Preserve source terminology and notation exactly. Do not invent page/slide references or unreadable content.`;
 }
 
 export async function POST(request: Request) {
@@ -113,15 +131,70 @@ export async function POST(request: Request) {
       config: {
         maxOutputTokens: 32_768,
         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        responseMimeType: "application/json",
+        responseJsonSchema: {
+          type: "object",
+          properties: {
+            structuredSource: { type: "string" },
+            lessonTree: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  title: { type: "string" },
+                  parentId: { type: ["string", "null"] },
+                  order: { type: "integer" },
+                  sourceReference: { type: "string" },
+                  teaching: {
+                    type: "object",
+                    properties: {
+                      type: {
+                        type: "string",
+                        enum: ["overview", "concept", "definition", "procedure", "worked-example", "comparison", "summary"],
+                      },
+                      importance: {
+                        type: "string",
+                        enum: ["core", "supporting", "optional"],
+                      },
+                      objective: { type: "string" },
+                      teachingPoints: { type: "array", items: { type: "string" } },
+                      completionCriteria: { type: "array", items: { type: "string" } },
+                      sourceReferences: { type: "array", items: { type: "string" } },
+                      keyTerms: { type: "array", items: { type: "string" } },
+                      notation: { type: "array", items: { type: "string" } },
+                      sourceConfidence: { type: "string", enum: ["clear", "uncertain"] },
+                      uncertaintyNote: { type: "string" },
+                    },
+                    required: ["type", "importance", "objective", "teachingPoints", "completionCriteria"],
+                    additionalProperties: false,
+                  },
+                },
+                required: ["id", "title", "parentId", "order"],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ["structuredSource", "lessonTree"],
+          additionalProperties: false,
+        },
       },
     });
-    const structuredText = response.text?.trim();
-    if (!structuredText) {
+    const parsed = JSON.parse(response.text || "{}") as {
+      structuredSource?: unknown;
+      lessonTree?: unknown;
+    };
+    const structuredText =
+      typeof parsed.structuredSource === "string"
+        ? parsed.structuredSource.trim()
+        : "";
+    const lessonTree = normalizeLessonTree(parsed.lessonTree);
+    if (!structuredText || lessonTree.length === 0) {
       throw new Error("The document model returned no structured content");
     }
 
     return NextResponse.json(
-      { structuredText, model: PDF_PREPROCESSING_MODEL },
+      { structuredText, lessonTree, model: PDF_PREPROCESSING_MODEL },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (error) {

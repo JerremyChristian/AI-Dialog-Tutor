@@ -12,8 +12,42 @@ export type LearningSource = {
   error?: string;
 };
 
+export type TeachingNodeType =
+  | "overview"
+  | "concept"
+  | "definition"
+  | "procedure"
+  | "worked-example"
+  | "comparison"
+  | "summary";
+
+export type TeachingImportance = "core" | "supporting" | "optional";
+
+export type AtomicTeachingContract = {
+  objective: string;
+  teachingPoints: string[];
+  completionCriteria: string[];
+  type: TeachingNodeType;
+  importance: TeachingImportance;
+  sourceReferences?: string[];
+  keyTerms?: string[];
+  notation?: string[];
+  sourceConfidence?: "clear" | "uncertain";
+  uncertaintyNote?: string;
+};
+
+export type LessonTreeItem = {
+  id: string;
+  title: string;
+  parentId: string | null;
+  order: number;
+  sourceReference?: string;
+  teaching?: AtomicTeachingContract;
+};
+
 export type PreparedLearningSource = {
   name: string;
   mimeType: SupportedSourceType;
   text: string;
+  lessonTree: LessonTreeItem[];
 };
