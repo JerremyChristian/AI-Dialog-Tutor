@@ -4,6 +4,7 @@ import {
   buildLessonInstruction,
   GEMINI_LIVE_MODEL,
 } from "../../../lib/lesson-state";
+import { SUPPORTED_SOURCE_TYPES } from "../../../lib/learning-source";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,17 +20,37 @@ export async function POST(request: Request) {
   }
 
   try {
-    const body = (await request.json()) as { topic?: unknown };
+    const body = (await request.json()) as {
+      topic?: unknown;
+      source?: { name?: unknown; mimeType?: unknown };
+    };
     const topic = typeof body.topic === "string" ? body.topic.trim() : "";
-    if (!topic || topic.length > 160) {
+    if (topic.length > 160) {
       return NextResponse.json(
-        { error: "Lesson topic must be between 1 and 160 characters" },
+        { error: "Lesson topic cannot exceed 160 characters" },
+        { status: 400 },
+      );
+    }
+    const sourceName = body.source?.name;
+    const sourceMimeType = body.source?.mimeType;
+    if (
+      typeof sourceName !== "string" ||
+      !sourceName.trim() ||
+      sourceName.length > 200 ||
+      typeof sourceMimeType !== "string" ||
+      !SUPPORTED_SOURCE_TYPES.includes(
+        sourceMimeType as (typeof SUPPORTED_SOURCE_TYPES)[number],
+      )
+    ) {
+      return NextResponse.json(
+        { error: "Valid learning source metadata is required" },
         { status: 400 },
       );
     }
 
-    const systemInstruction = buildLessonInstruction(topic);
     const client = new GoogleGenAI({ apiKey });
+    const normalizedSourceName = sourceName.trim();
+    const systemInstruction = buildLessonInstruction(topic, normalizedSourceName);
     const now = Date.now();
     const token = await client.authTokens.create({
       config: {
@@ -45,6 +66,7 @@ export async function POST(request: Request) {
             systemInstruction,
           },
         },
+        lockAdditionalFields: [],
       },
     });
 
@@ -53,11 +75,20 @@ export async function POST(request: Request) {
     }
 
     return NextResponse.json(
-      { token: token.name },
+      {
+        token: token.name,
+        source: {
+          name: normalizedSourceName,
+          mimeType: sourceMimeType,
+        },
+      },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (error) {
-    console.error("Failed to create a Gemini ephemeral token", error);
+    console.error(
+      "Failed to create a Gemini ephemeral token:",
+      error instanceof Error ? error.message : "Unknown error",
+    );
     return NextResponse.json(
       { error: "Unable to create a Gemini Live token" },
       { status: 502 },

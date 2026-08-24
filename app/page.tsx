@@ -1,13 +1,13 @@
 "use client";
 
-import {
-  GoogleGenAI,
-  Modality,
-  VoiceActivityType,
-  type LiveServerMessage,
-  type Session,
-} from "@google/genai";
+import type { LiveServerMessage } from "@google/genai";
 import { useEffect, useRef, useState } from "react";
+import { LearningSourceUpload } from "../components/learning-source-upload";
+import { GeminiLiveWebSocket } from "../lib/gemini-live-websocket";
+import type {
+  LearningSource,
+  PreparedLearningSource,
+} from "../lib/learning-source";
 import {
   MicrophonePcmStreamer,
   PcmAudioPlayer,
@@ -16,7 +16,6 @@ import {
 import {
   buildLessonInstruction,
   createLessonState,
-  DEFAULT_LESSON_TOPIC,
   deriveConcept,
   deriveResumePoint,
   GEMINI_LIVE_MODEL,
@@ -68,13 +67,15 @@ export default function Home() {
   const [aiConnectionStatus, setAiConnectionStatus] =
     useState<AiConnectionStatus>("Not connected");
   const [debugMessages, setDebugMessages] = useState<DebugMessage[]>([]);
-  const [topicInput, setTopicInput] = useState(DEFAULT_LESSON_TOPIC);
+  const [topicInput, setTopicInput] = useState("");
   const [lessonState, setLessonState] = useState<LessonState>(() =>
-    createLessonState(DEFAULT_LESSON_TOPIC),
+    createLessonState("Uploaded material"),
   );
+  const [learningSource, setLearningSource] = useState<LearningSource | null>(null);
+  const preparedSourceRef = useRef<PreparedLearningSource | null>(null);
 
   const streamRef = useRef<MediaStream | null>(null);
-  const sessionRef = useRef<Session | null>(null);
+  const sessionRef = useRef<GeminiLiveWebSocket | null>(null);
   const microphoneStreamerRef = useRef<MicrophonePcmStreamer | null>(null);
   const playerRef = useRef<PcmAudioPlayer | null>(null);
   const tokenRequestRef = useRef<AbortController | null>(null);
@@ -86,6 +87,7 @@ export default function Home() {
   const assistantTranscriptRef = useRef("");
   const lessonStateRef = useRef(lessonState);
   const resumptionPendingRef = useRef(false);
+  const sourceGroundingPendingRef = useRef(false);
   const nextMessageIdRef = useRef(0);
 
   const addDebugMessage = (text: string) => {
@@ -139,6 +141,7 @@ export default function Home() {
     assistantSpeakingRef.current = false;
     assistantTurnActiveRef.current = false;
     resumptionPendingRef.current = false;
+    sourceGroundingPendingRef.current = false;
   };
 
   useEffect(() => {
@@ -220,7 +223,7 @@ export default function Home() {
     }
 
     const voiceActivity = message.voiceActivity?.voiceActivityType;
-    if (voiceActivity === VoiceActivityType.ACTIVITY_START) {
+    if (voiceActivity === "ACTIVITY_START") {
       userTranscriptRef.current = "";
       addDebugMessage("User speech started");
       if (lessonStateRef.current.status === "interrupted") {
@@ -230,7 +233,7 @@ export default function Home() {
         }));
         addDebugMessage("Resolving learner interruption");
       }
-    } else if (voiceActivity === VoiceActivityType.ACTIVITY_END) {
+    } else if (voiceActivity === "ACTIVITY_END") {
       addDebugMessage("User speech ended");
     }
 
@@ -242,6 +245,7 @@ export default function Home() {
 
       if (!assistantSpeakingRef.current) {
         assistantSpeakingRef.current = true;
+        sourceGroundingPendingRef.current = false;
         if (!assistantTurnActiveRef.current) {
           assistantTurnActiveRef.current = true;
           assistantTranscriptRef.current = "";
@@ -282,15 +286,26 @@ export default function Home() {
   };
 
   const startConversation = async () => {
-    const lessonTopic = topicInput.trim() || DEFAULT_LESSON_TOPIC;
+    if (
+      learningSource?.status !== "ready" ||
+      !preparedSourceRef.current
+    ) {
+      addDebugMessage("Source grounding failed: a ready learning source is required");
+      return;
+    }
+
+    const activeSource = learningSource;
+    const preparedSource = preparedSourceRef.current;
+    const lessonFocus = topicInput.trim();
+    const lessonTopic = lessonFocus || `Main topics in ${activeSource.name}`;
     const initialLessonState = createLessonState(lessonTopic);
     lessonStateRef.current = initialLessonState;
     setLessonState(initialLessonState);
-    setTopicInput(lessonTopic);
+    setTopicInput(lessonFocus);
     userTranscriptRef.current = "";
     assistantTranscriptRef.current = "";
     resumptionPendingRef.current = false;
-    addDebugMessage(`Lesson initialized: ${lessonTopic}`);
+    addDebugMessage(`Lesson initialized from source: ${activeSource.name}`);
 
     const run = ++conversationRunRef.current;
     setMicrophoneStatus("Requesting permission");
@@ -327,14 +342,24 @@ export default function Home() {
         cache: "no-store",
         signal: tokenRequest.signal,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic: lessonTopic }),
+        body: JSON.stringify({
+          topic: lessonFocus,
+          source: {
+            name: activeSource.name,
+            mimeType: activeSource.mimeType,
+          },
+        }),
       });
       const tokenBody = (await tokenResponse.json()) as {
         token?: string;
         error?: string;
+        source?: {
+          name: string;
+          mimeType: string;
+        };
       };
 
-      if (!tokenResponse.ok || !tokenBody.token) {
+      if (!tokenResponse.ok || !tokenBody.token || !tokenBody.source) {
         throw new Error(tokenBody.error || "Gemini token request failed");
       }
       if (!isMountedRef.current || run !== conversationRunRef.current) return;
@@ -342,57 +367,56 @@ export default function Home() {
       tokenRequestRef.current = null;
       addDebugMessage("Gemini token received");
       addDebugMessage("Live connection opening");
-      const systemInstruction = buildLessonInstruction(lessonTopic);
+      const systemInstruction = buildLessonInstruction(
+        lessonFocus,
+        tokenBody.source.name,
+      );
 
-      const ai = new GoogleGenAI({
-        apiKey: tokenBody.token,
-        httpOptions: { apiVersion: "v1beta" },
+      const session = new GeminiLiveWebSocket({
+        onMessage: (message) => {
+          if (isMountedRef.current && run === conversationRunRef.current) {
+            handleLiveMessage(message);
+          }
+        },
+        onError: (message) => {
+          if (isMountedRef.current && run === conversationRunRef.current) {
+            setAiConnectionStatus("Error");
+            if (sourceGroundingPendingRef.current) {
+              addDebugMessage(`Source grounding failed: ${message}`);
+            }
+            addDebugMessage(`Realtime error: ${message}`);
+          }
+        },
+        onClose: ({ code, reason }) => {
+          if (isMountedRef.current && run === conversationRunRef.current) {
+            setAiConnectionStatus("Not connected");
+            const closeDetails = reason
+              ? `${reason} (code ${code})`
+              : `code ${code}`;
+            if (sourceGroundingPendingRef.current) {
+              addDebugMessage(
+                `Source grounding failed: Live connection closed before the first response (${closeDetails})`,
+              );
+            }
+            addDebugMessage(`Live connection closed (${closeDetails})`);
+            const hadMicrophone = Boolean(streamRef.current);
+            conversationRunRef.current += 1;
+            void disposeResources(false).then(() => {
+              if (isMountedRef.current && hadMicrophone) {
+                setMicrophoneStatus("Not active");
+                updateLessonState((current) => ({
+                  ...current,
+                  status: "idle",
+                }));
+                addDebugMessage("Microphone stopped");
+              }
+            });
+          }
+        },
       });
-      const session = await ai.live.connect({
+      await session.connect(tokenBody.token, {
         model: GEMINI_LIVE_MODEL,
-        config: {
-          responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          systemInstruction,
-        },
-        callbacks: {
-          onopen: () => {
-            if (isMountedRef.current && run === conversationRunRef.current) {
-              setAiConnectionStatus("Connected");
-              addDebugMessage("Live connection established");
-            }
-          },
-          onmessage: (message) => {
-            if (isMountedRef.current && run === conversationRunRef.current) {
-              handleLiveMessage(message);
-            }
-          },
-          onerror: (event) => {
-            if (isMountedRef.current && run === conversationRunRef.current) {
-              setAiConnectionStatus("Error");
-              addDebugMessage(`Realtime error: ${event.message || "WebSocket error"}`);
-            }
-          },
-          onclose: () => {
-            if (isMountedRef.current && run === conversationRunRef.current) {
-              setAiConnectionStatus("Not connected");
-              addDebugMessage("Live connection closed");
-              const hadMicrophone = Boolean(streamRef.current);
-              conversationRunRef.current += 1;
-              void disposeResources(false).then(() => {
-                if (isMountedRef.current && hadMicrophone) {
-                  setMicrophoneStatus("Not active");
-                  updateLessonState((current) => ({
-                    ...current,
-                    status: "idle",
-                  }));
-                  addDebugMessage("Microphone stopped");
-                }
-              });
-            }
-          },
-        },
+        systemInstruction,
       });
 
       if (!isMountedRef.current || run !== conversationRunRef.current) {
@@ -401,6 +425,17 @@ export default function Home() {
       }
 
       sessionRef.current = session;
+      setAiConnectionStatus("Connected");
+      addDebugMessage("Live connection established");
+      sourceGroundingPendingRef.current = true;
+      addDebugMessage("Source seeding started");
+      session.seedInitialSource({
+        ...preparedSource,
+        focus: lessonFocus,
+      });
+      addDebugMessage("Source seeded into Live context");
+      addDebugMessage("Source grounding ready");
+
       const microphoneStreamer = new MicrophonePcmStreamer(stream, (chunk) => {
         if (run !== conversationRunRef.current || sessionRef.current !== session) return;
 
@@ -426,7 +461,9 @@ export default function Home() {
       }));
       addDebugMessage("Lesson started");
       session.sendRealtimeInput({
-        text: `Begin the spoken lesson about ${lessonTopic} now. Briefly preview the lesson, then teach the first concept.`,
+        text: `Begin the source-grounded spoken lesson now. Identify the uploaded material as "${tokenBody.source.name}", briefly preview what you will cover, then teach the first concept${
+          lessonFocus ? ` related to ${lessonFocus}` : " from the source"
+        }.`,
       });
     } catch (error) {
       if (!isMountedRef.current || run !== conversationRunRef.current) return;
@@ -444,7 +481,11 @@ export default function Home() {
 
       if (streamRef.current) {
         setAiConnectionStatus("Error");
-        addDebugMessage(`Realtime error: ${getRealtimeErrorMessage(error)}`);
+        const message = getRealtimeErrorMessage(error);
+        if (message.toLowerCase().includes("source")) {
+          addDebugMessage(`Source grounding failed: ${message}`);
+        }
+        addDebugMessage(`Realtime error: ${message}`);
         await disposeResources(false);
         setMicrophoneStatus("Not active");
         updateLessonState((current) => ({ ...current, status: "idle" }));
@@ -485,12 +526,23 @@ export default function Home() {
           </p>
         </header>
 
+        <LearningSourceUpload
+          source={learningSource}
+          disabled={microphoneActive || requestingPermission}
+          onChange={setLearningSource}
+          onPreparedChange={(source) => {
+            preparedSourceRef.current = source;
+          }}
+          onDebug={addDebugMessage}
+        />
+
         <label className="topic-field">
-          <span>Lesson topic</span>
+          <span>Lesson topic or focus (optional)</span>
           <input
             type="text"
             value={topicInput}
             onChange={(event) => setTopicInput(event.target.value)}
+            placeholder="Leave blank to teach the source's main topics"
             maxLength={160}
             disabled={microphoneActive || requestingPermission}
           />
@@ -523,7 +575,10 @@ export default function Home() {
           className="start-button"
           type="button"
           onClick={microphoneActive ? stopConversation : startConversation}
-          disabled={requestingPermission}
+          disabled={
+            requestingPermission ||
+            (!microphoneActive && learningSource?.status !== "ready")
+          }
         >
           {microphoneActive
             ? "Stop Conversation"

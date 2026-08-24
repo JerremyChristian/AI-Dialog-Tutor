@@ -80,6 +80,130 @@ h1 {
   line-height: 1.6;
 }
 
+.source-upload {
+  margin-bottom: 24px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #f8fafb;
+}
+
+.source-upload-heading,
+.source-details {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.source-upload-heading {
+  margin-bottom: 14px;
+}
+
+.source-upload-heading h2 {
+  margin-bottom: 4px;
+  font-size: 0.9rem;
+}
+
+.source-upload-heading p {
+  margin-bottom: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.source-status {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #e9edf1;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.source-status-ready {
+  background: rgb(22 135 93 / 12%);
+  color: var(--active);
+}
+
+.source-status-preparing,
+.source-status-processing {
+  background: rgb(37 87 214 / 10%);
+  color: var(--accent);
+}
+
+.source-status-error {
+  background: rgb(179 45 45 / 10%);
+  color: #a52929;
+}
+
+.source-file-input {
+  width: 100%;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.source-file-input::file-selector-button {
+  margin-right: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+}
+
+.source-file-input:disabled::file-selector-button {
+  cursor: not-allowed;
+}
+
+.source-details {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.source-details strong,
+.source-details small {
+  display: block;
+}
+
+.source-details strong {
+  margin-bottom: 4px;
+  overflow-wrap: anywhere;
+  font-size: 0.82rem;
+}
+
+.source-details small {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.source-error {
+  margin: 8px 0 0;
+  color: #a52929;
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.source-remove {
+  padding: 5px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.source-remove:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
 .topic-field {
   display: block;
   margin-bottom: 24px;
