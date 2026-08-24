@@ -18,6 +18,8 @@
 html,
 body {
   min-height: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 body {
@@ -29,13 +31,15 @@ body {
 
 button {
   font: inherit;
+  touch-action: manipulation;
 }
 
 .page-shell {
   display: grid;
   min-height: 100vh;
+  min-height: 100dvh;
   place-items: center;
-  padding: 32px 20px;
+  padding: max(32px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(32px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
 }
 
 .tutor-card {
@@ -146,7 +150,8 @@ h1 {
 
 .source-file-input::file-selector-button {
   margin-right: 10px;
-  padding: 7px 10px;
+  min-height: 44px;
+  padding: 10px 14px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface);
@@ -190,7 +195,8 @@ h1 {
 }
 
 .source-remove {
-  padding: 5px 8px;
+  min-height: 44px;
+  padding: 10px 12px;
   border: 0;
   background: transparent;
   color: var(--accent);
@@ -282,6 +288,7 @@ h1 {
 
 .start-button {
   width: 100%;
+  min-height: 52px;
   padding: 14px 20px;
   border: 0;
   border-radius: 12px;
@@ -464,6 +471,99 @@ h1 {
   line-height: 1.6;
 }
 
+.transcript summary {
+  min-height: 48px;
+  padding: 14px 16px;
+  background: #f8fafb;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 700;
+  touch-action: manipulation;
+}
+
+.transcript[open] summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.active-summary {
+  margin-bottom: 18px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #f8fafb;
+}
+
+.active-source {
+  margin-bottom: 18px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.active-label {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.active-summary h2 {
+  margin-bottom: 14px;
+  overflow-wrap: anywhere;
+  font-size: 1.25rem;
+}
+
+.current-utterance {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.session-error {
+  margin-bottom: 18px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgb(179 45 45 / 10%);
+  color: #922727;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.install-hint {
+  margin-top: 20px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgb(37 87 214 / 8%);
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.install-hint p {
+  margin: 0;
+}
+
+.install-hint button {
+  min-height: 44px;
+  padding: 10px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 700;
+}
+
 .transcript-body p {
   margin-bottom: 0;
 }
@@ -484,12 +584,33 @@ h1 {
 
 @media (max-width: 560px) {
   .page-shell {
-    padding: 16px;
+    display: block;
+    padding: max(10px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right)) max(14px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
   }
 
   .tutor-card {
-    padding: 24px;
-    border-radius: 16px;
+    min-height: calc(100dvh - max(20px, env(safe-area-inset-top)) - max(28px, env(safe-area-inset-bottom)));
+    padding: 20px 16px;
+    border-radius: 14px;
+  }
+
+  .hero {
+    margin-bottom: 20px;
+  }
+
+  h1 {
+    font-size: 1.8rem;
+  }
+
+  .lesson-active .hero {
+    margin-bottom: 14px;
+  }
+
+  .lesson-active .eyebrow,
+  .lesson-active .setup-only,
+  .lesson-active .engineering-state,
+  .lesson-active .teaching-contract {
+    display: none;
   }
 
   .status-row {
@@ -502,5 +623,38 @@ h1 {
 
   .lesson-state dl div:nth-last-child(-n + 2) {
     grid-column: auto;
+  }
+
+  .coverage-map {
+    padding: 14px 12px;
+  }
+
+  .coverage-map li {
+    grid-template-columns: 16px minmax(0, 1fr);
+    max-width: 100%;
+  }
+
+  .coverage-map li small {
+    grid-column: 2;
+  }
+
+  .coverage-map li strong,
+  .transcript-body,
+  .debug-messages li {
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (max-height: 520px) and (orientation: landscape) {
+  .page-shell {
+    place-items: start center;
+  }
+
+  .hero {
+    margin-bottom: 14px;
+  }
+
+  .intro {
+    display: none;
   }
 }

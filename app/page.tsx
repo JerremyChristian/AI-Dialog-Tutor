@@ -43,6 +43,11 @@ type DebugMessage = {
   text: string;
 };
 
+type InstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
+};
+
 function getMicrophoneErrorMessage(error: unknown) {
   if (!(error instanceof DOMException)) {
     return error instanceof Error ? error.message : "Unknown microphone error";
@@ -72,6 +77,10 @@ export default function Home() {
   const [aiConnectionStatus, setAiConnectionStatus] =
     useState<AiConnectionStatus>("Not connected");
   const [debugMessages, setDebugMessages] = useState<DebugMessage[]>([]);
+  const [currentUtterance, setCurrentUtterance] = useState("");
+  const [userError, setUserError] = useState("");
+  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
+  const [showIosInstallHint, setShowIosInstallHint] = useState(false);
   const [topicInput, setTopicInput] = useState("");
   const [lessonState, setLessonState] = useState<LessonState>(() =>
     createLessonState("Uploaded material"),
@@ -96,6 +105,8 @@ export default function Home() {
   const toolResultsRef = useRef(new Map<string, Record<string, unknown>>());
   const cancelledToolCallIdsRef = useRef(new Set<string>());
   const nextMessageIdRef = useRef(0);
+  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+  const lessonActiveRef = useRef(false);
 
   const addDebugMessage = (text: string) => {
     if (!isMountedRef.current) return;
@@ -151,12 +162,48 @@ export default function Home() {
     sourceGroundingPendingRef.current = false;
     toolResultsRef.current.clear();
     cancelledToolCallIdsRef.current.clear();
+    lessonActiveRef.current = false;
+    await wakeLockRef.current?.release().catch(() => undefined);
+    wakeLockRef.current = null;
+  };
+
+  const requestWakeLock = async () => {
+    if (!("wakeLock" in navigator) || document.visibilityState !== "visible") return;
+    try {
+      wakeLockRef.current = await navigator.wakeLock.request("screen");
+      addDebugMessage("Screen wake lock active");
+    } catch {
+      addDebugMessage("Screen wake lock unavailable");
+    }
   };
 
   useEffect(() => {
     isMountedRef.current = true;
 
+    const onInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as InstallPromptEvent);
+    };
+    const standalone = window.matchMedia("(display-mode: standalone)").matches;
+    setShowIosInstallHint(/iPad|iPhone|iPod/.test(navigator.userAgent) && !standalone);
+    window.addEventListener("beforeinstallprompt", onInstallPrompt);
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible" && lessonActiveRef.current) {
+        void requestWakeLock();
+        void playerRef.current?.prepare().catch(() => {
+          setUserError("Audio was suspended. End the lesson, then start again.");
+          addDebugMessage("Audio context could not resume after backgrounding");
+        });
+      } else if (document.visibilityState === "hidden" && lessonActiveRef.current) {
+        addDebugMessage("App backgrounded; mobile audio or connection may be suspended");
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
     return () => {
+      window.removeEventListener("beforeinstallprompt", onInstallPrompt);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       isMountedRef.current = false;
       conversationRunRef.current += 1;
       void disposeResources(false);
@@ -182,6 +229,7 @@ export default function Home() {
         userTranscriptRef.current,
         serverContent.inputTranscription.text,
       );
+      setCurrentUtterance(userTranscriptRef.current);
       updateLessonState((current) => ({
         ...current,
         status:
@@ -205,6 +253,7 @@ export default function Home() {
         assistantTranscriptRef.current,
         serverContent.outputTranscription.text,
       );
+      setCurrentUtterance(assistantTranscriptRef.current);
       updateLessonState((current) => ({
         ...current,
         lastAssistantTranscript: assistantTranscriptRef.current,
@@ -365,6 +414,7 @@ export default function Home() {
   };
 
   const startConversation = async () => {
+    setUserError("");
     if (
       learningSource?.status !== "ready" ||
       !preparedSourceRef.current
@@ -386,6 +436,7 @@ export default function Home() {
     setTopicInput(lessonFocus);
     userTranscriptRef.current = "";
     assistantTranscriptRef.current = "";
+    setCurrentUtterance("");
     resumptionPendingRef.current = false;
     addDebugMessage(`Lesson initialized from source: ${activeSource.name}`);
     addDebugMessage("Lesson tree initialized");
@@ -419,6 +470,19 @@ export default function Home() {
       }
 
       streamRef.current = stream;
+      const audioTrack = stream.getAudioTracks()[0];
+      if (audioTrack) {
+        audioTrack.addEventListener("ended", () => {
+          if (!isMountedRef.current || run !== conversationRunRef.current) return;
+          setUserError("The microphone stopped unexpectedly. Start the lesson again.");
+          addDebugMessage("Microphone stream ended unexpectedly");
+          conversationRunRef.current += 1;
+          setMicrophoneStatus("Not active");
+          setAiConnectionStatus("Not connected");
+          updateLessonState((current) => ({ ...current, status: "idle" }));
+          void disposeResources(false);
+        }, { once: true });
+      }
       setMicrophoneStatus("Active");
       addDebugMessage("Microphone active");
       await playerReady;
@@ -471,6 +535,7 @@ export default function Home() {
         onError: (message) => {
           if (isMountedRef.current && run === conversationRunRef.current) {
             setAiConnectionStatus("Error");
+            setUserError(`Gemini Live connection failed: ${message}`);
             if (sourceGroundingPendingRef.current) {
               addDebugMessage(`Source grounding failed: ${message}`);
             }
@@ -483,6 +548,7 @@ export default function Home() {
             const closeDetails = reason
               ? `${reason} (code ${code})`
               : `code ${code}`;
+            setUserError("The realtime connection ended. Start the lesson again when ready.");
             if (sourceGroundingPendingRef.current) {
               addDebugMessage(
                 `Source grounding failed: Live connection closed before the first response (${closeDetails})`,
@@ -550,6 +616,8 @@ export default function Home() {
         status: "teaching",
       }));
       addDebugMessage("Lesson started");
+      lessonActiveRef.current = true;
+      void requestWakeLock();
       session.sendRealtimeInput({
         text: `Begin the source-grounded spoken lesson now. Identify the uploaded material as "${tokenBody.source.name}", briefly preview what you will cover, then teach the first concept${
           lessonFocus ? ` related to ${lessonFocus}` : " from the source"
@@ -564,6 +632,7 @@ export default function Home() {
 
       if (permissionDenied) {
         setMicrophoneStatus("Permission denied");
+        setUserError("Microphone permission was denied. Allow access in browser settings and try again.");
         addDebugMessage("Microphone permission denied");
         await disposeResources(false);
         return;
@@ -576,13 +645,16 @@ export default function Home() {
           addDebugMessage(`Source grounding failed: ${message}`);
         }
         addDebugMessage(`Realtime error: ${message}`);
+        setUserError(`The realtime lesson could not start: ${message}`);
         await disposeResources(false);
         setMicrophoneStatus("Not active");
         updateLessonState((current) => ({ ...current, status: "idle" }));
         addDebugMessage("Microphone stopped");
       } else {
         setMicrophoneStatus("Error");
-        addDebugMessage(`Microphone error: ${getMicrophoneErrorMessage(error)}`);
+        const message = getMicrophoneErrorMessage(error);
+        setUserError(message);
+        addDebugMessage(`Microphone error: ${message}`);
         await player.close();
       }
     }
@@ -605,34 +677,45 @@ export default function Home() {
   const aiConnected = aiConnectionStatus === "Connected";
   const requestingPermission = microphoneStatus === "Requesting permission";
   const currentTeachingContract = getCurrentConcept(lessonState)?.teaching;
+  const currentConcept = getCurrentConcept(lessonState);
+  const lessonActive = microphoneActive || requestingPermission || aiConnected;
+
+  const requestInstall = async () => {
+    if (!installPrompt) return;
+    await installPrompt.prompt();
+    await installPrompt.userChoice;
+    setInstallPrompt(null);
+  };
 
   return (
     <main className="page-shell">
-      <section className="tutor-card" aria-labelledby="page-title">
+      <section className={`tutor-card${lessonActive ? " lesson-active" : ""}`} aria-labelledby="page-title">
         <header className="hero">
           <p className="eyebrow">Learning workspace</p>
           <h1 id="page-title">Conversational AI Tutor</h1>
-          <p className="intro">
+          <p className="intro setup-only">
             A simple workspace for realtime, voice-guided conversation.
           </p>
         </header>
 
-        <LearningSourceUpload
-          source={learningSource}
-          disabled={microphoneActive || requestingPermission}
-          onChange={setLearningSource}
-          onPreparedChange={(source) => {
-            preparedSourceRef.current = source;
-            if (!source) {
-              const resetState = createLessonState("Uploaded material");
-              lessonStateRef.current = resetState;
-              setLessonState(resetState);
-            }
-          }}
-          onDebug={addDebugMessage}
-        />
+        <div className="setup-only">
+          <LearningSourceUpload
+            source={learningSource}
+            disabled={microphoneActive || requestingPermission}
+            onChange={setLearningSource}
+            onPreparedChange={(source) => {
+              preparedSourceRef.current = source;
+              if (!source) {
+                const resetState = createLessonState("Uploaded material");
+                lessonStateRef.current = resetState;
+                setLessonState(resetState);
+              }
+            }}
+            onDebug={addDebugMessage}
+          />
+        </div>
 
-        <label className="topic-field">
+        <label className="topic-field setup-only">
           <span>Lesson topic or focus (optional)</span>
           <input
             type="text"
@@ -643,6 +726,21 @@ export default function Home() {
             disabled={microphoneActive || requestingPermission}
           />
         </label>
+
+        {learningSource && lessonActive && (
+          <section className="active-summary" aria-label="Active lesson overview">
+            <p className="active-source" title={learningSource.name}>{learningSource.name}</p>
+            <p className="active-label">Current concept</p>
+            <h2>{currentConcept?.title || "Preparing lesson…"}</h2>
+            <p className="current-utterance">
+              {currentUtterance
+                ? `“${currentUtterance}”`
+                : "Listening for the lesson to begin…"}
+            </p>
+          </section>
+        )}
+
+        {userError && <p className="session-error" role="alert">{userError}</p>}
 
         <div className="status-row" aria-label="Conversation status">
           <div className="status-item" aria-live="polite">
@@ -661,7 +759,7 @@ export default function Home() {
               aria-hidden="true"
             />
             <span>
-              <strong>AI connection</strong>
+              <strong>Connection</strong>
               <small>{aiConnectionStatus}</small>
             </span>
           </div>
@@ -677,7 +775,7 @@ export default function Home() {
           }
         >
           {microphoneActive
-            ? "Stop Conversation"
+            ? "End Lesson"
             : requestingPermission
               ? "Requesting Permission..."
               : "Start Conversation"}
@@ -688,7 +786,7 @@ export default function Home() {
             <h2 id="lesson-state-title">Lesson State</h2>
             <span>Development</span>
           </div>
-          <dl>
+          <dl className="engineering-state">
             <div>
               <dt>Topic</dt>
               <dd>{lessonState.topic}</dd>
@@ -732,7 +830,7 @@ export default function Home() {
                         ? "coverage-current"
                         : undefined
                     }
-                    style={{ paddingLeft: `${depth * 16}px` }}
+                    style={{ paddingLeft: `${Math.min(depth * 16, 48)}px` }}
                   >
                     <span aria-hidden="true">
                       {node.id === lessonState.currentNodeId
@@ -791,12 +889,9 @@ export default function Home() {
           )}
         </section>
 
-        <section className="transcript" aria-labelledby="transcript-title">
-          <div className="panel-heading">
-            <h2 id="transcript-title">Transcript / Debug</h2>
-            <span>{aiConnected ? "Live conversation" : "Idle"}</span>
-          </div>
-          <div className="transcript-body" role="log" aria-live="polite">
+        <details className="transcript">
+          <summary id="transcript-title">Show Debug</summary>
+          <div className="transcript-body" role="log" aria-live="polite" aria-labelledby="transcript-title">
             {debugMessages.length === 0 ? (
               <p>Conversation events and transcript messages will appear here.</p>
             ) : (
@@ -809,7 +904,17 @@ export default function Home() {
               </ol>
             )}
           </div>
-        </section>
+        </details>
+
+        {!lessonActive && (installPrompt || showIosInstallHint) && (
+          <aside className="install-hint">
+            {installPrompt ? (
+              <button type="button" onClick={requestInstall}>Install AI Tutor</button>
+            ) : (
+              <p>On iPhone or iPad: open in Safari, tap Share, then Add to Home Screen.</p>
+            )}
+          </aside>
+        )}
       </section>
     </main>
   );

@@ -13,6 +13,7 @@ export class MicrophonePcmStreamer {
 
   async start() {
     this.context = new AudioContext({ latencyHint: "interactive" });
+    await resumeAudioContext(this.context);
     await this.context.audioWorklet.addModule("/pcm-recorder-worklet.js");
 
     this.source = this.context.createMediaStreamSource(this.stream);
@@ -32,7 +33,7 @@ export class MicrophonePcmStreamer {
     this.source.connect(this.worklet);
     this.worklet.connect(this.silentOutput);
     this.silentOutput.connect(this.context.destination);
-    await this.context.resume();
+    await resumeAudioContext(this.context);
   }
 
   async stop() {
@@ -68,7 +69,7 @@ export class PcmAudioPlayer {
       });
     }
 
-    await this.context.resume();
+    await resumeAudioContext(this.context);
   }
 
   play(base64Pcm: string) {
@@ -121,6 +122,13 @@ export class PcmAudioPlayer {
     if (context && context.state !== "closed") {
       await context.close();
     }
+  }
+}
+
+async function resumeAudioContext(context: AudioContext) {
+  if (context.state === "suspended") await context.resume();
+  if (context.state !== "running") {
+    throw new Error("Audio could not start. Tap Start Conversation again.");
   }
 }
 
