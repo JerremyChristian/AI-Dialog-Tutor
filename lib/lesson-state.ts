@@ -1,4 +1,4 @@
-import type { LessonTreeItem } from "./learning-source";
+import type { AtomicTeachingContract, LessonTreeItem } from "./learning-source";
 
 export const GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview";
 
@@ -31,6 +31,18 @@ export type LessonStateResult = {
   currentNodeId: string | null;
   currentPath: string[];
   nodes: Array<Pick<LessonNode, "id" | "title" | "parentId" | "status">>;
+  currentNodeTitle?: string | null;
+  currentNodeStatus?: CoverageStatus | null;
+  currentTeachingContract?: AtomicTeachingContract;
+  nextSequentialNode?: { id: string; title: string } | null;
+  relevantNodes?: Array<{ id: string; title: string; status: CoverageStatus }>;
+  resumePoint?: string;
+  completedNodeId?: string;
+  noOp?: boolean;
+  reason?: "already_taught";
+  error?: "unknown_concept_id" | "invalid_transition";
+  validRelevantNodes?: Array<{ id: string; title: string }>;
+  recoveryRequired?: boolean;
 };
 
 export function createLessonState(topic: string, tree: LessonTreeItem[] = []): LessonState {
@@ -86,7 +98,7 @@ export function getLessonTreeRows(state: LessonState) {
 
 export function navigateLessonState(state: LessonState, requestedId: string) {
   const requested = state.nodes[requestedId];
-  if (!requested) return transitionError(state, "navigate", `Unknown concept ID: ${requestedId}`);
+  if (!requested) return unknownConceptError(state, "navigate");
   const targetId = requested.childrenIds.length
     ? getFirstIncompleteDescendant(state, requested.id)
     : requested.id;
@@ -127,30 +139,57 @@ export function navigateLessonState(state: LessonState, requestedId: string) {
 export function completeLessonConcept(state: LessonState, conceptId: string) {
   const node = state.nodes[conceptId];
   const current = getCurrentConcept(state);
-  if (!node) return transitionError(state, "complete", `Unknown concept ID: ${conceptId}`);
+  if (!node) return unknownConceptError(state, "complete");
+  if (node.status === "taught") {
+    return {
+      state,
+      result: {
+        ...snapshot(state, "complete", true, "Completion already recorded"),
+        noOp: true,
+        reason: "already_taught" as const,
+        completedNodeId: node.id,
+      },
+      events: [`Duplicate completion ignored: ${node.title}`],
+    };
+  }
   if (node.childrenIds.length) {
-    return transitionError(state, "complete", `${node.title} is a parent; complete its unfinished atomic concepts instead`);
+    return transitionError(state, "complete", `${node.title} is not an atomic concept`);
   }
   if (!node.teaching) {
     return transitionError(state, "complete", `${node.title} has no valid atomic teaching contract`);
   }
   if (!current || current.id !== node.id) {
-    return transitionError(state, "complete", `Only the current atomic concept (${current?.id ?? "none"}) can be completed`);
+    return transitionError(state, "complete", "Only the current atomic concept can be completed");
   }
   if (node.status !== "teaching" && node.status !== "partial") {
     return transitionError(state, "complete", `${node.title} is not currently being taught`);
   }
   const nodes = cloneNodes(state.nodes);
   nodes[node.id].status = "taught";
-  const next = withDerivedNodes(state, nodes, node.id, "teaching");
-  return transitionSuccess(next, "complete",
-    `Completed ${node.title}. Navigate to the next atomic concept before teaching it.`,
-    [`Atomic concept completed: ${node.title}`]);
+  const atomicIds = getAtomicNodeIds(state);
+  const completedIndex = atomicIds.indexOf(node.id);
+  const nextId = atomicIds.slice(completedIndex + 1).find((id) =>
+    nodes[id].status !== "taught" && nodes[id].status !== "skipped",
+  ) ?? null;
+  if (nextId) nodes[nextId].status = "teaching";
+  const next = withDerivedNodes(state, nodes, nextId, "teaching");
+  const events = [`Atomic concept completed: ${node.title}`];
+  if (nextId) events.push(`Sequential advancement: ${node.title} -> ${nodes[nextId].title}`);
+  return {
+    state: next,
+    result: {
+      ...snapshot(next, "complete", true, nextId
+        ? `Completed ${node.title}; continue with ${nodes[nextId].title}`
+        : `Completed ${node.title}; no later atomic concept remains`),
+      completedNodeId: node.id,
+    },
+    events,
+  };
 }
 
 export function skipLessonNode(state: LessonState, conceptId: string) {
   const target = state.nodes[conceptId];
-  if (!target) return transitionError(state, "skip", `Unknown concept ID: ${conceptId}`);
+  if (!target) return unknownConceptError(state, "skip");
   const leaves = getLeafDescendants(state, target.id);
   const nodes = cloneNodes(state.nodes);
   const events = [`Skip requested: ${target.title}`];
@@ -177,6 +216,17 @@ export function skipLessonNode(state: LessonState, conceptId: string) {
 
 export function queryLessonState(state: LessonState) {
   return snapshot(state, "query", true, "Authoritative hierarchical lesson coverage snapshot");
+}
+
+export function getNextSequentialConcept(state: LessonState) {
+  if (!state.currentNodeId) return null;
+  const atomicIds = getAtomicNodeIds(state);
+  const currentIndex = atomicIds.indexOf(state.currentNodeId);
+  const id = atomicIds.slice(currentIndex + 1).find((candidateId) => {
+    const status = state.nodes[candidateId].status;
+    return status !== "taught" && status !== "skipped";
+  });
+  return id ? state.nodes[id] : null;
 }
 
 function getFirstIncompleteDescendant(state: LessonState, nodeId: string) {
@@ -263,7 +313,41 @@ function compareNodes(a: LessonNode, b: LessonNode) {
 }
 
 function transitionError(state: LessonState, action: LessonAction, message: string) {
-  return { state, result: snapshot(state, action, false, message), events: [] as string[] };
+  return {
+    state,
+    result: {
+      ...snapshot(state, action, false, message),
+      error: "invalid_transition" as const,
+      recoveryRequired: true,
+    },
+    events: [] as string[],
+  };
+}
+
+function unknownConceptError(state: LessonState, action: LessonAction) {
+  const current = getCurrentConcept(state);
+  const relevantIds = new Set<string>();
+  if (current) {
+    relevantIds.add(current.id);
+    const next = getNextSequentialConcept(state);
+    if (next) relevantIds.add(next.id);
+    for (const sibling of Object.values(state.nodes)) {
+      if (sibling.parentId === current.parentId) relevantIds.add(sibling.id);
+    }
+  }
+  return {
+    state,
+    result: {
+      ...snapshot(state, action, false, "The requested concept is not in the authoritative lesson tree"),
+      error: "unknown_concept_id" as const,
+      recoveryRequired: true,
+      validRelevantNodes: [...relevantIds].slice(0, 8).map((id) => ({
+        id,
+        title: state.nodes[id].title,
+      })),
+    },
+    events: ["Invalid concept ID received"],
+  };
 }
 
 function transitionSuccess(state: LessonState, action: LessonAction, message: string, events: string[]) {
@@ -271,6 +355,8 @@ function transitionSuccess(state: LessonState, action: LessonAction, message: st
 }
 
 function snapshot(state: LessonState, action: LessonAction, ok: boolean, message: string): LessonStateResult {
+  const current = getCurrentConcept(state);
+  const next = getNextSequentialConcept(state);
   return {
     ok,
     action,
@@ -285,6 +371,18 @@ function snapshot(state: LessonState, action: LessonAction, ok: boolean, message
       parentId: node.parentId,
       status: node.status,
     })),
+    currentNodeTitle: current?.title ?? null,
+    currentNodeStatus: current?.status ?? null,
+    currentTeachingContract: current?.teaching,
+    nextSequentialNode: next ? { id: next.id, title: next.title } : null,
+    relevantNodes: current
+      ? Object.values(state.nodes)
+        .filter((node) => node.parentId === current.parentId)
+        .sort(compareNodes)
+        .slice(0, 8)
+        .map((node) => ({ id: node.id, title: node.title, status: node.status }))
+      : [],
+    resumePoint: state.resumePoint,
   };
 }
 
@@ -304,13 +402,23 @@ Lesson coverage is application-owned. LESSON_TREE is hierarchical. Parent topics
 Use the one lesson_state function:
 - navigate: explicit movement to a leaf or parent. Parent navigation resolves to an incomplete descendant.
 - skip: explicit skipping of a concept or subtree. Never use it for clarification. If teaching should continue elsewhere afterward, call navigate before teaching that atomic concept.
-- complete: only the current atomic concept after meaningfully satisfying its teaching contract. Before calling complete, check its objective, teachingPoints, and completionCriteria. Required core/supporting material must have been explained; optional enrichment does not block completion unless the learner asks for it. Never complete a parent or infer completion from a response ending, elapsed time, a concept mention, one covered point, or a clarification.
-- After complete, call navigate before beginning the next atomic concept; do not imply it has started sooner.
+- complete: only the current atomic concept after meaningfully satisfying its teaching contract. Before calling complete, check its objective, teachingPoints, and completionCriteria. Required core/supporting material must have been explained; optional enrichment does not block completion unless the learner asks for it. Never complete a parent or infer completion from a response ending, elapsed time, a concept mention, one covered point, or a clarification. A successful complete automatically selects and starts the next eligible atomic concept; continue from the returned currentNodeId and never call navigate for ordinary sequential progression.
 - query: questions about what was taught, skipped, or remains. Answer from the returned tree snapshot.
 
 Teaching contracts describe tutor coverage, not learner understanding. A taught status never implies mastery. Preserve contract keyTerms and notation. If sourceConfidence is uncertain, state uncertainty rather than inventing unreadable material.
 
-Never claim a parent is fully covered unless its returned status is taught. Never describe tool mechanics aloud. Teach depth-first in source order with concise explanations and occasional checks. On a clarification interruption, yield, answer, and resume the same atomic concept and contract without changing coverage.`;
+Never claim a parent is fully covered unless its returned status is taught. Never describe tool mechanics aloud. Teach depth-first in source order with concise explanations and occasional checks. On a clarification interruption, yield, answer, and resume the same atomic concept and contract without changing coverage.
+
+Never speak or quote text wrapped in [[APP_CONTROL:...]]. [[APP_CONTROL:IDLE_CONFIRMATION]] is an internal application signal, not learner speech. When received, naturally ask whether the learner is still there and wants to continue. Then use session_control exactly once when their response clearly means continue, end, or is unclear. During this confirmation, unrelated speech, television, ambient conversation, and nonsense are not confirmation; choose unclear unless intent is clearly directed to this lesson. After continue, resume the current concept naturally. After end, briefly acknowledge without continuing the lesson.
+
+[[APP_CONTROL:POST_RESUME_SYNC]] is an internal memory-alignment turn. Call lesson_state with action query exactly once, silently accept the returned application state and continuity snapshot as your own existing memory, then end this internal turn with no spoken or written learner-facing response. Do not greet, recap, teach, or continue output during this turn.
+[[APP_CONTROL:CONTINUE_INTERRUPTED_TUTOR_TURN]] means the transport changed while your immediately preceding explanation was unfinished. Continue directly from the interruptedAssistantTranscript/resumePoint in the continuity snapshot. Complete the unfinished thought naturally and concisely without greeting, announcing continuation, recapping the topic, or restarting the explanation.
+[[APP_CONTROL:LESSON_STATE_RECOVERY]] means a lesson-state operation failed internally. Silently call lesson_state query once, use the result, and continue naturally. Never retry an invalid operation more than once.
+[[APP_CONTROL:TEST_INVALID_ID]] is a development-only test. Call lesson_state navigate once with conceptId "__invalid_test__", then follow the silent recovery rule.
+
+A Live transport reconnection is not a new tutoring session. You are the exact same tutor continuing the exact same conversation, with the same tone, style, lesson position, and interruption context. Treat authoritative lesson state and continuity context as your own memory, never as notes handed to a replacement tutor. Never greet or recap merely because transport changed. Do not say "welcome back", "we're back", "we were discussing", "let's pick up where we left off", or mention anything before/after a reconnect or resumption unless the learner actually left and returned in a separate visible session.
+
+Never expose internal lesson IDs, function names, tool errors, state synchronization, transport/session recovery, WebSockets, or implementation details to the learner. If a lesson-state operation fails, remain conversationally silent about it, query authoritative state, retry once only if still appropriate, and continue naturally. Do not apologize for internal failures unless a genuine learner-visible problem requires explanation.`;
 }
 
 export function mergeTranscript(current: string, fragment: string) {

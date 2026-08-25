@@ -286,6 +286,70 @@ h1 {
   box-shadow: 0 0 0 4px rgb(22 135 93 / 18%);
 }
 
+.lesson-controls {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px 12px;
+  margin-bottom: 16px;
+}
+
+.mute-button,
+.quick-responses button {
+  min-height: 44px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.mute-button {
+  min-width: 104px;
+  padding: 10px 16px;
+}
+
+.mute-button-active {
+  border-color: #a52929;
+  background: rgb(179 45 45 / 10%);
+  color: #922727;
+}
+
+.mute-notice {
+  margin: 0;
+  color: #922727;
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
+.quick-responses {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.quick-responses button {
+  padding: 10px 8px;
+  color: var(--accent);
+}
+
+.mute-button:focus-visible,
+.quick-responses button:focus-visible {
+  outline: 3px solid rgb(37 87 214 / 22%);
+  outline-offset: 2px;
+}
+
+.quick-response-feedback {
+  min-height: 1em;
+  grid-column: 1 / -1;
+  margin: -2px 0 0;
+  color: var(--active);
+  font-size: 0.75rem;
+  text-align: center;
+}
+
 .start-button {
   width: 100%;
   min-height: 52px;
@@ -580,6 +644,26 @@ h1 {
 
 .debug-messages time {
   color: var(--text);
+}
+
+.debug-session-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.debug-session-controls button {
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 0.75rem;
+  font-weight: 700;
 }
 
 @media (max-width: 560px) {

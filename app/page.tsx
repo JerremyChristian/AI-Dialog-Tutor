@@ -3,7 +3,6 @@
 import type { FunctionCall, LiveServerMessage } from "@google/genai";
 import { useEffect, useRef, useState } from "react";
 import { LearningSourceUpload } from "../components/learning-source-upload";
-import { GeminiLiveWebSocket } from "../lib/gemini-live-websocket";
 import type {
   LearningSource,
   PreparedLearningSource,
@@ -11,8 +10,23 @@ import type {
 import {
   MicrophonePcmStreamer,
   PcmAudioPlayer,
-  arrayBufferToBase64,
 } from "../lib/realtime-audio";
+import {
+  ACOUSTIC_ACTIVITY_MULTIPLIER,
+  ACOUSTIC_LOG_COOLDOWN_MS,
+  ENGAGEMENT_CHECK_INTERVAL_MS,
+  IDLE_AFTER_MS,
+  IDLE_CONFIRMATION_MS,
+  MIN_ACOUSTIC_RMS,
+  NOISE_FLOOR_SMOOTHING,
+  isMeaningfulLearnerTranscript,
+  pcm16Rms,
+  type EngagementState,
+} from "../lib/engagement";
+import {
+  LiveTransportManager,
+  type LiveTransportState,
+} from "../lib/live-transport-manager";
 import {
   buildLessonInstruction,
   completeLessonConcept,
@@ -48,6 +62,20 @@ type InstallPromptEvent = Event & {
   userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
 };
 
+type QuickResponse = "Yes" | "Repeat" | "Continue";
+
+type ConversationContinuity = {
+  lastMeaningfulLearnerTranscript?: string;
+  lastAssistantTranscript?: string;
+  lastAssistantTurnComplete: boolean;
+  interruptedAssistantTranscript?: string;
+  resumePoint?: string;
+  learnerUtteranceActive: boolean;
+  learnerUtteranceOpen: boolean;
+  interruptionAlreadyRegistered: boolean;
+  interruptionEpoch?: string;
+};
+
 function getMicrophoneErrorMessage(error: unknown) {
   if (!(error instanceof DOMException)) {
     return error instanceof Error ? error.message : "Unknown microphone error";
@@ -79,6 +107,10 @@ export default function Home() {
   const [debugMessages, setDebugMessages] = useState<DebugMessage[]>([]);
   const [currentUtterance, setCurrentUtterance] = useState("");
   const [userError, setUserError] = useState("");
+  const [engagementState, setEngagementState] = useState<EngagementState>("ended");
+  const [transportState, setTransportState] = useState<LiveTransportState>("closed");
+  const [microphoneMuted, setMicrophoneMuted] = useState(false);
+  const [quickResponseFeedback, setQuickResponseFeedback] = useState("");
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const [showIosInstallHint, setShowIosInstallHint] = useState(false);
   const [topicInput, setTopicInput] = useState("");
@@ -89,7 +121,7 @@ export default function Home() {
   const preparedSourceRef = useRef<PreparedLearningSource | null>(null);
 
   const streamRef = useRef<MediaStream | null>(null);
-  const sessionRef = useRef<GeminiLiveWebSocket | null>(null);
+  const transportRef = useRef<LiveTransportManager | null>(null);
   const microphoneStreamerRef = useRef<MicrophonePcmStreamer | null>(null);
   const playerRef = useRef<PcmAudioPlayer | null>(null);
   const tokenRequestRef = useRef<AbortController | null>(null);
@@ -98,7 +130,9 @@ export default function Home() {
   const assistantSpeakingRef = useRef(false);
   const assistantTurnActiveRef = useRef(false);
   const userTranscriptRef = useRef("");
+  const lastMeaningfulLearnerTranscriptRef = useRef("");
   const assistantTranscriptRef = useRef("");
+  const lastAssistantTurnCompleteRef = useRef(true);
   const lessonStateRef = useRef(lessonState);
   const resumptionPendingRef = useRef(false);
   const sourceGroundingPendingRef = useRef(false);
@@ -107,6 +141,18 @@ export default function Home() {
   const nextMessageIdRef = useRef(0);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const lessonActiveRef = useRef(false);
+  const engagementStateRef = useRef<EngagementState>("ended");
+  const lastAcousticActivityAtRef = useRef<number | null>(null);
+  const lastCandidateLearnerActivityAtRef = useRef<number | null>(null);
+  const lastMeaningfulLearnerActivityAtRef = useRef<number | null>(null);
+  const noiseFloorRef = useRef(0.004);
+  const lastAcousticLogAtRef = useRef(0);
+  const engagementTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const confirmationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const microphoneMutedRef = useRef(false);
+  const quickResponseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const meaningfulConfirmationSpeechRef = useRef(false);
+  const silentLessonRecoveryPendingRef = useRef(false);
 
   const addDebugMessage = (text: string) => {
     if (!isMountedRef.current) return;
@@ -137,18 +183,8 @@ export default function Home() {
     microphoneStreamerRef.current = null;
     await microphoneStreamer?.stop();
 
-    const session = sessionRef.current;
-    sessionRef.current = null;
-    if (session) {
-      if (sendAudioStreamEnd) {
-        try {
-          session.sendRealtimeInput({ audioStreamEnd: true });
-        } catch {
-          // The WebSocket may already be closed.
-        }
-      }
-      session.close();
-    }
+    transportRef.current?.close(sendAudioStreamEnd);
+    transportRef.current = null;
 
     streamRef.current?.getAudioTracks().forEach((track) => track.stop());
     streamRef.current = null;
@@ -158,6 +194,7 @@ export default function Home() {
     await player?.close();
     assistantSpeakingRef.current = false;
     assistantTurnActiveRef.current = false;
+    lastAssistantTurnCompleteRef.current = true;
     resumptionPendingRef.current = false;
     sourceGroundingPendingRef.current = false;
     toolResultsRef.current.clear();
@@ -165,6 +202,21 @@ export default function Home() {
     lessonActiveRef.current = false;
     await wakeLockRef.current?.release().catch(() => undefined);
     wakeLockRef.current = null;
+    if (engagementTimerRef.current) clearInterval(engagementTimerRef.current);
+    if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
+    if (quickResponseTimerRef.current) clearTimeout(quickResponseTimerRef.current);
+    engagementTimerRef.current = null;
+    confirmationTimerRef.current = null;
+    quickResponseTimerRef.current = null;
+    engagementStateRef.current = "ended";
+    setEngagementState("ended");
+    setTransportState("closed");
+    microphoneMutedRef.current = false;
+    setMicrophoneMuted(false);
+    setQuickResponseFeedback("");
+    meaningfulConfirmationSpeechRef.current = false;
+    silentLessonRecoveryPendingRef.current = false;
+    lastMeaningfulLearnerTranscriptRef.current = "";
   };
 
   const requestWakeLock = async () => {
@@ -175,6 +227,102 @@ export default function Home() {
     } catch {
       addDebugMessage("Screen wake lock unavailable");
     }
+  };
+
+  const updateEngagementState = (state: EngagementState) => {
+    engagementStateRef.current = state;
+    setEngagementState(state);
+  };
+
+  const markMeaningfulActivity = () => {
+    const now = Date.now();
+    lastMeaningfulLearnerActivityAtRef.current = now;
+    lastCandidateLearnerActivityAtRef.current = now;
+    if (engagementStateRef.current === "active") {
+      addDebugMessage("Meaningful learner activity");
+    }
+  };
+
+  const scheduleIdleEnd = () => {
+    if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
+    confirmationTimerRef.current = setTimeout(() => {
+      if (engagementStateRef.current !== "confirming") return;
+      addDebugMessage("Session ended due to inactivity");
+      void stopConversation("inactivity");
+    }, IDLE_CONFIRMATION_MS);
+  };
+
+  const requestIdleConfirmation = () => {
+    if (!lessonActiveRef.current || engagementStateRef.current === "confirming") return;
+    updateEngagementState("possibly-idle");
+    addDebugMessage("Possible inactivity");
+    updateEngagementState("confirming");
+    addDebugMessage("Idle confirmation requested");
+    transportRef.current?.sendRealtimeInput({
+      text: "[[APP_CONTROL:IDLE_CONFIRMATION]]",
+    });
+    scheduleIdleEnd();
+  };
+
+  const beginIdleMonitoring = () => {
+    const now = Date.now();
+    lastMeaningfulLearnerActivityAtRef.current = now;
+    lastCandidateLearnerActivityAtRef.current = now;
+    updateEngagementState("active");
+    engagementTimerRef.current = setInterval(() => {
+      if (!lessonActiveRef.current || engagementStateRef.current !== "active") return;
+      const lastMeaningful = lastMeaningfulLearnerActivityAtRef.current ?? Date.now();
+      if (Date.now() - lastMeaningful < IDLE_AFTER_MS) return;
+      requestIdleConfirmation();
+    }, ENGAGEMENT_CHECK_INTERVAL_MS);
+  };
+
+  const toggleMicrophoneMute = () => {
+    const muted = !microphoneMutedRef.current;
+    microphoneMutedRef.current = muted;
+    transportRef.current?.setMicrophoneForwardingEnabled(!muted);
+    setMicrophoneMuted(muted);
+    markMeaningfulActivity();
+    addDebugMessage(
+      muted ? "Microphone forwarding muted" : "Microphone forwarding unmuted",
+    );
+  };
+
+  const sendQuickResponse = (response: QuickResponse) => {
+    const confirming = engagementStateRef.current === "confirming";
+    let text = response === "Yes"
+      ? "Yes."
+      : response === "Repeat"
+        ? "Please repeat or re-explain the last explanation."
+        : "Continue with the lesson.";
+
+    if (confirming && response === "Repeat") {
+      text = "Please repeat the question asking whether I want to continue.";
+    }
+
+    if (!transportRef.current?.sendLearnerText(text)) {
+      setUserError("The quick response could not be sent while reconnecting. Try again.");
+      return;
+    }
+
+    lastMeaningfulLearnerTranscriptRef.current = text;
+    markMeaningfulActivity();
+    addDebugMessage(`Quick response sent: ${response}`);
+    if (confirming && (response === "Yes" || response === "Continue")) {
+      if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
+      confirmationTimerRef.current = null;
+      updateEngagementState("active");
+      addDebugMessage("Quick response confirmed session continuation");
+    } else if (confirming && response === "Repeat") {
+      scheduleIdleEnd();
+    }
+
+    setQuickResponseFeedback(`${response} sent`);
+    if (quickResponseTimerRef.current) clearTimeout(quickResponseTimerRef.current);
+    quickResponseTimerRef.current = setTimeout(() => {
+      setQuickResponseFeedback("");
+      quickResponseTimerRef.current = null;
+    }, 1_500);
   };
 
   useEffect(() => {
@@ -191,6 +339,7 @@ export default function Home() {
     const onVisibilityChange = () => {
       if (document.visibilityState === "visible" && lessonActiveRef.current) {
         void requestWakeLock();
+        transportRef.current?.ensureHealthy();
         void playerRef.current?.prepare().catch(() => {
           setUserError("Audio was suspended. End the lesson, then start again.");
           addDebugMessage("Audio context could not resume after backgrounding");
@@ -223,7 +372,29 @@ export default function Home() {
     }
 
     const serverContent = message.serverContent;
+    const voiceActivity = message.voiceActivity?.voiceActivityType;
+    // Update transport gating before interruption handling. Gemini can deliver
+    // ACTIVITY_START and interrupted together; ordering this first prevents a
+    // pending graceful rollover from retiring the socket between those events.
+    if (voiceActivity === "ACTIVITY_START") {
+      transportRef.current?.setLearnerSpeaking(true);
+    } else if (voiceActivity === "ACTIVITY_END") {
+      transportRef.current?.setLearnerSpeaking(false);
+    }
     if (serverContent?.inputTranscription?.text) {
+      const transcriptFragment = serverContent.inputTranscription.text;
+      if (isMeaningfulLearnerTranscript(transcriptFragment)) {
+        lastMeaningfulLearnerTranscriptRef.current = mergeTranscript(
+          lastMeaningfulLearnerTranscriptRef.current,
+          transcriptFragment,
+        );
+        lastCandidateLearnerActivityAtRef.current = Date.now();
+        transportRef.current?.noteLearnerTurnReceived();
+        if (engagementStateRef.current === "active") markMeaningfulActivity();
+        else if (engagementStateRef.current === "confirming") {
+          meaningfulConfirmationSpeechRef.current = true;
+        }
+      }
       const wasInterrupted = lessonStateRef.current.status === "interrupted";
       userTranscriptRef.current = mergeTranscript(
         userTranscriptRef.current,
@@ -245,9 +416,13 @@ export default function Home() {
     }
 
     if (serverContent?.outputTranscription?.text) {
+      lastAssistantTurnCompleteRef.current = false;
       if (!assistantTurnActiveRef.current) {
         assistantTurnActiveRef.current = true;
         assistantTranscriptRef.current = "";
+      }
+      if (engagementStateRef.current === "confirming" && !assistantSpeakingRef.current) {
+        addDebugMessage("Idle confirmation spoken");
       }
       assistantTranscriptRef.current = mergeTranscript(
         assistantTranscriptRef.current,
@@ -265,31 +440,36 @@ export default function Home() {
       // later UX refinement; yielding to the learner remains the priority.
       playerRef.current?.clear();
       assistantSpeakingRef.current = false;
+      const interruption = transportRef.current?.registerInterruption();
+      transportRef.current?.setAssistantSpeaking(false);
       assistantTurnActiveRef.current = false;
-
-      const current = lessonStateRef.current;
-      const interruptedTranscript =
-        assistantTranscriptRef.current || current.lastAssistantTranscript;
-      const currentConcept = getCurrentConcept(current)?.title || "current concept";
-      const resumePoint = deriveResumePoint(
-        interruptedTranscript,
-        currentConcept,
-      );
-      updateLessonState((state) => ({
-        ...state,
-        status: "interrupted",
-        resumePoint,
-        interruptionCount: state.interruptionCount + 1,
-        lastAssistantTranscript: interruptedTranscript,
-      }));
-      resumptionPendingRef.current = true;
-      addDebugMessage("Assistant interrupted");
-      addDebugMessage(`Resume point saved: ${resumePoint}`);
+      lastAssistantTurnCompleteRef.current = false;
+      if (!interruption?.duplicate) {
+        const current = lessonStateRef.current;
+        const interruptedTranscript =
+          assistantTranscriptRef.current || current.lastAssistantTranscript;
+        const currentConcept = getCurrentConcept(current)?.title || "current concept";
+        const resumePoint = deriveResumePoint(
+          interruptedTranscript,
+          currentConcept,
+        );
+        updateLessonState((state) => ({
+          ...state,
+          status: "interrupted",
+          resumePoint,
+          interruptionCount: state.interruptionCount + 1,
+          lastAssistantTranscript: interruptedTranscript,
+        }));
+        resumptionPendingRef.current = true;
+        addDebugMessage("Assistant interrupted");
+        addDebugMessage(`Resume point saved: ${resumePoint}`);
+      }
     }
 
-    const voiceActivity = message.voiceActivity?.voiceActivityType;
     if (voiceActivity === "ACTIVITY_START") {
       userTranscriptRef.current = "";
+      lastMeaningfulLearnerTranscriptRef.current = "";
+      lastCandidateLearnerActivityAtRef.current = Date.now();
       addDebugMessage("User speech started");
       if (lessonStateRef.current.status === "interrupted") {
         updateLessonState((current) => ({
@@ -310,6 +490,7 @@ export default function Home() {
 
       if (!assistantSpeakingRef.current) {
         assistantSpeakingRef.current = true;
+        transportRef.current?.setAssistantSpeaking(true);
         sourceGroundingPendingRef.current = false;
         if (!assistantTurnActiveRef.current) {
           assistantTurnActiveRef.current = true;
@@ -330,6 +511,8 @@ export default function Home() {
     if (serverContent.generationComplete) {
       assistantSpeakingRef.current = false;
       assistantTurnActiveRef.current = false;
+      lastAssistantTurnCompleteRef.current = true;
+      transportRef.current?.setAssistantSpeaking(false);
       updateLessonState((state) => ({
         ...state,
         status: state.status === "idle" ? "idle" : "teaching",
@@ -343,10 +526,29 @@ export default function Home() {
 
   const handleLessonToolCalls = (calls: FunctionCall[]) => {
     const functionResponses: Array<Record<string, unknown>> = [];
+    let endAfterResponse = false;
+    let postResumeQueryReceived = false;
+    let recoveryQueryReceived = false;
+    let requestSilentRecovery = false;
 
     for (const call of calls) {
       const id = call.id;
-      if (!id || cancelledToolCallIdsRef.current.has(id)) continue;
+      if (!id) {
+        addDebugMessage("Lesson tool call missing required response ID");
+        continue;
+      }
+      if (cancelledToolCallIdsRef.current.has(id)) continue;
+      const args = call.args ?? {};
+      const action = args.action;
+      const conceptId = args.conceptId;
+      const isLessonQuery = call.name === "lesson_state" && action === "query";
+      if (isLessonQuery && transportRef.current?.isPostResumeSynchronizing()) {
+        postResumeQueryReceived = true;
+        addDebugMessage("Post-resume state query received");
+      }
+      if (isLessonQuery && silentLessonRecoveryPendingRef.current) {
+        recoveryQueryReceived = true;
+      }
 
       const cached = toolResultsRef.current.get(id);
       if (cached) {
@@ -354,17 +556,63 @@ export default function Home() {
         continue;
       }
 
-      addDebugMessage("Lesson tool call received");
+      addDebugMessage(call.name === "session_control"
+        ? "Session control tool call received"
+        : "Lesson tool call received");
       let result;
       let events: string[] = [];
-      const args = call.args ?? {};
-      const action = args.action;
-      const conceptId = args.conceptId;
 
-      if (call.name !== "lesson_state") {
+      if (call.name === "session_control") {
+        if (engagementStateRef.current !== "confirming" && action === "continue") {
+          result = { ok: true, action: "continue", message: "Session is already active" };
+        } else if (engagementStateRef.current !== "confirming") {
+          result = { ok: false, message: "No idle confirmation is active" };
+        } else if (action === "continue") {
+          if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
+          confirmationTimerRef.current = null;
+          updateEngagementState("active");
+          if (meaningfulConfirmationSpeechRef.current) markMeaningfulActivity();
+          meaningfulConfirmationSpeechRef.current = false;
+          addDebugMessage("Continue confirmed");
+          result = { ok: true, action: "continue", message: "Continue the current lesson" };
+        } else if (action === "end") {
+          meaningfulConfirmationSpeechRef.current = false;
+          addDebugMessage("End confirmed");
+          result = { ok: true, action: "end", message: "End the lesson" };
+          endAfterResponse = true;
+        } else {
+          meaningfulConfirmationSpeechRef.current = false;
+          addDebugMessage("Idle confirmation unclear");
+          result = { ok: true, action: "unclear", message: "Remain in confirmation" };
+        }
+      } else if (call.name !== "lesson_state") {
         result = { ok: false, error: `Unknown function: ${call.name || "missing"}` };
       } else if (action === "query") {
-        result = queryLessonState(lessonStateRef.current);
+        const state = lessonStateRef.current;
+        const continuity: ConversationContinuity = {
+          lastMeaningfulLearnerTranscript:
+            lastMeaningfulLearnerTranscriptRef.current || undefined,
+          lastAssistantTranscript:
+            assistantTranscriptRef.current || state.lastAssistantTranscript || undefined,
+          lastAssistantTurnComplete: lastAssistantTurnCompleteRef.current,
+          interruptedAssistantTranscript:
+            !lastAssistantTurnCompleteRef.current
+              ? assistantTranscriptRef.current || state.lastAssistantTranscript || undefined
+              : undefined,
+          resumePoint: state.resumePoint || undefined,
+          ...(transportRef.current?.getInterruptionContinuity() ?? {
+            learnerUtteranceActive: false,
+            learnerUtteranceOpen: false,
+            interruptionAlreadyRegistered: false,
+          }),
+        };
+        result = {
+          ...queryLessonState(state),
+          ...(postResumeQueryReceived ? { continuity } : {}),
+        };
+        if (postResumeQueryReceived) {
+          addDebugMessage("Post-resume continuity snapshot prepared");
+        }
         addDebugMessage("Lesson state queried");
       } else if (
         (action === "navigate" || action === "complete" || action === "skip") &&
@@ -373,7 +621,7 @@ export default function Home() {
         if (action === "complete") {
           const requestedNode = lessonStateRef.current.nodes[conceptId];
           addDebugMessage(
-            `Atomic concept completion requested: ${requestedNode?.title || conceptId}`,
+            `Atomic concept completion requested: ${requestedNode?.title || "unknown concept"}`,
           );
         }
         const transition = action === "navigate"
@@ -387,30 +635,54 @@ export default function Home() {
           lessonStateRef.current = transition.state;
           setLessonState(transition.state);
         }
+        if (transition.result.recoveryRequired && !silentLessonRecoveryPendingRef.current) {
+          silentLessonRecoveryPendingRef.current = true;
+          requestSilentRecovery = true;
+        }
       } else {
         const snapshot = queryLessonState(lessonStateRef.current);
+        const missingConcept = action === "navigate" || action === "complete" || action === "skip";
         result = {
           ...snapshot,
           ok: false,
-          message:
-            action === "navigate" || action === "complete" || action === "skip"
-              ? `conceptId is required for ${action}`
-              : "action must be navigate, complete, skip, or query",
+          message: missingConcept
+            ? "A concept is required for this operation"
+            : "Unsupported lesson-state action",
+          error: missingConcept ? "missing_concept_id" : "invalid_action",
+          recoveryRequired: missingConcept,
         };
+        if (missingConcept && !silentLessonRecoveryPendingRef.current) {
+          silentLessonRecoveryPendingRef.current = true;
+          requestSilentRecovery = true;
+        }
       }
 
       for (const event of events) addDebugMessage(event);
       const response = { result };
       toolResultsRef.current.set(id, response);
-      functionResponses.push({ id, name: "lesson_state", response });
+      functionResponses.push({ id, name: call.name || "lesson_state", response });
     }
 
     if (functionResponses.length === 0) return;
-    if (sessionRef.current?.sendToolResponse(functionResponses)) {
+    if (transportRef.current?.sendToolResponse(functionResponses)) {
       addDebugMessage("Lesson state tool response sent");
+      if (postResumeQueryReceived) {
+        addDebugMessage("Post-resume state response sent");
+        transportRef.current.completePostResumeSynchronization();
+      }
+      if (recoveryQueryReceived) {
+        silentLessonRecoveryPendingRef.current = false;
+        addDebugMessage("Silent lesson-state recovery complete");
+      } else if (requestSilentRecovery) {
+        addDebugMessage("Silent lesson-state recovery started");
+        transportRef.current?.sendRealtimeInput({
+          text: "[[APP_CONTROL:LESSON_STATE_RECOVERY]]",
+        });
+      }
     } else {
       addDebugMessage("Realtime error: Live connection closed before lesson state response");
     }
+    if (endAfterResponse) window.setTimeout(() => void stopConversation("confirmed"), 250);
   };
 
   const startConversation = async () => {
@@ -427,6 +699,37 @@ export default function Home() {
     const preparedSource = preparedSourceRef.current;
     const lessonFocus = topicInput.trim();
     const lessonTopic = lessonFocus || `Main topics in ${activeSource.name}`;
+    const requestFreshToken = async () => {
+      addDebugMessage("Gemini token requested");
+      const controller = new AbortController();
+      tokenRequestRef.current = controller;
+      const response = await fetch("/api/gemini-token", {
+        method: "POST",
+        cache: "no-store",
+        signal: controller.signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          topic: lessonFocus,
+          source: { name: activeSource.name, mimeType: activeSource.mimeType },
+        }),
+      });
+      const body = (await response.json()) as {
+        token?: string;
+        newSessionExpiresAt?: number;
+        error?: string;
+        source?: { name: string; mimeType: string };
+      };
+      if (!response.ok || !body.token || !body.source) {
+        throw new Error(body.error || "Gemini token request failed");
+      }
+      if (tokenRequestRef.current === controller) tokenRequestRef.current = null;
+      addDebugMessage("Gemini token received");
+      return {
+        token: body.token,
+        source: body.source,
+        newSessionExpiresAt: body.newSessionExpiresAt,
+      };
+    };
     const initialLessonState = createLessonState(
       lessonTopic,
       preparedSource.lessonTree,
@@ -435,7 +738,9 @@ export default function Home() {
     setLessonState(initialLessonState);
     setTopicInput(lessonFocus);
     userTranscriptRef.current = "";
+    lastMeaningfulLearnerTranscriptRef.current = "";
     assistantTranscriptRef.current = "";
+    lastAssistantTurnCompleteRef.current = true;
     setCurrentUtterance("");
     resumptionPendingRef.current = false;
     addDebugMessage(`Lesson initialized from source: ${activeSource.name}`);
@@ -488,99 +793,61 @@ export default function Home() {
       await playerReady;
 
       setAiConnectionStatus("Connecting");
-      addDebugMessage("Gemini token requested");
-      const tokenRequest = new AbortController();
-      tokenRequestRef.current = tokenRequest;
-      const tokenResponse = await fetch("/api/gemini-token", {
-        method: "POST",
-        cache: "no-store",
-        signal: tokenRequest.signal,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          topic: lessonFocus,
-          source: {
-            name: activeSource.name,
-            mimeType: activeSource.mimeType,
-          },
-        }),
-      });
-      const tokenBody = (await tokenResponse.json()) as {
-        token?: string;
-        error?: string;
-        source?: {
-          name: string;
-          mimeType: string;
-        };
-      };
-
-      if (!tokenResponse.ok || !tokenBody.token || !tokenBody.source) {
-        throw new Error(tokenBody.error || "Gemini token request failed");
-      }
+      const tokenBody = await requestFreshToken();
       if (!isMountedRef.current || run !== conversationRunRef.current) return;
 
-      tokenRequestRef.current = null;
-      addDebugMessage("Gemini token received");
       addDebugMessage("Live connection opening");
       const systemInstruction = buildLessonInstruction(
         lessonFocus,
         tokenBody.source.name,
       );
 
-      const session = new GeminiLiveWebSocket({
+      const transport = new LiveTransportManager({
+        model: GEMINI_LIVE_MODEL,
+        systemInstruction,
+        requestToken: requestFreshToken,
         onMessage: (message) => {
           if (isMountedRef.current && run === conversationRunRef.current) {
             handleLiveMessage(message);
           }
         },
-        onError: (message) => {
-          if (isMountedRef.current && run === conversationRunRef.current) {
-            setAiConnectionStatus("Error");
-            setUserError(`Gemini Live connection failed: ${message}`);
-            if (sourceGroundingPendingRef.current) {
-              addDebugMessage(`Source grounding failed: ${message}`);
-            }
-            addDebugMessage(`Realtime error: ${message}`);
-          }
+        onDebug: addDebugMessage,
+        onStateChange: (state) => {
+          if (!isMountedRef.current || run !== conversationRunRef.current) return;
+          setTransportState(state);
+          setAiConnectionStatus(
+            state === "active" || state === "rollover-ready"
+              ? "Connected"
+              : state === "closed"
+                ? "Not connected"
+                : "Connecting",
+          );
         },
-        onClose: ({ code, reason }) => {
-          if (isMountedRef.current && run === conversationRunRef.current) {
-            setAiConnectionStatus("Not connected");
-            const closeDetails = reason
-              ? `${reason} (code ${code})`
-              : `code ${code}`;
-            setUserError("The realtime connection ended. Start the lesson again when ready.");
-            if (sourceGroundingPendingRef.current) {
-              addDebugMessage(
-                `Source grounding failed: Live connection closed before the first response (${closeDetails})`,
-              );
-            }
-            addDebugMessage(`Live connection closed (${closeDetails})`);
-            const hadMicrophone = Boolean(streamRef.current);
-            conversationRunRef.current += 1;
-            void disposeResources(false).then(() => {
-              if (isMountedRef.current && hadMicrophone) {
-                setMicrophoneStatus("Not active");
-                updateLessonState((current) => ({
-                  ...current,
-                  status: "idle",
-                }));
-                addDebugMessage("Microphone stopped");
-              }
-            });
-          }
+        seedFreshRecovery: (socket) => {
+          socket.seedRecoveryContext({ ...preparedSource, focus: lessonFocus }, {
+            coverage: queryLessonState(lessonStateRef.current),
+            currentTeachingContract: getCurrentConcept(lessonStateRef.current)?.teaching,
+            resumePoint: lessonStateRef.current.resumePoint,
+          });
+        },
+        onFatalError: (message) => {
+          if (!isMountedRef.current || run !== conversationRunRef.current) return;
+          setUserError(`The realtime lesson could not recover: ${message}`);
+          setAiConnectionStatus("Error");
+          setMicrophoneStatus("Not active");
+          updateLessonState((current) => ({ ...current, status: "idle" }));
+          conversationRunRef.current += 1;
+          void disposeResources(false);
         },
       });
-      await session.connect(tokenBody.token, {
-        model: GEMINI_LIVE_MODEL,
-        systemInstruction,
-      });
+      transportRef.current = transport;
+      const session = await transport.connectInitial(tokenBody.token);
 
       if (!isMountedRef.current || run !== conversationRunRef.current) {
-        session.close();
+        transport.close(false);
         return;
       }
 
-      sessionRef.current = session;
       setAiConnectionStatus("Connected");
       addDebugMessage("Live connection established");
       sourceGroundingPendingRef.current = true;
@@ -593,14 +860,17 @@ export default function Home() {
       addDebugMessage("Source grounding ready");
 
       const microphoneStreamer = new MicrophonePcmStreamer(stream, (chunk) => {
-        if (run !== conversationRunRef.current || sessionRef.current !== session) return;
-
-        session.sendRealtimeInput({
-          audio: {
-            data: arrayBufferToBase64(chunk),
-            mimeType: "audio/pcm;rate=16000",
-          },
-        });
+        if (run !== conversationRunRef.current || transportRef.current !== transport) return;
+        const rms = pcm16Rms(chunk);
+        noiseFloorRef.current += (rms - noiseFloorRef.current) * NOISE_FLOOR_SMOOTHING;
+        if (rms >= Math.max(MIN_ACOUSTIC_RMS, noiseFloorRef.current * ACOUSTIC_ACTIVITY_MULTIPLIER)) {
+          lastAcousticActivityAtRef.current = Date.now();
+          if (Date.now() - lastAcousticLogAtRef.current >= ACOUSTIC_LOG_COOLDOWN_MS) {
+            lastAcousticLogAtRef.current = Date.now();
+            addDebugMessage("Acoustic activity detected");
+          }
+        }
+        if (!microphoneMutedRef.current) transport.sendAudio(chunk);
       });
       microphoneStreamerRef.current = microphoneStreamer;
       await microphoneStreamer.start();
@@ -617,8 +887,9 @@ export default function Home() {
       }));
       addDebugMessage("Lesson started");
       lessonActiveRef.current = true;
+      beginIdleMonitoring();
       void requestWakeLock();
-      session.sendRealtimeInput({
+      transport.sendRealtimeInput({
         text: `Begin the source-grounded spoken lesson now. Identify the uploaded material as "${tokenBody.source.name}", briefly preview what you will cover, then teach the first concept${
           lessonFocus ? ` related to ${lessonFocus}` : " from the source"
         }.`,
@@ -660,14 +931,20 @@ export default function Home() {
     }
   };
 
-  const stopConversation = async () => {
+  const stopConversation = async (reason?: "inactivity" | "confirmed") => {
     conversationRunRef.current += 1;
     const hadMicrophone = Boolean(streamRef.current);
-    const hadSession = Boolean(sessionRef.current);
+    const hadSession = Boolean(transportRef.current);
     setMicrophoneStatus("Not active");
     setAiConnectionStatus("Not connected");
     updateLessonState((current) => ({ ...current, status: "idle" }));
     await disposeResources(true);
+
+    if (reason === "inactivity") {
+      setUserError("The lesson ended after no response to the inactivity check.");
+    } else if (reason === "confirmed") {
+      setUserError("The lesson has ended.");
+    }
 
     if (hadMicrophone) addDebugMessage("Microphone stopped");
     if (hadSession) addDebugMessage("Live connection closed");
@@ -765,10 +1042,43 @@ export default function Home() {
           </div>
         </div>
 
+        {lessonActive && (
+          <section className="lesson-controls" aria-label="Lesson response controls">
+            <button
+              className={`mute-button${microphoneMuted ? " mute-button-active" : ""}`}
+              type="button"
+              onClick={toggleMicrophoneMute}
+              aria-label={microphoneMuted ? "Unmute microphone" : "Mute microphone"}
+              aria-pressed={microphoneMuted}
+            >
+              {microphoneMuted ? "Unmute" : "Mute"}
+            </button>
+            {microphoneMuted && (
+              <p className="mute-notice" role="status">
+                Microphone muted — tutor cannot hear you
+              </p>
+            )}
+            <div className="quick-responses" aria-label="Quick responses">
+              <button type="button" onClick={() => sendQuickResponse("Yes")} aria-label="Yes">
+                Yes
+              </button>
+              <button type="button" onClick={() => sendQuickResponse("Repeat")} aria-label="Repeat explanation">
+                Repeat
+              </button>
+              <button type="button" onClick={() => sendQuickResponse("Continue")} aria-label="Continue lesson">
+                Continue
+              </button>
+            </div>
+            <p className="quick-response-feedback" role="status" aria-live="polite">
+              {quickResponseFeedback}
+            </p>
+          </section>
+        )}
+
         <button
           className="start-button"
           type="button"
-          onClick={microphoneActive ? stopConversation : startConversation}
+          onClick={microphoneActive ? () => void stopConversation() : startConversation}
           disabled={
             requestingPermission ||
             (!microphoneActive && learningSource?.status !== "ready")
@@ -806,6 +1116,14 @@ export default function Home() {
             <div>
               <dt>Interruptions</dt>
               <dd>{lessonState.interruptionCount}</dd>
+            </div>
+            <div>
+              <dt>Transport</dt>
+              <dd>{transportState}</dd>
+            </div>
+            <div>
+              <dt>Engagement</dt>
+              <dd>{engagementState}</dd>
             </div>
             <div>
               <dt>Latest learner transcript</dt>
@@ -892,6 +1210,30 @@ export default function Home() {
         <details className="transcript">
           <summary id="transcript-title">Show Debug</summary>
           <div className="transcript-body" role="log" aria-live="polite" aria-labelledby="transcript-title">
+            {process.env.NODE_ENV === "development" && lessonActive && (
+              <div className="debug-session-controls" aria-label="Development session controls">
+                <button type="button" onClick={() => transportRef.current?.requestSafeRolloverForTest()}>
+                  Force safe rollover
+                </button>
+                <button type="button" onClick={() => transportRef.current?.requestImmediateRolloverForTest()}>
+                  Force immediate rollover
+                </button>
+                <button type="button" onClick={() => transportRef.current?.requestImmediateRolloverForTest(true)}>
+                  Test recovery fallback
+                </button>
+                <button type="button" onClick={requestIdleConfirmation}>
+                  Test idle confirmation
+                </button>
+                <button
+                  type="button"
+                  onClick={() => transportRef.current?.sendRealtimeInput({
+                    text: "[[APP_CONTROL:TEST_INVALID_ID]]",
+                  })}
+                >
+                  Test invalid lesson ID
+                </button>
+              </div>
+            )}
             {debugMessages.length === 0 ? (
               <p>Conversation events and transcript messages will appear here.</p>
             ) : (

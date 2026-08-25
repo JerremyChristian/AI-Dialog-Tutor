@@ -9,6 +9,9 @@ import { SUPPORTED_SOURCE_TYPES } from "../../../lib/learning-source";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+const NEW_SESSION_WINDOW_MS = 5 * 60_000;
+const TOKEN_MESSAGE_LIFETIME_MS = 30 * 60_000;
+
 export async function POST(request: Request) {
   const apiKey = process.env.GEMINI_API_KEY;
 
@@ -52,17 +55,20 @@ export async function POST(request: Request) {
     const normalizedSourceName = sourceName.trim();
     const systemInstruction = buildLessonInstruction(topic, normalizedSourceName);
     const now = Date.now();
+    const newSessionExpiresAt = now + NEW_SESSION_WINDOW_MS;
     const token = await client.authTokens.create({
       config: {
         uses: 1,
-        newSessionExpireTime: new Date(now + 60_000).toISOString(),
-        expireTime: new Date(now + 30 * 60_000).toISOString(),
+        newSessionExpireTime: new Date(newSessionExpiresAt).toISOString(),
+        expireTime: new Date(now + TOKEN_MESSAGE_LIFETIME_MS).toISOString(),
         liveConnectConstraints: {
           model: GEMINI_LIVE_MODEL,
           config: {
             responseModalities: [Modality.AUDIO],
             inputAudioTranscription: {},
             outputAudioTranscription: {},
+            sessionResumption: {},
+            contextWindowCompression: { slidingWindow: {} },
             systemInstruction,
           },
         },
@@ -77,6 +83,7 @@ export async function POST(request: Request) {
     return NextResponse.json(
       {
         token: token.name,
+        newSessionExpiresAt,
         source: {
           name: normalizedSourceName,
           mimeType: sourceMimeType,

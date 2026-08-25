@@ -5,6 +5,8 @@ import { createLessonState, queryLessonState } from "./lesson-state";
 const LIVE_WEBSOCKET_URL =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained";
 
+export const TUTOR_VOICE = "Kore";
+
 type LiveCallbacks = {
   onMessage: (message: LiveServerMessage) => void;
   onError: (message: string) => void;
@@ -14,11 +16,79 @@ type LiveCallbacks = {
 type SetupConfig = {
   model: string;
   systemInstruction: string;
+  resumptionHandle?: string;
 };
 
 type InitialSource = PreparedLearningSource & {
   focus: string;
 };
+
+function buildLiveSetup(config: SetupConfig) {
+  return {
+    model: `models/${config.model}`,
+    generationConfig: {
+      responseModalities: ["AUDIO"],
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: { voiceName: TUTOR_VOICE },
+        },
+      },
+    },
+    systemInstruction: {
+      parts: [{ text: config.systemInstruction }],
+    },
+    inputAudioTranscription: {},
+    outputAudioTranscription: {},
+    sessionResumption: config.resumptionHandle
+      ? { handle: config.resumptionHandle }
+      : {},
+    contextWindowCompression: { slidingWindow: {} },
+    historyConfig: { initialHistoryInClientContent: true },
+    tools: [
+      {
+        functionDeclarations: [
+          {
+            name: "lesson_state",
+            description:
+              "Synchronize authoritative hierarchical lesson coverage. Use navigate only for explicit learner-directed movement, skip for explicit subtree skipping, complete only after meaningfully finishing the current atomic concept, and query for authoritative state. A successful complete automatically advances to the next eligible atomic concept; continue from the returned currentNodeId without calling navigate.",
+            parametersJsonSchema: {
+              type: "object",
+              properties: {
+                action: {
+                  type: "string",
+                  enum: ["navigate", "complete", "skip", "query"],
+                },
+                conceptId: {
+                  type: "string",
+                  description:
+                    "Stable node ID from LESSON_TREE. Required for navigate, complete, and skip.",
+                },
+              },
+              required: ["action"],
+              additionalProperties: false,
+            },
+          },
+          {
+            name: "session_control",
+            description:
+              "Resolve the application's idle confirmation. Use only when the application has asked whether the learner wants to continue. Continue only for speech clearly directed to the tutor or a clear lesson request; end for a clear stop/finish response; otherwise use unclear.",
+            parametersJsonSchema: {
+              type: "object",
+              properties: {
+                action: {
+                  type: "string",
+                  enum: ["continue", "end", "unclear"],
+                },
+              },
+              required: ["action"],
+              additionalProperties: false,
+            },
+          },
+        ],
+      },
+    ],
+  };
+}
 
 export class GeminiLiveWebSocket {
   private socket: WebSocket | null = null;
@@ -36,43 +106,7 @@ export class GeminiLiveWebSocket {
 
       socket.onopen = () => {
         this.send({
-          setup: {
-            model: `models/${config.model}`,
-            generationConfig: { responseModalities: ["AUDIO"] },
-            systemInstruction: {
-              parts: [{ text: config.systemInstruction }],
-            },
-            inputAudioTranscription: {},
-            outputAudioTranscription: {},
-            historyConfig: { initialHistoryInClientContent: true },
-            tools: [
-              {
-                functionDeclarations: [
-                  {
-                    name: "lesson_state",
-                    description:
-                      "Synchronize authoritative hierarchical lesson coverage. Use navigate for movement, skip for explicit subtree skipping, complete only after meaningfully finishing the current atomic concept, and query for coverage questions. Navigate before teaching a new atomic concept after complete or skip.",
-                    parametersJsonSchema: {
-                      type: "object",
-                      properties: {
-                        action: {
-                          type: "string",
-                          enum: ["navigate", "complete", "skip", "query"],
-                        },
-                        conceptId: {
-                          type: "string",
-                          description:
-                            "Stable node ID from LESSON_TREE. Required for navigate, complete, and skip.",
-                        },
-                      },
-                      required: ["action"],
-                      additionalProperties: false,
-                    },
-                  },
-                ],
-              },
-            ],
-          },
+          setup: buildLiveSetup(config),
         });
       };
 
@@ -156,9 +190,35 @@ export class GeminiLiveWebSocket {
     });
   }
 
+  seedRecoveryContext(source: InitialSource, lessonSnapshot: unknown) {
+    const currentSource = source.mimeType === "application/pdf" ? "PDF" : "PLAIN_TEXT";
+    this.send({
+      clientContent: {
+        turns: [{
+          role: "user",
+          parts: [{
+            text: `RECOVERED_APPLICATION_CONTEXT. Continue the existing spoken lesson naturally; do not greet or restart it. The application lesson state below is authoritative.\n\nSOURCE_FILENAME:\n${source.name}\n\nSOURCE_TYPE:\n${currentSource}\n\nLESSON_STATE:\n${JSON.stringify(lessonSnapshot)}\n\nBEGIN SOURCE_CONTENT\n${source.text}\nEND SOURCE_CONTENT`,
+          }],
+        }],
+        turnComplete: true,
+      },
+    });
+  }
+
   sendRealtimeInput(input: Record<string, unknown>) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false;
     this.socket.send(JSON.stringify({ realtimeInput: input }));
+    return true;
+  }
+
+  sendLearnerText(text: string) {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(JSON.stringify({
+      clientContent: {
+        turns: [{ role: "user", parts: [{ text }] }],
+        turnComplete: true,
+      },
+    }));
     return true;
   }
 
@@ -174,6 +234,10 @@ export class GeminiLiveWebSocket {
     if (socket && socket.readyState < WebSocket.CLOSING) {
       socket.close(1000, "Conversation stopped");
     }
+  }
+
+  isOpen() {
+    return this.socket?.readyState === WebSocket.OPEN;
   }
 
   private send(message: Record<string, unknown>) {
