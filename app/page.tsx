@@ -3,6 +3,7 @@
 import type { FunctionCall, LiveServerMessage } from "@google/genai";
 import { useEffect, useRef, useState } from "react";
 import { LearningSourceUpload } from "../components/learning-source-upload";
+import { LessonRoadmap } from "../components/lesson-roadmap";
 import type {
   LearningSource,
   PreparedLearningSource,
@@ -41,6 +42,13 @@ import {
   skipLessonNode,
   type LessonState,
 } from "../lib/lesson-state";
+import {
+  DEFAULT_TEACHING_PREFERENCES,
+  EXPLANATION_DEPTHS,
+  TEACHING_PACES,
+  applyTeachingPreferenceUpdate,
+  type TeachingPreferences,
+} from "../lib/teaching-preferences";
 
 type MicrophoneStatus =
   | "Not active"
@@ -63,6 +71,7 @@ type InstallPromptEvent = Event & {
 };
 
 type QuickResponse = "Yes" | "Repeat" | "Continue";
+type TeachingPreferenceUpdate = Partial<TeachingPreferences>;
 
 type ConversationContinuity = {
   lastMeaningfulLearnerTranscript?: string;
@@ -99,6 +108,59 @@ function getRealtimeErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unknown Gemini Live error";
 }
 
+function TeachingStyleControls({
+  preferences,
+  disabled,
+  onChange,
+}: {
+  preferences: TeachingPreferences;
+  disabled?: boolean;
+  onChange: (update: TeachingPreferenceUpdate) => void;
+}) {
+  return (
+    <div className="teaching-style-controls">
+      <fieldset disabled={disabled}>
+        <legend>Explanation</legend>
+        <div className="preference-segments">
+          {EXPLANATION_DEPTHS.map((depth) => (
+            <button
+              key={depth}
+              type="button"
+              className={preferences.explanationDepth === depth ? "selected" : undefined}
+              aria-label={`${capitalize(depth)} explanation depth`}
+              aria-pressed={preferences.explanationDepth === depth}
+              onClick={() => onChange({ explanationDepth: depth })}
+            >
+              {capitalize(depth)}
+            </button>
+          ))}
+        </div>
+      </fieldset>
+      <fieldset disabled={disabled}>
+        <legend>Pace</legend>
+        <div className="preference-segments">
+          {TEACHING_PACES.map((pace) => (
+            <button
+              key={pace}
+              type="button"
+              className={preferences.teachingPace === pace ? "selected" : undefined}
+              aria-label={`${capitalize(pace)} teaching pace`}
+              aria-pressed={preferences.teachingPace === pace}
+              onClick={() => onChange({ teachingPace: pace })}
+            >
+              {capitalize(pace)}
+            </button>
+          ))}
+        </div>
+      </fieldset>
+    </div>
+  );
+}
+
+function capitalize(value: string) {
+  return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
+}
+
 export default function Home() {
   const [microphoneStatus, setMicrophoneStatus] =
     useState<MicrophoneStatus>("Not active");
@@ -111,6 +173,11 @@ export default function Home() {
   const [transportState, setTransportState] = useState<LiveTransportState>("closed");
   const [microphoneMuted, setMicrophoneMuted] = useState(false);
   const [quickResponseFeedback, setQuickResponseFeedback] = useState("");
+  const [teachingPreferences, setTeachingPreferences] = useState<TeachingPreferences>(
+    DEFAULT_TEACHING_PREFERENCES,
+  );
+  const [preferenceUpdatePending, setPreferenceUpdatePending] = useState(false);
+  const [roadmapNavigationPending, setRoadmapNavigationPending] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const [showIosInstallHint, setShowIosInstallHint] = useState(false);
   const [topicInput, setTopicInput] = useState("");
@@ -150,7 +217,12 @@ export default function Home() {
   const engagementTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const confirmationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const microphoneMutedRef = useRef(false);
+  const microphoneMuteTransitionRef = useRef(false);
   const quickResponseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const preferenceUpdateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const roadmapNavigationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const roadmapNavigationPendingRef = useRef(false);
+  const teachingPreferencesRef = useRef<TeachingPreferences>(teachingPreferences);
   const meaningfulConfirmationSpeechRef = useRef(false);
   const silentLessonRecoveryPendingRef = useRef(false);
 
@@ -205,15 +277,22 @@ export default function Home() {
     if (engagementTimerRef.current) clearInterval(engagementTimerRef.current);
     if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
     if (quickResponseTimerRef.current) clearTimeout(quickResponseTimerRef.current);
+    if (preferenceUpdateTimerRef.current) clearTimeout(preferenceUpdateTimerRef.current);
+    if (roadmapNavigationTimerRef.current) clearTimeout(roadmapNavigationTimerRef.current);
     engagementTimerRef.current = null;
     confirmationTimerRef.current = null;
     quickResponseTimerRef.current = null;
+    preferenceUpdateTimerRef.current = null;
+    roadmapNavigationTimerRef.current = null;
     engagementStateRef.current = "ended";
     setEngagementState("ended");
     setTransportState("closed");
     microphoneMutedRef.current = false;
     setMicrophoneMuted(false);
     setQuickResponseFeedback("");
+    setPreferenceUpdatePending(false);
+    setRoadmapNavigationPending(false);
+    roadmapNavigationPendingRef.current = false;
     meaningfulConfirmationSpeechRef.current = false;
     silentLessonRecoveryPendingRef.current = false;
     lastMeaningfulLearnerTranscriptRef.current = "";
@@ -241,6 +320,69 @@ export default function Home() {
     if (engagementStateRef.current === "active") {
       addDebugMessage("Meaningful learner activity");
     }
+  };
+
+  const applyAuthoritativeTeachingPreferences = (next: TeachingPreferences) => {
+    teachingPreferencesRef.current = next;
+    setTeachingPreferences(next);
+  };
+
+  const changeActiveTeachingPreference = (update: TeachingPreferenceUpdate) => {
+    if (preferenceUpdatePending) return;
+    const current = teachingPreferencesRef.current;
+    const next = { ...current, ...update };
+    if (next.explanationDepth === current.explanationDepth &&
+        next.teachingPace === current.teachingPace) return;
+    const requested = update.explanationDepth
+      ? `depth=${update.explanationDepth}`
+      : `pace=${update.teachingPace}`;
+    const text = update.explanationDepth
+      ? `Please use ${update.explanationDepth} explanations from now on.`
+      : `Please use a ${update.teachingPace} teaching pace from now on.`;
+    if (!transportRef.current?.sendLearnerText(text)) {
+      setUserError("The teaching style could not be updated while reconnecting. Try again.");
+      return;
+    }
+    markMeaningfulActivity();
+    addDebugMessage(`Teaching preference update requested: ${requested}`);
+    setPreferenceUpdatePending(true);
+    if (preferenceUpdateTimerRef.current) clearTimeout(preferenceUpdateTimerRef.current);
+    preferenceUpdateTimerRef.current = setTimeout(() => {
+      preferenceUpdateTimerRef.current = null;
+      setPreferenceUpdatePending(false);
+    }, 5_000);
+  };
+
+  const navigateFromRoadmap = (node: LessonState["nodes"][string]) => {
+    if (!lessonActiveRef.current || roadmapNavigationPendingRef.current) return;
+    if (node.id === lessonStateRef.current.currentNodeId || node.childrenIds.length) return;
+    playerRef.current?.clear();
+    assistantSpeakingRef.current = false;
+    transportRef.current?.setAssistantSpeaking(false);
+    const path = [node.title];
+    let parentId = node.parentId;
+    while (parentId) {
+      const parent = lessonStateRef.current.nodes[parentId];
+      if (!parent) break;
+      path.unshift(parent.title);
+      parentId = parent.parentId;
+    }
+    const text = `Go to "${path.join(" > ")}" in the lesson roadmap.`;
+    if (!transportRef.current?.sendLearnerText(text)) {
+      setUserError("That lesson navigation could not be sent while reconnecting. Try again.");
+      return;
+    }
+    lastMeaningfulLearnerTranscriptRef.current = text;
+    markMeaningfulActivity();
+    addDebugMessage(`Roadmap navigation requested: ${node.title}`);
+    setRoadmapNavigationPending(true);
+    roadmapNavigationPendingRef.current = true;
+    if (roadmapNavigationTimerRef.current) clearTimeout(roadmapNavigationTimerRef.current);
+    roadmapNavigationTimerRef.current = setTimeout(() => {
+      roadmapNavigationTimerRef.current = null;
+      setRoadmapNavigationPending(false);
+      roadmapNavigationPendingRef.current = false;
+    }, 5_000);
   };
 
   const scheduleIdleEnd = () => {
@@ -277,15 +419,26 @@ export default function Home() {
     }, ENGAGEMENT_CHECK_INTERVAL_MS);
   };
 
-  const toggleMicrophoneMute = () => {
+  const toggleMicrophoneMute = async () => {
+    if (microphoneMuteTransitionRef.current) return;
     const muted = !microphoneMutedRef.current;
-    microphoneMutedRef.current = muted;
-    transportRef.current?.setMicrophoneForwardingEnabled(!muted);
-    setMicrophoneMuted(muted);
-    markMeaningfulActivity();
-    addDebugMessage(
-      muted ? "Microphone forwarding muted" : "Microphone forwarding unmuted",
-    );
+    microphoneMuteTransitionRef.current = true;
+    try {
+      if (muted && transportRef.current?.getInterruptionContinuity().learnerUtteranceOpen) {
+        // Keep forwarding enabled until the worklet confirms every PCM sample
+        // produced before the explicit mute boundary has reached the transport.
+        await microphoneStreamerRef.current?.flushPendingAudio();
+      }
+      microphoneMutedRef.current = muted;
+      transportRef.current?.setMicrophoneForwardingEnabled(!muted);
+      setMicrophoneMuted(muted);
+      markMeaningfulActivity();
+      addDebugMessage(
+        muted ? "Microphone forwarding muted" : "Microphone forwarding unmuted",
+      );
+    } finally {
+      microphoneMuteTransitionRef.current = false;
+    }
   };
 
   const sendQuickResponse = (response: QuickResponse) => {
@@ -440,7 +593,9 @@ export default function Home() {
       // later UX refinement; yielding to the learner remains the priority.
       playerRef.current?.clear();
       assistantSpeakingRef.current = false;
-      const interruption = transportRef.current?.registerInterruption();
+      const interruption = transportRef.current?.registerInterruption(
+        roadmapNavigationPendingRef.current,
+      );
       transportRef.current?.setAssistantSpeaking(false);
       assistantTurnActiveRef.current = false;
       lastAssistantTurnCompleteRef.current = false;
@@ -558,11 +713,39 @@ export default function Home() {
 
       addDebugMessage(call.name === "session_control"
         ? "Session control tool call received"
-        : "Lesson tool call received");
+        : call.name === "update_teaching_preferences"
+          ? "Teaching preference tool call received"
+          : "Lesson tool call received");
       let result;
       let events: string[] = [];
 
-      if (call.name === "session_control") {
+      if (call.name === "update_teaching_preferences") {
+        const next = applyTeachingPreferenceUpdate(
+          teachingPreferencesRef.current,
+          args as Record<string, unknown>,
+        );
+        if (preferenceUpdateTimerRef.current) clearTimeout(preferenceUpdateTimerRef.current);
+        preferenceUpdateTimerRef.current = null;
+        setPreferenceUpdatePending(false);
+        if (next) {
+          applyAuthoritativeTeachingPreferences(next);
+          transportRef.current?.updateSystemInstruction(buildLessonInstruction(
+            topicInput.trim(),
+            learningSource?.name,
+            next,
+          ));
+          addDebugMessage(
+            `Teaching preferences updated: depth=${next.explanationDepth}, pace=${next.teachingPace}`,
+          );
+          result = { ok: true, teachingPreferences: next };
+        } else {
+          result = {
+            ok: false,
+            error: "invalid_teaching_preferences",
+            teachingPreferences: teachingPreferencesRef.current,
+          };
+        }
+      } else if (call.name === "session_control") {
         if (engagementStateRef.current !== "confirming" && action === "continue") {
           result = { ok: true, action: "continue", message: "Session is already active" };
         } else if (engagementStateRef.current !== "confirming") {
@@ -608,10 +791,16 @@ export default function Home() {
         };
         result = {
           ...queryLessonState(state),
-          ...(postResumeQueryReceived ? { continuity } : {}),
+          ...(postResumeQueryReceived
+            ? {
+                continuity,
+                teachingPreferences: teachingPreferencesRef.current,
+              }
+            : {}),
         };
         if (postResumeQueryReceived) {
           addDebugMessage("Post-resume continuity snapshot prepared");
+          addDebugMessage("Teaching preferences included in post-resume state");
         }
         addDebugMessage("Lesson state queried");
       } else if (
@@ -635,6 +824,12 @@ export default function Home() {
           lessonStateRef.current = transition.state;
           setLessonState(transition.state);
         }
+        if (action === "navigate") {
+          if (roadmapNavigationTimerRef.current) clearTimeout(roadmapNavigationTimerRef.current);
+          roadmapNavigationTimerRef.current = null;
+          setRoadmapNavigationPending(false);
+          roadmapNavigationPendingRef.current = false;
+        }
         if (transition.result.recoveryRequired && !silentLessonRecoveryPendingRef.current) {
           silentLessonRecoveryPendingRef.current = true;
           requestSilentRecovery = true;
@@ -657,6 +852,12 @@ export default function Home() {
         }
       }
 
+      if (call.name === "lesson_state" && result && typeof result === "object") {
+        result = {
+          ...result,
+          teachingPreferences: teachingPreferencesRef.current,
+        };
+      }
       for (const event of events) addDebugMessage(event);
       const response = { result };
       toolResultsRef.current.set(id, response);
@@ -699,6 +900,7 @@ export default function Home() {
     const preparedSource = preparedSourceRef.current;
     const lessonFocus = topicInput.trim();
     const lessonTopic = lessonFocus || `Main topics in ${activeSource.name}`;
+    const sessionInitialTeachingPreferences = { ...teachingPreferencesRef.current };
     const requestFreshToken = async () => {
       addDebugMessage("Gemini token requested");
       const controller = new AbortController();
@@ -711,6 +913,7 @@ export default function Home() {
         body: JSON.stringify({
           topic: lessonFocus,
           source: { name: activeSource.name, mimeType: activeSource.mimeType },
+          teachingPreferences: teachingPreferencesRef.current,
         }),
       });
       const body = (await response.json()) as {
@@ -745,6 +948,10 @@ export default function Home() {
     resumptionPendingRef.current = false;
     addDebugMessage(`Lesson initialized from source: ${activeSource.name}`);
     addDebugMessage("Lesson tree initialized");
+    addDebugMessage(
+      `Teaching preferences initialized: depth=${sessionInitialTeachingPreferences.explanationDepth}, ` +
+      `pace=${sessionInitialTeachingPreferences.teachingPace}`,
+    );
     const firstConcept = getCurrentConcept(initialLessonState);
     if (firstConcept) {
       if (firstConcept.teaching) {
@@ -800,6 +1007,7 @@ export default function Home() {
       const systemInstruction = buildLessonInstruction(
         lessonFocus,
         tokenBody.source.name,
+        sessionInitialTeachingPreferences,
       );
 
       const transport = new LiveTransportManager({
@@ -828,6 +1036,7 @@ export default function Home() {
             coverage: queryLessonState(lessonStateRef.current),
             currentTeachingContract: getCurrentConcept(lessonStateRef.current)?.teaching,
             resumePoint: lessonStateRef.current.resumePoint,
+            teachingPreferences: teachingPreferencesRef.current,
           });
         },
         onFatalError: (message) => {
@@ -982,11 +1191,12 @@ export default function Home() {
             onChange={setLearningSource}
             onPreparedChange={(source) => {
               preparedSourceRef.current = source;
-              if (!source) {
-                const resetState = createLessonState("Uploaded material");
-                lessonStateRef.current = resetState;
-                setLessonState(resetState);
-              }
+              const outlineState = createLessonState(
+                source ? `Main topics in ${source.name}` : "Uploaded material",
+                source?.lessonTree ?? [],
+              );
+              lessonStateRef.current = outlineState;
+              setLessonState(outlineState);
             }}
             onDebug={addDebugMessage}
           />
@@ -1004,17 +1214,57 @@ export default function Home() {
           />
         </label>
 
+        <section className="teaching-style setup-only" aria-labelledby="teaching-style-title">
+          <h2 id="teaching-style-title">Teaching style</h2>
+          <TeachingStyleControls
+            preferences={teachingPreferences}
+            disabled={requestingPermission}
+            onChange={(update) => {
+              applyAuthoritativeTeachingPreferences({
+                ...teachingPreferencesRef.current,
+                ...update,
+              });
+            }}
+          />
+        </section>
+
         {learningSource && lessonActive && (
           <section className="active-summary" aria-label="Active lesson overview">
             <p className="active-source" title={learningSource.name}>{learningSource.name}</p>
             <p className="active-label">Current concept</p>
             <h2>{currentConcept?.title || "Preparing lesson…"}</h2>
+            <p className="active-teaching-style">
+              Teaching: {capitalize(teachingPreferences.explanationDepth)} · {capitalize(teachingPreferences.teachingPace)}
+            </p>
             <p className="current-utterance">
               {currentUtterance
                 ? `“${currentUtterance}”`
                 : "Listening for the lesson to begin…"}
             </p>
           </section>
+        )}
+
+        {lessonActive && (
+          <details className="active-teaching-preferences">
+            <summary>Teaching style</summary>
+            <TeachingStyleControls
+              preferences={teachingPreferences}
+              disabled={preferenceUpdatePending}
+              onChange={changeActiveTeachingPreference}
+            />
+            {preferenceUpdatePending && (
+              <p className="preference-pending" role="status">Updating teaching style…</p>
+            )}
+          </details>
+        )}
+
+        {lessonState.rootNodeIds.length > 0 && (
+          <LessonRoadmap
+            lessonState={lessonState}
+            lessonActive={lessonActive}
+            navigationPending={roadmapNavigationPending}
+            onNavigate={navigateFromRoadmap}
+          />
         )}
 
         {userError && <p className="session-error" role="alert">{userError}</p>}

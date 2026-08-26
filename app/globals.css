@@ -363,6 +363,219 @@ h1 {
   transition: background 150ms ease, transform 150ms ease;
 }
 
+.teaching-style {
+  margin-bottom: 20px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #f8fafb;
+}
+
+.teaching-style h2 {
+  margin-bottom: 14px;
+  font-size: 1rem;
+}
+
+.teaching-style-controls {
+  display: grid;
+  gap: 14px;
+}
+
+.teaching-style-controls fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.teaching-style-controls legend {
+  margin-bottom: 7px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.preference-segments {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.preference-segments button {
+  min-width: 0;
+  min-height: 44px;
+  padding: 9px 6px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 700;
+  touch-action: manipulation;
+}
+
+.preference-segments button.selected {
+  border-color: var(--accent);
+  background: rgb(37 87 214 / 10%);
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.preference-segments button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.active-teaching-style {
+  margin: -6px 0 12px;
+  color: var(--accent);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.active-teaching-preferences {
+  margin: -6px 0 18px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #f8fafb;
+}
+
+.active-teaching-preferences summary {
+  min-height: 44px;
+  padding: 12px 14px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 700;
+  touch-action: manipulation;
+}
+
+.active-teaching-preferences .teaching-style-controls {
+  padding: 4px 14px 14px;
+}
+
+.preference-pending {
+  margin: -6px 14px 12px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.lesson-roadmap {
+  margin: -6px 0 18px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #f8fafb;
+}
+
+.lesson-roadmap summary {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 700;
+  touch-action: manipulation;
+}
+
+.lesson-roadmap summary small {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 500;
+  text-align: right;
+}
+
+.roadmap-body {
+  padding: 4px 10px 12px;
+}
+
+.roadmap-tree,
+.roadmap-tree ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.roadmap-row {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) 22px;
+  align-items: center;
+  min-width: 0;
+  margin-left: calc(var(--roadmap-depth) * min(18px, 3vw));
+  border-radius: 8px;
+}
+
+.roadmap-row:hover {
+  background: rgb(37 87 214 / 5%);
+}
+
+.roadmap-current {
+  background: rgb(37 87 214 / 10%);
+  box-shadow: inset 3px 0 var(--accent);
+}
+
+.roadmap-status-icon,
+.roadmap-expand-icon {
+  color: var(--muted);
+  text-align: center;
+}
+
+.roadmap-teaching .roadmap-status-icon,
+.roadmap-current .roadmap-status-icon,
+.roadmap-current .roadmap-node-title {
+  color: var(--accent);
+}
+
+.roadmap-node-button {
+  display: flex;
+  min-width: 0;
+  min-height: 46px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.roadmap-node-button:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.roadmap-node-button:focus-visible {
+  border-radius: 6px;
+  outline: 3px solid rgb(37 87 214 / 25%);
+}
+
+.roadmap-node-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.82rem;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.roadmap-status-label {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 500;
+}
+
+.roadmap-pending,
+.roadmap-empty {
+  margin: 2px 6px 8px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
 .start-button:hover {
   background: var(--accent-hover);
 }
@@ -726,6 +939,27 @@ h1 {
   .transcript-body,
   .debug-messages li {
     overflow-wrap: anywhere;
+  }
+
+  .lesson-roadmap summary {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .lesson-roadmap summary small {
+    text-align: left;
+  }
+
+  .roadmap-row {
+    margin-left: calc(var(--roadmap-depth) * 12px);
+  }
+
+  .roadmap-node-button {
+    align-items: flex-start;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
   }
 }
 

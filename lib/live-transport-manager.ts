@@ -75,6 +75,7 @@ export class LiveTransportManager {
   private intentionalSockets = new WeakSet<GeminiLiveWebSocket>();
   private preparedToken: TokenResult | null = null;
   private preparingTokenPromise: Promise<void> | null = null;
+  private systemInstructionVersion = 0;
   private syncTimer: ReturnType<typeof setTimeout> | null = null;
   private syncAttempts = 0;
   private postResumeSyncStartedAt: number | null = null;
@@ -94,6 +95,7 @@ export class LiveTransportManager {
   private learnerUtteranceOpen = false;
   private interruptionRegisteredForUtterance = false;
   private learnerUtteranceSpansRollover = false;
+  private pendingAudioStreamEnd = false;
 
   constructor(private readonly options: ManagerOptions) {}
 
@@ -161,6 +163,14 @@ export class LiveTransportManager {
     return this.activeSocket?.sendToolResponse(responses) ?? false;
   }
 
+  updateSystemInstruction(systemInstruction: string) {
+    this.options.systemInstruction = systemInstruction;
+    this.systemInstructionVersion += 1;
+    // A prepared token may constrain the previous instruction. Discard it so
+    // the next replacement credential is minted for current application state.
+    this.preparedToken = null;
+  }
+
   setLearnerSpeaking(speaking: boolean) {
     if (!this.microphoneForwardingEnabled) return;
     if (speaking) {
@@ -198,20 +208,48 @@ export class LiveTransportManager {
   }
 
   setMicrophoneForwardingEnabled(enabled: boolean) {
+    if (this.microphoneForwardingEnabled === enabled) return;
     this.microphoneForwardingEnabled = enabled;
     if (enabled) return;
+    const utteranceId = this.currentLearnerUtteranceId;
+    const utteranceWasOpen = this.learnerUtteranceOpen;
     if (this.learnerSpeechEndTimer) clearTimeout(this.learnerSpeechEndTimer);
     if (this.interruptionEpochExpiryTimer) clearTimeout(this.interruptionEpochExpiryTimer);
     this.learnerSpeechEndTimer = null;
     this.interruptionEpochExpiryTimer = null;
     this.learnerSpeaking = false;
     this.learnerSpeechStartedAt = null;
-    if (!this.learnerUtteranceSpansRollover) this.finishLearnerUtterance();
-    if (this.rolloverReason) void this.tryRequestedRollover(false);
+    if (!utteranceWasOpen) return;
+
+    this.pendingAudioStreamEnd = true;
+    const sentImmediately = this.sendPendingAudioStreamEnd(false);
+    if (!sentImmediately) {
+      this.options.onDebug("Audio stream end deferred during handoff");
+    }
+    this.options.onDebug(`Learner utterance finalized by mute: utterance-${utteranceId}`);
+    const preserveInterruptionEpoch = !sentImmediately || Boolean(this.rolloverReason);
+    if (preserveInterruptionEpoch) {
+      this.learnerUtteranceOpen = false;
+      this.learnerUtteranceSpansRollover = true;
+      this.options.onDebug(`Learner utterance ended: utterance-${utteranceId}`);
+    } else {
+      this.finishLearnerUtterance();
+    }
+    this.options.onDebug("Learner utterance closed by explicit mute");
+    if (this.rolloverReason) {
+      this.options.onDebug("Pending safe rollover released by mute");
+      void this.tryRequestedRollover(false);
+    }
   }
 
-  registerInterruption() {
-    if (!this.learnerUtteranceOpen) this.openLearnerUtterance();
+  registerInterruption(discreteLearnerTurn = false) {
+    const preservingFinalizedRolloverUtterance =
+      !this.learnerUtteranceOpen &&
+      this.learnerUtteranceSpansRollover &&
+      this.currentLearnerUtteranceId !== null;
+    if (!this.learnerUtteranceOpen && !preservingFinalizedRolloverUtterance) {
+      this.openLearnerUtterance();
+    }
     const epoch = this.currentLearnerUtteranceId;
     const duplicate = this.interruptionRegisteredForUtterance;
     if (!duplicate) {
@@ -223,7 +261,9 @@ export class LiveTransportManager {
         ? `Duplicate interruption across rollover suppressed: utterance-${epoch}`
         : `Duplicate interruption suppressed: utterance-${epoch}`);
     }
-    return { duplicate, epoch };
+    const result = { duplicate, epoch };
+    if (discreteLearnerTurn) this.finishLearnerUtterance();
+    return result;
   }
 
   getInterruptionContinuity() {
@@ -321,6 +361,7 @@ export class LiveTransportManager {
     this.preparedToken = null;
     this.queuedLearnerText = null;
     this.postResumeState = "none";
+    this.pendingAudioStreamEnd = false;
     if (this.learnerSpeechEndTimer) clearTimeout(this.learnerSpeechEndTimer);
     if (this.interruptionEpochExpiryTimer) clearTimeout(this.interruptionEpochExpiryTimer);
     this.learnerSpeechEndTimer = null;
@@ -576,6 +617,7 @@ export class LiveTransportManager {
         audio: { data: arrayBufferToBase64(chunk), mimeType: "audio/pcm;rate=16000" },
       });
     }
+    this.sendPendingAudioStreamEnd(true);
     this.handoffBuffer = [];
     const handoffDurationMs = this.handoffStartedAt
       ? Date.now() - this.handoffStartedAt
@@ -595,6 +637,21 @@ export class LiveTransportManager {
     }
     this.setState("active");
     this.schedulePreparation();
+  }
+
+  private sendPendingAudioStreamEnd(afterHandoff: boolean) {
+    if (!this.pendingAudioStreamEnd) return true;
+    const socket = this.activeSocket;
+    if (!socket) return false;
+    if (!afterHandoff && this.state !== "active" && this.state !== "rollover-ready") {
+      return false;
+    }
+    if (!socket.sendRealtimeInput({ audioStreamEnd: true })) return false;
+    this.pendingAudioStreamEnd = false;
+    this.options.onDebug(afterHandoff
+      ? "Deferred audio stream end sent after handoff"
+      : "Audio stream end sent");
+    return true;
   }
 
   private startPostResumeSynchronization() {
@@ -651,10 +708,12 @@ export class LiveTransportManager {
 
   private async prepareReplacementToken() {
     if (this.preparingTokenPromise) return this.preparingTokenPromise;
+    const instructionVersion = this.systemInstructionVersion;
     this.preparingTokenPromise = (async () => {
       try {
         const token = await this.options.requestToken();
         if (this.state === "closed") return;
+        if (instructionVersion !== this.systemInstructionVersion) return;
         this.preparedToken = token;
         this.options.onDebug("Replacement token prepared");
       } catch {

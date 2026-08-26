@@ -8,6 +8,21 @@ class PcmRecorderProcessor extends AudioWorkletProcessor {
     this.inputBuffer = [];
     this.outputBuffer = [];
     this.resamplePosition = 0;
+    this.port.onmessage = (event) => {
+      if (event.data?.type !== "flush") return;
+      this.flushOutput();
+      this.port.postMessage({
+        type: "flush-complete",
+        requestId: event.data.requestId,
+      });
+    };
+  }
+
+  flushOutput() {
+    if (this.outputBuffer.length === 0) return;
+    const pcm = Int16Array.from(this.outputBuffer);
+    this.port.postMessage(pcm.buffer, [pcm.buffer]);
+    this.outputBuffer = [];
   }
 
   process(inputs, outputs) {
@@ -44,9 +59,7 @@ class PcmRecorderProcessor extends AudioWorkletProcessor {
       this.resamplePosition += step;
 
       if (this.outputBuffer.length === this.chunkSamples) {
-        const pcm = Int16Array.from(this.outputBuffer);
-        this.port.postMessage(pcm.buffer, [pcm.buffer]);
-        this.outputBuffer = [];
+        this.flushOutput();
       }
     }
 

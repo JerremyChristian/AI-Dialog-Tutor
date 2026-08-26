@@ -1,4 +1,9 @@
 import type { AtomicTeachingContract, LessonTreeItem } from "./learning-source";
+import {
+  DEFAULT_TEACHING_PREFERENCES,
+  buildTeachingPreferenceInstruction,
+  type TeachingPreferences,
+} from "./teaching-preferences";
 
 export const GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview";
 
@@ -386,7 +391,11 @@ function snapshot(state: LessonState, action: LessonAction, ok: boolean, message
   };
 }
 
-export function buildLessonInstruction(topic: string, sourceName?: string) {
+export function buildLessonInstruction(
+  topic: string,
+  sourceName?: string,
+  teachingPreferences: TeachingPreferences = DEFAULT_TEACHING_PREFERENCES,
+) {
   const sourceGuidance = sourceName
     ? `You are conducting a spoken one-on-one lesson based primarily on educational material uploaded by the learner. The source is named: ${sourceName}.
 
@@ -396,6 +405,8 @@ Treat the supplied material as the authoritative course reference for topics, te
     : `You are conducting a spoken one-on-one lesson about: ${topic}.`;
 
   return `${sourceGuidance}
+
+${buildTeachingPreferenceInstruction(teachingPreferences)}
 
 Lesson coverage is application-owned. LESSON_TREE is hierarchical. Parent topics aggregate atomic descendants; teaching one child never means siblings or the parent were fully taught. Use the most specific atomic ID whenever possible.
 

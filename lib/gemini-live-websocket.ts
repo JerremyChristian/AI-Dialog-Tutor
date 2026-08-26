@@ -84,6 +84,26 @@ function buildLiveSetup(config: SetupConfig) {
               additionalProperties: false,
             },
           },
+          {
+            name: "update_teaching_preferences",
+            description:
+              "Update application-owned session teaching style only when the learner clearly requests an ongoing change. Depth and pace are independent. Do not use for a one-off request about only the current equation, sentence, example, explanation, or summary.",
+            parametersJsonSchema: {
+              type: "object",
+              properties: {
+                explanationDepth: {
+                  type: "string",
+                  enum: ["overview", "normal", "detailed"],
+                },
+                teachingPace: {
+                  type: "string",
+                  enum: ["slow", "normal", "fast"],
+                },
+              },
+              minProperties: 1,
+              additionalProperties: false,
+            },
+          },
         ],
       },
     ],

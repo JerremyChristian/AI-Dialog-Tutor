@@ -5,6 +5,7 @@ import {
   GEMINI_LIVE_MODEL,
 } from "../../../lib/lesson-state";
 import { SUPPORTED_SOURCE_TYPES } from "../../../lib/learning-source";
+import { parseTeachingPreferences } from "../../../lib/teaching-preferences";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -26,6 +27,7 @@ export async function POST(request: Request) {
     const body = (await request.json()) as {
       topic?: unknown;
       source?: { name?: unknown; mimeType?: unknown };
+      teachingPreferences?: unknown;
     };
     const topic = typeof body.topic === "string" ? body.topic.trim() : "";
     if (topic.length > 160) {
@@ -36,6 +38,7 @@ export async function POST(request: Request) {
     }
     const sourceName = body.source?.name;
     const sourceMimeType = body.source?.mimeType;
+    const teachingPreferences = parseTeachingPreferences(body.teachingPreferences);
     if (
       typeof sourceName !== "string" ||
       !sourceName.trim() ||
@@ -43,17 +46,22 @@ export async function POST(request: Request) {
       typeof sourceMimeType !== "string" ||
       !SUPPORTED_SOURCE_TYPES.includes(
         sourceMimeType as (typeof SUPPORTED_SOURCE_TYPES)[number],
-      )
+      ) ||
+      !teachingPreferences
     ) {
       return NextResponse.json(
-        { error: "Valid learning source metadata is required" },
+        { error: "Valid learning source metadata and teaching preferences are required" },
         { status: 400 },
       );
     }
 
     const client = new GoogleGenAI({ apiKey });
     const normalizedSourceName = sourceName.trim();
-    const systemInstruction = buildLessonInstruction(topic, normalizedSourceName);
+    const systemInstruction = buildLessonInstruction(
+      topic,
+      normalizedSourceName,
+      teachingPreferences,
+    );
     const now = Date.now();
     const newSessionExpiresAt = now + NEW_SESSION_WINDOW_MS;
     const token = await client.authTokens.create({

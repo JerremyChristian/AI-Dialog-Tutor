@@ -1,10 +1,17 @@
 const OUTPUT_SAMPLE_RATE = 24_000;
 
+type RecorderWorkletMessage = ArrayBuffer | {
+  type: "flush-complete";
+  requestId: number;
+};
+
 export class MicrophonePcmStreamer {
   private context: AudioContext | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private worklet: AudioWorkletNode | null = null;
   private silentOutput: GainNode | null = null;
+  private flushSequence = 0;
+  private flushResolvers = new Map<number, () => void>();
 
   constructor(
     private readonly stream: MediaStream,
@@ -26,8 +33,15 @@ export class MicrophonePcmStreamer {
     });
     this.silentOutput = this.context.createGain();
     this.silentOutput.gain.value = 0;
-    this.worklet.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
-      this.onChunk(event.data);
+    this.worklet.port.onmessage = (event: MessageEvent<RecorderWorkletMessage>) => {
+      if (event.data instanceof ArrayBuffer) {
+        this.onChunk(event.data);
+        return;
+      }
+      if (event.data.type === "flush-complete") {
+        this.flushResolvers.get(event.data.requestId)?.();
+        this.flushResolvers.delete(event.data.requestId);
+      }
     };
 
     this.source.connect(this.worklet);
@@ -36,7 +50,26 @@ export class MicrophonePcmStreamer {
     await resumeAudioContext(this.context);
   }
 
+  flushPendingAudio() {
+    const worklet = this.worklet;
+    if (!worklet) return Promise.resolve();
+    const requestId = ++this.flushSequence;
+    return new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        if (!this.flushResolvers.delete(requestId)) return;
+        resolve();
+      }, 250);
+      this.flushResolvers.set(requestId, () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      worklet.port.postMessage({ type: "flush", requestId });
+    });
+  }
+
   async stop() {
+    for (const resolve of this.flushResolvers.values()) resolve();
+    this.flushResolvers.clear();
     if (this.worklet) {
       this.worklet.port.onmessage = null;
       this.worklet.disconnect();
