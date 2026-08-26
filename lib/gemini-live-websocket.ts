@@ -87,7 +87,7 @@ function buildLiveSetup(config: SetupConfig) {
           {
             name: "update_teaching_preferences",
             description:
-              "Update application-owned session teaching style only when the learner clearly requests an ongoing change. Depth and pace are independent. Do not use for a one-off request about only the current equation, sentence, example, explanation, or summary.",
+              "Update application-owned session teaching style only for a clearly ongoing request. speakingSpeed means physical spoken-word delivery, not lesson progression. Use it for requests to speak/talk slower or faster, never for requests to move through topics faster or spend less time on a concept. Do not persist a one-off request about only the current equation, sentence, example, explanation, repetition, or summary.",
             parametersJsonSchema: {
               type: "object",
               properties: {
@@ -95,9 +95,10 @@ function buildLiveSetup(config: SetupConfig) {
                   type: "string",
                   enum: ["overview", "normal", "detailed"],
                 },
-                teachingPace: {
+                speakingSpeed: {
                   type: "string",
                   enum: ["slow", "normal", "fast"],
+                  description: "Persistent qualitative speed of the tutor's spoken delivery.",
                 },
               },
               minProperties: 1,

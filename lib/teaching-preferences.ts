@@ -1,35 +1,35 @@
 export const EXPLANATION_DEPTHS = ["overview", "normal", "detailed"] as const;
-export const TEACHING_PACES = ["slow", "normal", "fast"] as const;
+export const SPEAKING_SPEEDS = ["slow", "normal", "fast"] as const;
 
 export type ExplanationDepth = (typeof EXPLANATION_DEPTHS)[number];
-export type TeachingPace = (typeof TEACHING_PACES)[number];
+export type SpeakingSpeed = (typeof SPEAKING_SPEEDS)[number];
 
 export type TeachingPreferences = {
   explanationDepth: ExplanationDepth;
-  teachingPace: TeachingPace;
+  speakingSpeed: SpeakingSpeed;
 };
 
 export const DEFAULT_TEACHING_PREFERENCES: TeachingPreferences = {
   explanationDepth: "normal",
-  teachingPace: "normal",
+  speakingSpeed: "normal",
 };
 
 export function isExplanationDepth(value: unknown): value is ExplanationDepth {
   return EXPLANATION_DEPTHS.includes(value as ExplanationDepth);
 }
 
-export function isTeachingPace(value: unknown): value is TeachingPace {
-  return TEACHING_PACES.includes(value as TeachingPace);
+export function isSpeakingSpeed(value: unknown): value is SpeakingSpeed {
+  return SPEAKING_SPEEDS.includes(value as SpeakingSpeed);
 }
 
 export function parseTeachingPreferences(value: unknown): TeachingPreferences | null {
   if (!value || typeof value !== "object") return null;
   const candidate = value as Record<string, unknown>;
   if (!isExplanationDepth(candidate.explanationDepth) ||
-      !isTeachingPace(candidate.teachingPace)) return null;
+      !isSpeakingSpeed(candidate.speakingSpeed)) return null;
   return {
     explanationDepth: candidate.explanationDepth,
-    teachingPace: candidate.teachingPace,
+    speakingSpeed: candidate.speakingSpeed,
   };
 }
 
@@ -38,20 +38,20 @@ export function applyTeachingPreferenceUpdate(
   update: Record<string, unknown>,
 ) {
   if (Object.keys(update).some(
-    (key) => key !== "explanationDepth" && key !== "teachingPace",
+    (key) => key !== "explanationDepth" && key !== "speakingSpeed",
   )) return null;
   const hasDepth = update.explanationDepth !== undefined;
-  const hasPace = update.teachingPace !== undefined;
-  if (!hasDepth && !hasPace) return null;
+  const hasSpeakingSpeed = update.speakingSpeed !== undefined;
+  if (!hasDepth && !hasSpeakingSpeed) return null;
   if (hasDepth && !isExplanationDepth(update.explanationDepth)) return null;
-  if (hasPace && !isTeachingPace(update.teachingPace)) return null;
+  if (hasSpeakingSpeed && !isSpeakingSpeed(update.speakingSpeed)) return null;
   return {
     explanationDepth: hasDepth
       ? update.explanationDepth as ExplanationDepth
       : current.explanationDepth,
-    teachingPace: hasPace
-      ? update.teachingPace as TeachingPace
-      : current.teachingPace,
+    speakingSpeed: hasSpeakingSpeed
+      ? update.speakingSpeed as SpeakingSpeed
+      : current.speakingSpeed,
   };
 }
 
@@ -59,7 +59,7 @@ export function buildTeachingPreferenceInstruction(preferences: TeachingPreferen
   return `CURRENT TEACHING PREFERENCES
 
 Explanation depth: ${preferences.explanationDepth}
-Teaching pace: ${preferences.teachingPace}
+Speaking speed: ${preferences.speakingSpeed}
 
 These independent, application-owned preferences remain active until the learner explicitly requests an ongoing change.
 
@@ -68,12 +68,12 @@ Explanation depth:
 - normal: use the existing balanced style with clear reasoning, helpful examples, important steps, and moderate conversational checking.
 - detailed: unpack assumptions, intermediate reasoning, equations, notation, useful examples, and relevant distinctions without filler, repetition, or unrelated expansion.
 
-Teaching pace:
-- slow: present one main idea at a time in shorter spoken chunks, with deliberate sentences and room for interruption.
-- normal: use the tutor's natural conversational cadence.
-- fast: use denser chunks, quicker transitions, and fewer redundant pauses or confirmations while remaining intelligible.
+Speaking speed controls the physical delivery of spoken words only, not lesson progression or explanation depth:
+- slow: speak noticeably slower than normal conversational speech. Articulate clearly, use a calm deliberate cadence, and allow slightly longer natural pauses between phrases. Keep this vocal delivery consistently slower across future responses.
+- normal: use the tutor's current natural conversational speaking rate and cadence.
+- fast: speak noticeably faster than normal with a more energetic, efficient vocal cadence and fewer long pauses, while remaining clear and intelligible.
 
-Depth and pace are independent. Neither preference permits skipping source concepts, required teaching points, completion criteria, or lesson-state transitions. Preferences change HOW a teaching contract is delivered, never WHAT must be taught.
+Depth and speaking speed are independent. Slow speech must not reduce content or make lesson progression slower; fast speech must not skip or shorten required teaching. Neither preference permits skipping source concepts, required teaching points, completion criteria, or lesson-state transitions.
 
-Use update_teaching_preferences only for clearly ongoing/session-level requests such as "go slower", "from now on give more detail", or "keep things concise". Do not update persistent preferences for a local request about only the last equation, sentence, example, explanation, or summary. After a valid update, acknowledge it briefly and naturally without exposing tool or enum terminology.`;
+Use update_teaching_preferences for speaking speed only when the learner clearly requests an ongoing change to how fast you speak or talk, such as "speak slower", "you're talking too fast", or "use normal speaking speed again". Requests to move through topics faster, spend less time on a concept, move on, or take more time explaining concern lesson progression or local explanation—not speakingSpeed. Do not persist one-off requests such as "repeat that sentence more slowly" or "say the equation slower". Likewise, persist explanation-depth changes only when they are clearly ongoing. After a valid update, acknowledge it briefly and naturally without exposing tool or enum terminology.`;
 }

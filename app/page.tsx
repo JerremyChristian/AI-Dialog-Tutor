@@ -45,7 +45,7 @@ import {
 import {
   DEFAULT_TEACHING_PREFERENCES,
   EXPLANATION_DEPTHS,
-  TEACHING_PACES,
+  SPEAKING_SPEEDS,
   applyTeachingPreferenceUpdate,
   type TeachingPreferences,
 } from "../lib/teaching-preferences";
@@ -120,7 +120,7 @@ function TeachingStyleControls({
   return (
     <div className="teaching-style-controls">
       <fieldset disabled={disabled}>
-        <legend>Explanation</legend>
+        <legend>Explanation depth</legend>
         <div className="preference-segments">
           {EXPLANATION_DEPTHS.map((depth) => (
             <button
@@ -137,18 +137,21 @@ function TeachingStyleControls({
         </div>
       </fieldset>
       <fieldset disabled={disabled}>
-        <legend>Pace</legend>
+        <legend>
+          Speaking speed
+          <small>How fast the tutor talks</small>
+        </legend>
         <div className="preference-segments">
-          {TEACHING_PACES.map((pace) => (
+          {SPEAKING_SPEEDS.map((speed) => (
             <button
-              key={pace}
+              key={speed}
               type="button"
-              className={preferences.teachingPace === pace ? "selected" : undefined}
-              aria-label={`${capitalize(pace)} teaching pace`}
-              aria-pressed={preferences.teachingPace === pace}
-              onClick={() => onChange({ teachingPace: pace })}
+              className={preferences.speakingSpeed === speed ? "selected" : undefined}
+              aria-label={`${capitalize(speed)} speaking speed`}
+              aria-pressed={preferences.speakingSpeed === speed}
+              onClick={() => onChange({ speakingSpeed: speed })}
             >
-              {capitalize(pace)}
+              {capitalize(speed)}
             </button>
           ))}
         </div>
@@ -332,13 +335,13 @@ export default function Home() {
     const current = teachingPreferencesRef.current;
     const next = { ...current, ...update };
     if (next.explanationDepth === current.explanationDepth &&
-        next.teachingPace === current.teachingPace) return;
+        next.speakingSpeed === current.speakingSpeed) return;
     const requested = update.explanationDepth
       ? `depth=${update.explanationDepth}`
-      : `pace=${update.teachingPace}`;
+      : `speakingSpeed=${update.speakingSpeed}`;
     const text = update.explanationDepth
       ? `Please use ${update.explanationDepth} explanations from now on.`
-      : `Please use a ${update.teachingPace} teaching pace from now on.`;
+      : `Please use a ${update.speakingSpeed} speaking speed from now on.`;
     if (!transportRef.current?.sendLearnerText(text)) {
       setUserError("The teaching style could not be updated while reconnecting. Try again.");
       return;
@@ -735,7 +738,7 @@ export default function Home() {
             next,
           ));
           addDebugMessage(
-            `Teaching preferences updated: depth=${next.explanationDepth}, pace=${next.teachingPace}`,
+            `Teaching preferences updated: depth=${next.explanationDepth}, speakingSpeed=${next.speakingSpeed}`,
           );
           result = { ok: true, teachingPreferences: next };
         } else {
@@ -950,7 +953,7 @@ export default function Home() {
     addDebugMessage("Lesson tree initialized");
     addDebugMessage(
       `Teaching preferences initialized: depth=${sessionInitialTeachingPreferences.explanationDepth}, ` +
-      `pace=${sessionInitialTeachingPreferences.teachingPace}`,
+      `speakingSpeed=${sessionInitialTeachingPreferences.speakingSpeed}`,
     );
     const firstConcept = getCurrentConcept(initialLessonState);
     if (firstConcept) {
@@ -1214,19 +1217,21 @@ export default function Home() {
           />
         </label>
 
-        <section className="teaching-style setup-only" aria-labelledby="teaching-style-title">
-          <h2 id="teaching-style-title">Teaching style</h2>
-          <TeachingStyleControls
-            preferences={teachingPreferences}
-            disabled={requestingPermission}
-            onChange={(update) => {
-              applyAuthoritativeTeachingPreferences({
-                ...teachingPreferencesRef.current,
-                ...update,
-              });
-            }}
-          />
-        </section>
+        {!lessonActive && (
+          <section className="teaching-style setup-only" aria-labelledby="teaching-style-title">
+            <h2 id="teaching-style-title">Teaching style</h2>
+            <TeachingStyleControls
+              preferences={teachingPreferences}
+              disabled={requestingPermission}
+              onChange={(update) => {
+                applyAuthoritativeTeachingPreferences({
+                  ...teachingPreferencesRef.current,
+                  ...update,
+                });
+              }}
+            />
+          </section>
+        )}
 
         {learningSource && lessonActive && (
           <section className="active-summary" aria-label="Active lesson overview">
@@ -1234,7 +1239,7 @@ export default function Home() {
             <p className="active-label">Current concept</p>
             <h2>{currentConcept?.title || "Preparing lesson…"}</h2>
             <p className="active-teaching-style">
-              Teaching: {capitalize(teachingPreferences.explanationDepth)} · {capitalize(teachingPreferences.teachingPace)}
+              Teaching: {capitalize(teachingPreferences.explanationDepth)} · Speech: {capitalize(teachingPreferences.speakingSpeed)}
             </p>
             <p className="current-utterance">
               {currentUtterance

@@ -395,6 +395,14 @@ h1 {
   font-weight: 700;
 }
 
+.teaching-style-controls legend small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 400;
+}
+
 .preference-segments {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -517,6 +525,10 @@ h1 {
   box-shadow: inset 3px 0 var(--accent);
 }
 
+.roadmap-active-branch:not(.roadmap-current) {
+  background: rgb(37 87 214 / 5%);
+}
+
 .roadmap-status-icon,
 .roadmap-expand-icon {
   color: var(--muted);
@@ -524,6 +536,7 @@ h1 {
 }
 
 .roadmap-teaching .roadmap-status-icon,
+.roadmap-active-branch .roadmap-node-title,
 .roadmap-current .roadmap-status-icon,
 .roadmap-current .roadmap-node-title {
   color: var(--accent);
