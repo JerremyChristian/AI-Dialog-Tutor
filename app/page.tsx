@@ -377,7 +377,12 @@ export default function Home() {
     }
     lastMeaningfulLearnerTranscriptRef.current = text;
     markMeaningfulActivity();
-    addDebugMessage(`Roadmap navigation requested: ${node.title}`);
+    const preferences = teachingPreferencesRef.current;
+    addDebugMessage(`Roadmap navigation requested: target=${node.title}`);
+    addDebugMessage(
+      `Teaching preferences before navigation: depth=${preferences.explanationDepth}, ` +
+      `speakingSpeed=${preferences.speakingSpeed}`,
+    );
     setRoadmapNavigationPending(true);
     roadmapNavigationPendingRef.current = true;
     if (roadmapNavigationTimerRef.current) clearTimeout(roadmapNavigationTimerRef.current);
@@ -699,6 +704,8 @@ export default function Home() {
       const args = call.args ?? {};
       const action = args.action;
       const conceptId = args.conceptId;
+      const isRoadmapNavigation = call.name === "lesson_state" &&
+        action === "navigate" && roadmapNavigationPendingRef.current;
       const isLessonQuery = call.name === "lesson_state" && action === "query";
       if (isLessonQuery && transportRef.current?.isPostResumeSynchronizing()) {
         postResumeQueryReceived = true;
@@ -828,6 +835,14 @@ export default function Home() {
           setLessonState(transition.state);
         }
         if (action === "navigate") {
+          if (isRoadmapNavigation) {
+            const preferences = teachingPreferencesRef.current;
+            addDebugMessage("lesson_state.navigate completed");
+            addDebugMessage(
+              `Teaching preferences after navigation: depth=${preferences.explanationDepth}, ` +
+              `speakingSpeed=${preferences.speakingSpeed}`,
+            );
+          }
           if (roadmapNavigationTimerRef.current) clearTimeout(roadmapNavigationTimerRef.current);
           roadmapNavigationTimerRef.current = null;
           setRoadmapNavigationPending(false);
@@ -860,6 +875,9 @@ export default function Home() {
           ...result,
           teachingPreferences: teachingPreferencesRef.current,
         };
+        if (isRoadmapNavigation) {
+          addDebugMessage("Teaching preferences included in lesson_state.navigate response");
+        }
       }
       for (const event of events) addDebugMessage(event);
       const response = { result };
