@@ -92,6 +92,118 @@ h1 {
   background: #f8fafb;
 }
 
+.recent-lessons {
+  margin-bottom: 24px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #f8fafb;
+}
+
+.recent-lessons-heading,
+.current-saved-lesson,
+.recent-lesson-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.recent-lessons-heading h2 {
+  margin-bottom: 3px;
+  font-size: 1rem;
+}
+
+.recent-lessons-heading p,
+.recent-lesson-card p,
+.current-saved-lesson {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.recent-lessons-heading p,
+.recent-lesson-card p {
+  margin-bottom: 0;
+}
+
+.new-lesson-button,
+.recent-lesson-actions button,
+.current-saved-lesson button {
+  min-height: 44px;
+  padding: 9px 13px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.current-saved-lesson {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.current-saved-lesson span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.recent-lesson-list {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.recent-lesson-card {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.recent-lesson-card h3 {
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+  font-size: 0.95rem;
+}
+
+.recent-lesson-card p + p {
+  margin-top: 4px;
+}
+
+.recent-lesson-secondary,
+.recent-lesson-time {
+  color: var(--muted);
+}
+
+.recent-lesson-actions {
+  margin-top: 12px;
+  justify-content: flex-start;
+}
+
+.recent-lesson-actions .recent-lesson-continue {
+  min-width: 112px;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.recent-lesson-delete {
+  color: #a12626 !important;
+}
+
+.recent-lesson-actions button:disabled,
+.current-saved-lesson button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
 .source-upload-heading,
 .source-details {
   display: flex;
@@ -192,6 +304,36 @@ h1 {
   color: #a52929;
   font-size: 0.75rem;
   line-height: 1.4;
+}
+
+.source-processing {
+  margin: 8px 0 0;
+  color: var(--accent);
+  font-size: 0.75rem;
+}
+
+.source-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+}
+
+.source-retry {
+  min-height: 44px;
+  padding: 10px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.source-retry:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .source-remove {
@@ -910,6 +1052,21 @@ h1 {
 
   h1 {
     font-size: 1.8rem;
+  }
+
+  .recent-lessons-heading,
+  .current-saved-lesson {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .new-lesson-button,
+  .current-saved-lesson button {
+    width: 100%;
+  }
+
+  .recent-lesson-actions button {
+    flex: 1 1 0;
   }
 
   .lesson-active .hero {

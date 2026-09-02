@@ -1,7 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { CoverageStatus, LessonNode, LessonState } from "../lib/lesson-state";
+import {
+  isTeachableLessonNode,
+  type CoverageStatus,
+  type LessonNode,
+  type LessonState,
+} from "../lib/lesson-state";
 
 type Props = {
   lessonState: LessonState;
@@ -63,7 +68,7 @@ export function LessonRoadmap({
   }, [lessonState.currentNodeId, lessonState.nodes]);
 
   const teachableNodes = useMemo(
-    () => Object.values(lessonState.nodes).filter(isTeachableNode),
+    () => Object.values(lessonState.nodes).filter(isTeachableLessonNode),
     [lessonState.nodes],
   );
   const covered = teachableNodes.filter((node) => node.status === "taught").length;
@@ -86,7 +91,7 @@ export function LessonRoadmap({
     const node = lessonState.nodes[nodeId];
     if (!node) return null;
     const structural = node.childrenIds.length > 0;
-    const teachable = isTeachableNode(node);
+    const teachable = isTeachableLessonNode(node);
     const expanded = expandedNodeIds.has(node.id);
     const current = lessonActive && node.id === lessonState.currentNodeId;
     const activeBranch = structural && activePathNodeIds.has(node.id);
@@ -159,8 +164,4 @@ export function LessonRoadmap({
       </div>
     </details>
   );
-}
-
-function isTeachableNode(node: LessonNode) {
-  return node.childrenIds.length === 0 && Boolean(node.teaching);
 }

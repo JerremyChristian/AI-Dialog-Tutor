@@ -6,14 +6,20 @@ import {
 } from "./teaching-preferences";
 
 export const GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview";
+export const PERSISTED_LESSON_RESUME_CONTROL =
+  "[[APP_CONTROL:PERSISTED_LESSON_RESUME:RECAP_THEN_RESUME_LOCATION_THEN_CONTINUE_TEACHING;DO_NOT_ASK_WHAT_TO_COVER]]";
 
 export type LessonStatus = "idle" | "teaching" | "interrupted" |
   "resolving-interruption" | "resuming" | "completed";
+export type LessonSessionStartMode = "new" | "persisted-resume";
 export type CoverageStatus =
   "not-started" | "teaching" | "partial" | "taught" | "skipped";
 export type LessonNode = LessonTreeItem & {
   childrenIds: string[];
   status: CoverageStatus;
+};
+export type TeachingContractProgress = {
+  nextTeachingPointIndex: number;
 };
 export type LessonState = {
   topic: string;
@@ -22,13 +28,14 @@ export type LessonState = {
   currentNodeId: string | null;
   rootNodeIds: string[];
   nodes: Record<string, LessonNode>;
+  teachingContractProgress: Record<string, TeachingContractProgress>;
   resumePoint: string;
   interruptionCount: number;
   lastUserTranscript: string;
   lastAssistantTranscript: string;
 };
 
-type LessonAction = "navigate" | "complete" | "skip" | "query";
+type LessonAction = "navigate" | "progress" | "complete" | "skip" | "query";
 export type LessonStateResult = {
   ok: boolean;
   action: LessonAction;
@@ -39,13 +46,18 @@ export type LessonStateResult = {
   currentNodeTitle?: string | null;
   currentNodeStatus?: CoverageStatus | null;
   currentTeachingContract?: AtomicTeachingContract;
+  currentTeachingProgress?: TeachingContractProgress & {
+    confirmedTeachingPoints: string[];
+    nextTeachingPoint: string | null;
+    remainingTeachingPoints: string[];
+  };
   nextSequentialNode?: { id: string; title: string } | null;
   relevantNodes?: Array<{ id: string; title: string; status: CoverageStatus }>;
   resumePoint?: string;
   completedNodeId?: string;
   noOp?: boolean;
   reason?: "already_taught";
-  error?: "unknown_concept_id" | "invalid_transition";
+  error?: "unknown_concept_id" | "invalid_transition" | "incomplete_teaching_contract";
   validRelevantNodes?: Array<{ id: string; title: string }>;
   recoveryRequired?: boolean;
 };
@@ -78,6 +90,7 @@ export function createLessonState(topic: string, tree: LessonTreeItem[] = []): L
     currentNodeId: first,
     rootNodeIds,
     nodes: deriveParentStatuses(nodes, first),
+    teachingContractProgress: createTeachingContractProgress(nodes),
     resumePoint: "",
     interruptionCount: 0,
     lastUserTranscript: "",
@@ -87,6 +100,123 @@ export function createLessonState(topic: string, tree: LessonTreeItem[] = []): L
 
 export function getCurrentConcept(state: LessonState) {
   return state.currentNodeId ? state.nodes[state.currentNodeId] : undefined;
+}
+
+export function createTeachingContractProgress(
+  nodes: Record<string, LessonNode>,
+): Record<string, TeachingContractProgress> {
+  return Object.fromEntries(Object.values(nodes)
+    .filter((node) => node.childrenIds.length === 0 && Boolean(node.teaching))
+    .map((node) => [node.id, {
+      nextTeachingPointIndex: node.status === "taught"
+        ? node.teaching!.teachingPoints.length
+        : 0,
+    }]));
+}
+
+export function normalizeTeachingContractProgress(
+  nodes: Record<string, LessonNode>,
+  value: unknown,
+): Record<string, TeachingContractProgress> {
+  const candidate = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  return Object.fromEntries(Object.values(nodes)
+    .filter((node) => node.childrenIds.length === 0 && Boolean(node.teaching))
+    .map((node) => {
+      const raw = candidate[node.id];
+      const rawNext = raw && typeof raw === "object" && !Array.isArray(raw)
+        ? (raw as Record<string, unknown>).nextTeachingPointIndex
+        : undefined;
+      const fallback = node.status === "taught" ? node.teaching!.teachingPoints.length : 0;
+      const next = node.status === "taught"
+        ? node.teaching!.teachingPoints.length
+        : typeof rawNext === "number" && Number.isFinite(rawNext)
+        ? Math.trunc(rawNext)
+        : fallback;
+      return [node.id, {
+        nextTeachingPointIndex: Math.max(
+          0,
+          Math.min(node.teaching!.teachingPoints.length, next),
+        ),
+      }];
+    }));
+}
+
+export function progressLessonTeachingPoint(
+  state: LessonState,
+  conceptId: string,
+  teachingPointIndex: number,
+) {
+  const node = state.nodes[conceptId];
+  if (!node) return unknownConceptError(state, "progress");
+  if (!node.teaching || node.childrenIds.length) {
+    return transitionError(state, "progress", `${node.title} has no valid atomic teaching contract`);
+  }
+  if (state.currentNodeId !== conceptId) {
+    return transitionError(state, "progress", "Only the current atomic concept can report teaching progress");
+  }
+  if (!Number.isInteger(teachingPointIndex) || teachingPointIndex < 0 ||
+      teachingPointIndex >= node.teaching.teachingPoints.length) {
+    return transitionError(state, "progress", "Teaching point index is outside the current contract");
+  }
+  const currentNext = state.teachingContractProgress[conceptId]?.nextTeachingPointIndex ?? 0;
+  const reportedNext = teachingPointIndex + 1;
+  if (reportedNext <= currentNext) {
+    return {
+      state,
+      result: {
+        ...snapshot(state, "progress", true, "Teaching point progress was already recorded"),
+        noOp: true,
+      },
+      events: [
+        `Teaching point progress ignored: concept=${conceptId}, reported=${teachingPointIndex}, currentNext=${currentNext}`,
+      ],
+    };
+  }
+  const nextState: LessonState = {
+    ...state,
+    teachingContractProgress: {
+      ...state.teachingContractProgress,
+      [conceptId]: { nextTeachingPointIndex: reportedNext },
+    },
+  };
+  return {
+    state: nextState,
+    result: snapshot(
+      nextState,
+      "progress",
+      true,
+      `Recorded completion of teaching point ${teachingPointIndex}`,
+    ),
+    events: [
+      `Teaching point completed: concept=${conceptId}, point=${teachingPointIndex}, next=${reportedNext}`,
+    ],
+  };
+}
+
+export function pauseLessonState(
+  state: LessonState,
+  progress?: { conceptId: string; resumePoint: string },
+) {
+  const nodes = cloneNodes(state.nodes);
+  const current = getCurrentConcept(state);
+  const hasCurrentProgress = Boolean(
+    progress?.resumePoint && current && progress.conceptId === current.id,
+  );
+  if (hasCurrentProgress && current?.status === "teaching") {
+    nodes[current.id].status = "partial";
+  }
+  return {
+    ...state,
+    status: "idle" as const,
+    nodes: deriveParentStatuses(nodes, state.currentNodeId),
+    resumePoint: hasCurrentProgress && progress ? progress.resumePoint : state.resumePoint,
+  };
+}
+
+export function isTeachableLessonNode(node: LessonNode) {
+  return node.childrenIds.length === 0 && Boolean(node.teaching);
 }
 
 export function getLessonTreeRows(state: LessonState) {
@@ -137,7 +267,10 @@ export function navigateLessonState(state: LessonState, requestedId: string) {
   if (nodes[target.id].status !== "taught") nodes[target.id].status = "teaching";
   if (target.teaching) events.push(`Teaching contract loaded: ${target.title}`);
   events.push(`Atomic concept started: ${target.title}`, `Moved to concept: ${target.title}`);
-  const next = withDerivedNodes(state, nodes, target.id, "teaching");
+  const next = {
+    ...withDerivedNodes(state, nodes, target.id, "teaching"),
+    resumePoint: "",
+  };
   return transitionSuccess(next, "navigate", `Moved to ${target.title}`, events);
 }
 
@@ -169,6 +302,18 @@ export function completeLessonConcept(state: LessonState, conceptId: string) {
   if (node.status !== "teaching" && node.status !== "partial") {
     return transitionError(state, "complete", `${node.title} is not currently being taught`);
   }
+  const nextTeachingPointIndex =
+    state.teachingContractProgress[node.id]?.nextTeachingPointIndex ?? 0;
+  if (nextTeachingPointIndex < node.teaching.teachingPoints.length) {
+    const result = transitionError(
+      state,
+      "complete",
+      `Teaching contract is incomplete; continue from teaching point ${nextTeachingPointIndex}`,
+      "incomplete_teaching_contract",
+      false,
+    );
+    return result;
+  }
   const nodes = cloneNodes(state.nodes);
   nodes[node.id].status = "taught";
   const atomicIds = getAtomicNodeIds(state);
@@ -177,7 +322,10 @@ export function completeLessonConcept(state: LessonState, conceptId: string) {
     nodes[id].status !== "taught" && nodes[id].status !== "skipped",
   ) ?? null;
   if (nextId) nodes[nextId].status = "teaching";
-  const next = withDerivedNodes(state, nodes, nextId, "teaching");
+  const next = {
+    ...withDerivedNodes(state, nodes, nextId, "teaching"),
+    resumePoint: "",
+  };
   const events = [`Atomic concept completed: ${node.title}`];
   if (nextId) events.push(`Sequential advancement: ${node.title} -> ${nodes[nextId].title}`);
   return {
@@ -216,7 +364,12 @@ export function skipLessonNode(state: LessonState, conceptId: string) {
     currentInside ? null : state.currentNodeId,
     "teaching",
   );
-  return transitionSuccess(next, "skip", `Skipped unfinished content under ${target.title}`, events);
+  return transitionSuccess(
+    currentInside ? { ...next, resumePoint: "" } : next,
+    "skip",
+    `Skipped unfinished content under ${target.title}`,
+    events,
+  );
 }
 
 export function queryLessonState(state: LessonState) {
@@ -317,13 +470,19 @@ function compareNodes(a: LessonNode, b: LessonNode) {
   return a.order - b.order || a.title.localeCompare(b.title);
 }
 
-function transitionError(state: LessonState, action: LessonAction, message: string) {
+function transitionError(
+  state: LessonState,
+  action: LessonAction,
+  message: string,
+  error: "invalid_transition" | "incomplete_teaching_contract" = "invalid_transition",
+  recoveryRequired = true,
+) {
   return {
     state,
     result: {
       ...snapshot(state, action, false, message),
-      error: "invalid_transition" as const,
-      recoveryRequired: true,
+      error,
+      recoveryRequired,
     },
     events: [] as string[],
   };
@@ -362,6 +521,9 @@ function transitionSuccess(state: LessonState, action: LessonAction, message: st
 function snapshot(state: LessonState, action: LessonAction, ok: boolean, message: string): LessonStateResult {
   const current = getCurrentConcept(state);
   const next = getNextSequentialConcept(state);
+  const currentNextTeachingPointIndex = current?.teaching
+    ? state.teachingContractProgress[current.id]?.nextTeachingPointIndex ?? 0
+    : null;
   return {
     ok,
     action,
@@ -379,6 +541,17 @@ function snapshot(state: LessonState, action: LessonAction, ok: boolean, message
     currentNodeTitle: current?.title ?? null,
     currentNodeStatus: current?.status ?? null,
     currentTeachingContract: current?.teaching,
+    currentTeachingProgress: current?.teaching && currentNextTeachingPointIndex !== null
+      ? {
+          nextTeachingPointIndex: currentNextTeachingPointIndex,
+          confirmedTeachingPoints:
+            current.teaching.teachingPoints.slice(0, currentNextTeachingPointIndex),
+          nextTeachingPoint:
+            current.teaching.teachingPoints[currentNextTeachingPointIndex] ?? null,
+          remainingTeachingPoints:
+            current.teaching.teachingPoints.slice(currentNextTeachingPointIndex),
+        }
+      : undefined,
     nextSequentialNode: next ? { id: next.id, title: next.title } : null,
     relevantNodes: current
       ? Object.values(state.nodes)
@@ -395,6 +568,7 @@ export function buildLessonInstruction(
   topic: string,
   sourceName?: string,
   teachingPreferences: TeachingPreferences = DEFAULT_TEACHING_PREFERENCES,
+  sessionStartMode: LessonSessionStartMode = "new",
 ) {
   const sourceGuidance = sourceName
     ? `You are conducting a spoken one-on-one lesson based primarily on educational material uploaded by the learner. The source is named: ${sourceName}.
@@ -404,23 +578,47 @@ ${topic ? `The learner's requested focus within the source is: ${topic}.` : "Tea
 Treat the supplied material as the authoritative course reference for topics, terminology, notation, conventions, equations, examples, and teaching sequence. Answer primarily from it when it covers the question. Use reliable general knowledge for relevant gaps, distinguish that extension when useful, and never claim outside knowledge came from the source. Follow source conventions for course-specific work.`
     : `You are conducting a spoken one-on-one lesson about: ${topic}.`;
 
+  const persistedResumeGuidance = sessionStartMode === "persisted-resume"
+    ? `
+This fresh Live connection is starting a user-visible continuation of a locally persisted lesson. It is the same tutor and lesson, but you have only the supplied authoritative state—not unsaved conversational memory.
+
+When and only when you receive ${PERSISTED_LESSON_RESUME_CONTROL}, the FIRST learner-visible response has a strict three-part contract: RECAP, RESUME LOCATION, then CONTINUE TEACHING. Produce all three in that order in the same response:
+- CONTRACT PROGRESS IS AUTHORITATIVE: contractProgress.confirmedTeachingPoints are fully delivered; contractProgress.nextTeachingPoint is the exact point to teach next; contractProgress.remainingTeachingPoints contains it and everything after it. Never infer the next point from transcripts. If resumePoint or recentTeachingContext conflicts with this structure, contract progress wins.
+- Use persistedResumeContext only as optional wording support. Its recentTeachingContext contains at most three bounded excerpts of recent explanation. Never use excerpts or resumePoint as teaching-completion evidence.
+- RECAP: name the current concept and briefly recap one or two confirmedTeachingPoints. If none are confirmed, say the concept was just beginning; do not invent a specific recap.
+- RESUME LOCATION: identify nextTeachingPoint as the authoritative continuation point. resumePoint may add fine-grained wording only when it is consistent with that point.
+- CONTINUE TEACHING: immediately teach nextTeachingPoint in this same response. Do not stop after orientation and do not hand progression back to the learner. If every teaching point is confirmed but coverage is not taught, perform the legitimate concept-completion/transition step instead of restarting point zero.
+- For a partial current concept, continue its unfinished portion without restarting it.
+- If the current concept has not yet been meaningfully taught after a completed predecessor, briefly connect the last covered concept to the new current concept without claiming the new one was covered.
+- If the current concept is already taught, describe it as a review location, not unfinished work.
+- If resumePoint is absent or weak, use a safe generic current-topic orientation and never invent prior dialogue or details.
+
+The first spoken sentence after this control must be orientation, not new teaching. Even with no usable resumePoint, explicitly say that you are continuing the named current concept and had already started it when its status is partial. When previousCoveredConceptTitle is present and the current concept has not been covered, briefly say the previous concept was finished and the current concept is next. Only after that orientation should you continue the teaching contract. When currentNodeId, the current concept, and its contract are valid, NEVER ask what the learner wants to cover, which topic they prefer, where to continue, or whether to proceed. Authoritative state has already made that decision. A lesson_state query may be used internally if needed, but its result does not cancel or replace this first-response contract.
+
+For overview depth, use one concise substantive recap sentence and one concise resume-location/transition sentence before immediately continuing; overview never permits omitting the recap. For normal, use roughly 2–3 concise orientation sentences. For detailed, use no more than 4 concise orientation sentences. It is a recap, not reteaching or a quiz. Apply the current speakingSpeed from the first spoken word. Do not welcome the learner, restart the lesson, request confirmation, change coverage, or call complete merely because the recap mentioned content. Never repeat this briefing after navigation, interruption, tool calls, or transport rollover.`
+    : "";
+
   return `${sourceGuidance}
 
 ${buildTeachingPreferenceInstruction(teachingPreferences)}
+${persistedResumeGuidance}
 
 Lesson coverage is application-owned. LESSON_TREE is hierarchical. Parent topics aggregate atomic descendants; teaching one child never means siblings or the parent were fully taught. Use the most specific atomic ID whenever possible.
 
 Use the one lesson_state function:
 - navigate: explicit movement to a leaf or parent. Parent navigation resolves to an incomplete descendant.
 - skip: explicit skipping of a concept or subtree. Never use it for clarification. If teaching should continue elsewhere afterward, call navigate before teaching that atomic concept.
-- complete: only the current atomic concept after meaningfully satisfying its teaching contract. Before calling complete, check its objective, teachingPoints, and completionCriteria. Required core/supporting material must have been explained; optional enrichment does not block completion unless the learner asks for it. Never complete a parent or infer completion from a response ending, elapsed time, a concept mention, one covered point, or a clarification. A successful complete automatically selects and starts the next eligible atomic concept; continue from the returned currentNodeId and never call navigate for ordinary sequential progression.
+- progress: immediately AFTER fully delivering one ordered teachingPoints entry, report its zero-based teachingPointIndex and conceptId. Never report before delivery or merely because you intend to teach it. Report each completed point before moving to the next. Duplicate reports are safe. After interruption, resume the same unconfirmed nextTeachingPoint; a little repetition is safer than skipping it.
+- complete: only the current atomic concept after all teaching points have been reported through progress and the completionCriteria are meaningfully satisfied. Never silently treat unreported points as delivered. Never complete a parent or infer completion from a response ending, elapsed time, a concept mention, one covered point, or a clarification. A successful complete automatically selects and starts the next eligible atomic concept; continue from the returned currentNodeId and its returned currentTeachingProgress without calling navigate for ordinary sequential progression.
 - query: questions about what was taught, skipped, or remains. Answer from the returned tree snapshot.
+
+For normal active teaching, currentTeachingProgress is authoritative too. Continue and interruption recovery resume its nextTeachingPoint. Navigation, skip, review, and resumePoint changes never reset contract progress. Coverage and contract progress are separate; neither implies mastery.
 
 Teaching contracts describe tutor coverage, not learner understanding. A taught status never implies mastery. Preserve contract keyTerms and notation. If sourceConfidence is uncertain, state uncertainty rather than inventing unreadable material.
 
 Never claim a parent is fully covered unless its returned status is taught. Never describe tool mechanics aloud. Teach depth-first in source order with concise explanations and occasional checks. On a clarification interruption, yield, answer, and resume the same atomic concept and contract without changing coverage.
 
-Never speak or quote text wrapped in [[APP_CONTROL:...]]. [[APP_CONTROL:IDLE_CONFIRMATION]] is an internal application signal, not learner speech. When received, naturally ask whether the learner is still there and wants to continue. Then use session_control exactly once when their response clearly means continue, end, or is unclear. During this confirmation, unrelated speech, television, ambient conversation, and nonsense are not confirmation; choose unclear unless intent is clearly directed to this lesson. After continue, resume the current concept naturally. After end, briefly acknowledge without continuing the lesson.
+Never speak or quote text wrapped in [[APP_CONTROL:...]]. ${PERSISTED_LESSON_RESUME_CONTROL} is the one-time saved-lesson start signal governed above; it is not learner speech. [[APP_CONTROL:IDLE_CONFIRMATION]] is an internal application signal, not learner speech. When received, naturally ask whether the learner is still there and wants to continue. Then use session_control exactly once when their response clearly means continue, end, or is unclear. During this confirmation, unrelated speech, television, ambient conversation, and nonsense are not confirmation; choose unclear unless intent is clearly directed to this lesson. After continue, resume the current concept naturally. After end, briefly acknowledge without continuing the lesson.
 
 [[APP_CONTROL:POST_RESUME_SYNC]] is an internal memory-alignment turn. Call lesson_state with action query exactly once, silently accept the returned application state and continuity snapshot as your own existing memory, then end this internal turn with no spoken or written learner-facing response. Do not greet, recap, teach, or continue output during this turn.
 [[APP_CONTROL:CONTINUE_INTERRUPTED_TUTOR_TURN]] means the transport changed while your immediately preceding explanation was unfinished. Continue directly from the interruptedAssistantTranscript/resumePoint in the continuity snapshot. Complete the unfinished thought naturally and concisely without greeting, announcing continuation, recapping the topic, or restarting the explanation.

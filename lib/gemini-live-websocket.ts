@@ -50,18 +50,24 @@ function buildLiveSetup(config: SetupConfig) {
           {
             name: "lesson_state",
             description:
-              "Synchronize authoritative hierarchical lesson coverage. Use navigate only for explicit learner-directed movement, skip for explicit subtree skipping, complete only after meaningfully finishing the current atomic concept, and query for authoritative state. A successful complete automatically advances to the next eligible atomic concept; continue from the returned currentNodeId without calling navigate.",
+              "Synchronize authoritative hierarchical lesson coverage and teaching-contract progress. After fully delivering one ordered teaching point, call progress for that point. Use navigate only for explicit learner-directed movement, skip for explicit subtree skipping, complete only after all teaching points are reported and the current atomic concept is meaningfully finished, and query for authoritative state. A successful complete automatically advances to the next eligible atomic concept.",
             parametersJsonSchema: {
               type: "object",
               properties: {
                 action: {
                   type: "string",
-                  enum: ["navigate", "complete", "skip", "query"],
+                  enum: ["navigate", "progress", "complete", "skip", "query"],
                 },
                 conceptId: {
                   type: "string",
                   description:
-                    "Stable node ID from LESSON_TREE. Required for navigate, complete, and skip.",
+                    "Stable node ID from LESSON_TREE. Required for navigate, progress, complete, and skip.",
+                },
+                teachingPointIndex: {
+                  type: "integer",
+                  minimum: 0,
+                  description:
+                    "Zero-based teachingPoints array index just fully delivered. Required only for progress.",
                 },
               },
               required: ["action"],

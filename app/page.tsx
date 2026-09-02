@@ -4,6 +4,7 @@ import type { FunctionCall, LiveServerMessage } from "@google/genai";
 import { useEffect, useRef, useState } from "react";
 import { LearningSourceUpload } from "../components/learning-source-upload";
 import { LessonRoadmap } from "../components/lesson-roadmap";
+import { RecentLessons } from "../components/recent-lessons";
 import type {
   LearningSource,
   PreparedLearningSource,
@@ -38,8 +39,12 @@ import {
   getLessonTreeRows,
   mergeTranscript,
   navigateLessonState,
+  pauseLessonState,
+  PERSISTED_LESSON_RESUME_CONTROL,
+  progressLessonTeachingPoint,
   queryLessonState,
   skipLessonNode,
+  type LessonSessionStartMode,
   type LessonState,
 } from "../lib/lesson-state";
 import {
@@ -49,6 +54,20 @@ import {
   applyTeachingPreferenceUpdate,
   type TeachingPreferences,
 } from "../lib/teaching-preferences";
+import {
+  MAX_RECENT_TEACHING_CONTEXT_ENTRIES,
+  MAX_RECENT_TEACHING_EXCERPT_LENGTH,
+  SAVED_LESSON_SCHEMA_VERSION,
+  clearActiveLessonId,
+  deleteSavedLesson,
+  getSavedLesson,
+  listSavedLessons,
+  loadActiveLesson,
+  saveActiveLesson,
+  setActiveLessonId,
+  type RecentTeachingContextEntry,
+  type SavedLesson,
+} from "../lib/local-persistence";
 
 type MicrophoneStatus =
   | "Not active"
@@ -164,6 +183,49 @@ function capitalize(value: string) {
   return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
 }
 
+function createLocalLessonId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `lesson-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function getPersistedResumeContext(
+  state: LessonState,
+  recentTeachingContext: RecentTeachingContextEntry[],
+) {
+  const current = getCurrentConcept(state);
+  const atomicConcepts = getLessonTreeRows(state)
+    .map(({ node }) => node)
+    .filter((node) => node.childrenIds.length === 0 && Boolean(node.teaching));
+  const currentIndex = current
+    ? atomicConcepts.findIndex((node) => node.id === current.id)
+    : -1;
+  const previousCovered = currentIndex > 0
+    ? atomicConcepts.slice(0, currentIndex).reverse()
+      .find((node) => node.status === "taught")
+    : undefined;
+  return {
+    currentConceptTitle: current?.title ?? null,
+    currentConceptStatus: current?.status ?? null,
+    resumePointAvailable: Boolean(state.resumePoint.trim()),
+    previousCoveredConceptTitle: previousCovered?.title ?? null,
+    recentTeachingContext: current
+      ? recentTeachingContext
+        .filter((entry) => entry.conceptId === current.id)
+        .map((entry) => entry.excerpt)
+      : [],
+  };
+}
+
+function createRecentTeachingExcerpt(transcript: string) {
+  const concise = transcript.trim().replace(/\s+/g, " ");
+  if (!concise) return "";
+  return concise.length <= MAX_RECENT_TEACHING_EXCERPT_LENGTH
+    ? concise
+    : `${concise.slice(0, MAX_RECENT_TEACHING_EXCERPT_LENGTH - 3).trimEnd()}...`;
+}
+
 export default function Home() {
   const [microphoneStatus, setMicrophoneStatus] =
     useState<MicrophoneStatus>("Not active");
@@ -181,6 +243,12 @@ export default function Home() {
   );
   const [preferenceUpdatePending, setPreferenceUpdatePending] = useState(false);
   const [roadmapNavigationPending, setRoadmapNavigationPending] = useState(false);
+  const [persistenceHydrated, setPersistenceHydrated] = useState(false);
+  const [persistenceNotice, setPersistenceNotice] = useState("");
+  const [savedLessonId, setSavedLessonId] = useState<string | null>(null);
+  const [resumeExistingLesson, setResumeExistingLesson] = useState(false);
+  const [savedLessons, setSavedLessons] = useState<SavedLesson[]>([]);
+  const [lessonLibraryBusyId, setLessonLibraryBusyId] = useState<string | null>(null);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const [showIosInstallHint, setShowIosInstallHint] = useState(false);
   const [topicInput, setTopicInput] = useState("");
@@ -189,6 +257,12 @@ export default function Home() {
   );
   const [learningSource, setLearningSource] = useState<LearningSource | null>(null);
   const preparedSourceRef = useRef<PreparedLearningSource | null>(null);
+  const savedLessonIdRef = useRef<string | null>(null);
+  const savedLessonCreatedAtRef = useRef<string | null>(null);
+  const savedLessonWasPersistedRef = useRef(false);
+  const resumeExistingLessonRef = useRef(false);
+  const persistenceAvailableRef = useRef(true);
+  const persistenceHydratedRef = useRef(false);
 
   const streamRef = useRef<MediaStream | null>(null);
   const transportRef = useRef<LiveTransportManager | null>(null);
@@ -205,6 +279,10 @@ export default function Home() {
   const lastAssistantTurnCompleteRef = useRef(true);
   const lessonStateRef = useRef(lessonState);
   const resumptionPendingRef = useRef(false);
+  const persistedResumeBriefingPendingRef = useRef(false);
+  const persistedResumeFirstResponseLoggedRef = useRef(false);
+  const assistantCheckpointConceptIdRef = useRef<string | null>(null);
+  const recentTeachingContextRef = useRef<RecentTeachingContextEntry[]>([]);
   const sourceGroundingPendingRef = useRef(false);
   const toolResultsRef = useRef(new Map<string, Record<string, unknown>>());
   const cancelledToolCallIdsRef = useRef(new Set<string>());
@@ -224,6 +302,7 @@ export default function Home() {
   const quickResponseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const preferenceUpdateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const roadmapNavigationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const persistenceSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const roadmapNavigationPendingRef = useRef(false);
   const teachingPreferencesRef = useRef<TeachingPreferences>(teachingPreferences);
   const meaningfulConfirmationSpeechRef = useRef(false);
@@ -271,6 +350,9 @@ export default function Home() {
     assistantTurnActiveRef.current = false;
     lastAssistantTurnCompleteRef.current = true;
     resumptionPendingRef.current = false;
+    persistedResumeBriefingPendingRef.current = false;
+    persistedResumeFirstResponseLoggedRef.current = false;
+    assistantCheckpointConceptIdRef.current = null;
     sourceGroundingPendingRef.current = false;
     toolResultsRef.current.clear();
     cancelledToolCallIdsRef.current.clear();
@@ -282,11 +364,13 @@ export default function Home() {
     if (quickResponseTimerRef.current) clearTimeout(quickResponseTimerRef.current);
     if (preferenceUpdateTimerRef.current) clearTimeout(preferenceUpdateTimerRef.current);
     if (roadmapNavigationTimerRef.current) clearTimeout(roadmapNavigationTimerRef.current);
+    if (persistenceSaveTimerRef.current) clearTimeout(persistenceSaveTimerRef.current);
     engagementTimerRef.current = null;
     confirmationTimerRef.current = null;
     quickResponseTimerRef.current = null;
     preferenceUpdateTimerRef.current = null;
     roadmapNavigationTimerRef.current = null;
+    persistenceSaveTimerRef.current = null;
     engagementStateRef.current = "ended";
     setEngagementState("ended");
     setTransportState("closed");
@@ -328,6 +412,228 @@ export default function Home() {
   const applyAuthoritativeTeachingPreferences = (next: TeachingPreferences) => {
     teachingPreferencesRef.current = next;
     setTeachingPreferences(next);
+  };
+
+  const updateRecentTeachingContext = (conceptId: string | null, transcript: string) => {
+    if (!conceptId || !lessonStateRef.current.nodes[conceptId]) return;
+    const excerpt = createRecentTeachingExcerpt(transcript);
+    if (!excerpt) return;
+    const matching = recentTeachingContextRef.current
+      .filter((entry) => entry.conceptId === conceptId);
+    if (matching.at(-1)?.excerpt === excerpt) return;
+    recentTeachingContextRef.current = [
+      ...matching,
+      { conceptId, excerpt },
+    ].slice(-MAX_RECENT_TEACHING_CONTEXT_ENTRIES);
+    addDebugMessage(
+      `Resume teaching context updated: concept=${conceptId}, ` +
+      `entries=${recentTeachingContextRef.current.length}`,
+    );
+  };
+
+  const createCurrentLessonSnapshot = (stateOverride?: LessonState) => {
+    if (!persistenceAvailableRef.current || !persistenceHydratedRef.current) return;
+    const id = savedLessonIdRef.current;
+    const prepared = preparedSourceRef.current;
+    const source = learningSource;
+    if (!id || !prepared || !source || source.status !== "ready") return;
+    const now = new Date().toISOString();
+    const createdAt = savedLessonCreatedAtRef.current ?? now;
+    savedLessonCreatedAtRef.current = createdAt;
+    const currentState = stateOverride ?? lessonStateRef.current;
+    return structuredClone<SavedLesson>({
+      schemaVersion: SAVED_LESSON_SCHEMA_VERSION,
+      id,
+      title: source.name,
+      lessonFocus: topicInput.trim(),
+      hasStarted: resumeExistingLessonRef.current,
+      source: {
+        metadata: { ...source, status: "ready", error: undefined },
+        prepared,
+      },
+      lessonState: {
+        ...currentState,
+        // M6.1 persists lesson continuity, not conversation history.
+        lastUserTranscript: "",
+        lastAssistantTranscript: "",
+      },
+      recentTeachingContext: recentTeachingContextRef.current,
+      teachingPreferences: teachingPreferencesRef.current,
+      createdAt,
+      updatedAt: now,
+    });
+  };
+
+  const persistLessonSnapshot = async (snapshot: SavedLesson) => {
+    try {
+      await saveActiveLesson(snapshot);
+      setSavedLessons((current) => [
+        snapshot,
+        ...current.filter((lesson) => lesson.id !== snapshot.id),
+      ].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+      if (savedLessonIdRef.current === snapshot.id && !savedLessonWasPersistedRef.current) {
+        savedLessonWasPersistedRef.current = true;
+        addDebugMessage(`Saved lesson created: ${snapshot.id}`);
+      } else {
+        addDebugMessage("Lesson autosaved");
+      }
+    } catch {
+      persistenceAvailableRef.current = false;
+      setPersistenceNotice("Local lesson saving is unavailable on this device.");
+      addDebugMessage("Local persistence unavailable");
+    }
+  };
+
+  const persistCurrentLesson = async (stateOverride?: LessonState) => {
+    const snapshot = createCurrentLessonSnapshot(stateOverride);
+    if (snapshot) await persistLessonSnapshot(snapshot);
+  };
+
+  const hydrateSavedLesson = (saved: SavedLesson) => {
+    preparedSourceRef.current = saved.source.prepared;
+    lessonStateRef.current = saved.lessonState;
+    recentTeachingContextRef.current = saved.recentTeachingContext;
+    teachingPreferencesRef.current = saved.teachingPreferences;
+    savedLessonIdRef.current = saved.id;
+    savedLessonCreatedAtRef.current = saved.createdAt;
+    savedLessonWasPersistedRef.current = true;
+    resumeExistingLessonRef.current = saved.hasStarted;
+    setLearningSource(saved.source.metadata);
+    setLessonState(saved.lessonState);
+    setTeachingPreferences(saved.teachingPreferences);
+    setTopicInput(saved.lessonFocus);
+    setSavedLessonId(saved.id);
+    setResumeExistingLesson(saved.hasStarted);
+    setCurrentUtterance("");
+    setUserError("");
+    addDebugMessage(
+      `Restored resume teaching context: entries=${saved.recentTeachingContext.length}`,
+    );
+  };
+
+  const resetIdleLessonWorkspace = () => {
+    const emptyLesson = createLessonState("Uploaded material", []);
+    preparedSourceRef.current = null;
+    lessonStateRef.current = emptyLesson;
+    recentTeachingContextRef.current = [];
+    teachingPreferencesRef.current = DEFAULT_TEACHING_PREFERENCES;
+    savedLessonIdRef.current = null;
+    savedLessonCreatedAtRef.current = null;
+    savedLessonWasPersistedRef.current = false;
+    resumeExistingLessonRef.current = false;
+    setLearningSource(null);
+    setLessonState(emptyLesson);
+    setTeachingPreferences(DEFAULT_TEACHING_PREFERENCES);
+    setTopicInput("");
+    setSavedLessonId(null);
+    setResumeExistingLesson(false);
+    setCurrentUtterance("");
+    setUserError("");
+  };
+
+  const startNewLessonFlow = () => {
+    if (lessonActiveRef.current) return;
+    if (persistenceSaveTimerRef.current) clearTimeout(persistenceSaveTimerRef.current);
+    persistenceSaveTimerRef.current = null;
+    const outgoingSnapshot = createCurrentLessonSnapshot();
+    if (outgoingSnapshot) void persistLessonSnapshot(outgoingSnapshot);
+    resetIdleLessonWorkspace();
+    addDebugMessage("New lesson setup opened");
+  };
+
+  const selectSavedLesson = async (id: string) => {
+    if (lessonActiveRef.current || lessonLibraryBusyId) return;
+    setLessonLibraryBusyId(id);
+    try {
+      if (persistenceSaveTimerRef.current) clearTimeout(persistenceSaveTimerRef.current);
+      persistenceSaveTimerRef.current = null;
+      const outgoingSnapshot = createCurrentLessonSnapshot();
+      if (outgoingSnapshot) await persistLessonSnapshot(outgoingSnapshot);
+      const saved = await getSavedLesson(id);
+      if (!saved) {
+        setUserError("That saved lesson is unavailable or incompatible.");
+        setSavedLessons((current) => current.filter((lesson) => lesson.id !== id));
+        return;
+      }
+      await setActiveLessonId(id);
+      hydrateSavedLesson(saved);
+      addDebugMessage(`Saved lesson selected: ${id}`);
+      addDebugMessage(`Active lesson changed: ${id}`);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch {
+      setPersistenceNotice("Local lesson saving is unavailable on this device.");
+      addDebugMessage("Local persistence unavailable");
+    } finally {
+      setLessonLibraryBusyId(null);
+    }
+  };
+
+  const requestDeleteSavedLesson = async (saved: SavedLesson) => {
+    if (lessonActiveRef.current || lessonLibraryBusyId) return;
+    if (!window.confirm(`Delete "${saved.title}"?\n\nThis removes its local source and progress.`)) {
+      return;
+    }
+    setLessonLibraryBusyId(saved.id);
+    try {
+      if (savedLessonIdRef.current === saved.id && persistenceSaveTimerRef.current) {
+        clearTimeout(persistenceSaveTimerRef.current);
+        persistenceSaveTimerRef.current = null;
+      }
+      await deleteSavedLesson(saved.id);
+      setSavedLessons((current) => current.filter((lesson) => lesson.id !== saved.id));
+      if (savedLessonIdRef.current === saved.id) resetIdleLessonWorkspace();
+      addDebugMessage(`Saved lesson deleted: ${saved.id}`);
+    } catch {
+      setPersistenceNotice("That saved lesson could not be deleted on this device.");
+      addDebugMessage("Local persistence unavailable");
+    } finally {
+      setLessonLibraryBusyId(null);
+    }
+  };
+
+  const handlePreparedSourceChange = (source: PreparedLearningSource | null) => {
+    if (!source) {
+      const outgoingSnapshot = createCurrentLessonSnapshot();
+      if (outgoingSnapshot) void persistLessonSnapshot(outgoingSnapshot);
+    }
+    preparedSourceRef.current = source;
+    recentTeachingContextRef.current = [];
+    const outlineState = createLessonState(
+      source ? `Main topics in ${source.name}` : "Uploaded material",
+      source?.lessonTree ?? [],
+    );
+    lessonStateRef.current = outlineState;
+    setLessonState(outlineState);
+    if (!source) return;
+
+    const id = createLocalLessonId();
+    const createdAt = new Date().toISOString();
+    savedLessonIdRef.current = id;
+    savedLessonCreatedAtRef.current = createdAt;
+    savedLessonWasPersistedRef.current = false;
+    resumeExistingLessonRef.current = false;
+    setSavedLessonId(id);
+    setResumeExistingLesson(false);
+  };
+
+  const handleLearningSourceChange = (source: LearningSource | null) => {
+    setLearningSource(source);
+    if (source !== null) return;
+    savedLessonIdRef.current = null;
+    savedLessonCreatedAtRef.current = null;
+    savedLessonWasPersistedRef.current = false;
+    resumeExistingLessonRef.current = false;
+    teachingPreferencesRef.current = DEFAULT_TEACHING_PREFERENCES;
+    setSavedLessonId(null);
+    setResumeExistingLesson(false);
+    setTeachingPreferences(DEFAULT_TEACHING_PREFERENCES);
+    if (persistenceAvailableRef.current) {
+      void clearActiveLessonId().catch(() => {
+        persistenceAvailableRef.current = false;
+        setPersistenceNotice("Local lesson saving is unavailable on this device.");
+        addDebugMessage("Local persistence unavailable");
+      });
+    }
   };
 
   const changeActiveTeachingPreference = (update: TeachingPreferenceUpdate) => {
@@ -487,6 +793,70 @@ export default function Home() {
   };
 
   useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [result, library] = await Promise.all([
+          loadActiveLesson(),
+          listSavedLessons(),
+        ]);
+        if (cancelled) return;
+        addDebugMessage("IndexedDB opened");
+        setSavedLessons(library);
+        addDebugMessage(`Saved lesson library loaded: ${library.length} lessons`);
+        if (result.status === "incompatible") {
+          addDebugMessage("Saved lesson schema incompatible");
+          await clearActiveLessonId();
+        } else if (result.status === "restored") {
+          const saved = result.lesson;
+          hydrateSavedLesson(saved);
+          addDebugMessage(`Restored saved lesson: ${saved.id}`);
+        }
+      } catch {
+        if (!cancelled) {
+          persistenceAvailableRef.current = false;
+          setPersistenceNotice("Local lesson saving is unavailable on this device.");
+          addDebugMessage("Local persistence unavailable");
+        }
+      } finally {
+        if (!cancelled) {
+          persistenceHydratedRef.current = true;
+          setPersistenceHydrated(true);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!persistenceHydrated || !savedLessonId || learningSource?.status !== "ready") return;
+    const snapshot = createCurrentLessonSnapshot();
+    if (!snapshot) return;
+    if (persistenceSaveTimerRef.current) clearTimeout(persistenceSaveTimerRef.current);
+    persistenceSaveTimerRef.current = setTimeout(() => {
+      persistenceSaveTimerRef.current = null;
+      void persistLessonSnapshot(snapshot);
+    }, 600);
+    return () => {
+      if (persistenceSaveTimerRef.current) clearTimeout(persistenceSaveTimerRef.current);
+      persistenceSaveTimerRef.current = null;
+    };
+  }, [
+    persistenceHydrated,
+    savedLessonId,
+    learningSource,
+    lessonState.currentNodeId,
+    lessonState.nodes,
+    lessonState.teachingContractProgress,
+    lessonState.resumePoint,
+    lessonState.status,
+    teachingPreferences,
+    topicInput,
+  ]);
+
+  useEffect(() => {
     isMountedRef.current = true;
 
     const onInstallPrompt = (event: Event) => {
@@ -581,6 +951,12 @@ export default function Home() {
       if (!assistantTurnActiveRef.current) {
         assistantTurnActiveRef.current = true;
         assistantTranscriptRef.current = "";
+        assistantCheckpointConceptIdRef.current = lessonStateRef.current.currentNodeId;
+      }
+      if (persistedResumeBriefingPendingRef.current &&
+          !persistedResumeFirstResponseLoggedRef.current) {
+        persistedResumeFirstResponseLoggedRef.current = true;
+        addDebugMessage("First persisted-resume response received");
       }
       if (engagementStateRef.current === "confirming" && !assistantSpeakingRef.current) {
         addDebugMessage("Idle confirmation spoken");
@@ -658,6 +1034,12 @@ export default function Home() {
         if (!assistantTurnActiveRef.current) {
           assistantTurnActiveRef.current = true;
           assistantTranscriptRef.current = "";
+          assistantCheckpointConceptIdRef.current = lessonStateRef.current.currentNodeId;
+        }
+        if (persistedResumeBriefingPendingRef.current &&
+            !persistedResumeFirstResponseLoggedRef.current) {
+          persistedResumeFirstResponseLoggedRef.current = true;
+          addDebugMessage("First persisted-resume response received");
         }
         if (resumptionPendingRef.current) {
           updateLessonState((current) => ({
@@ -676,13 +1058,33 @@ export default function Home() {
       assistantTurnActiveRef.current = false;
       lastAssistantTurnCompleteRef.current = true;
       transportRef.current?.setAssistantSpeaking(false);
-      updateLessonState((state) => ({
-        ...state,
-        status: state.status === "idle" ? "idle" : "teaching",
-        lastAssistantTranscript:
-          assistantTranscriptRef.current || state.lastAssistantTranscript,
-      }));
+      const completedAssistantTranscript =
+        assistantTranscriptRef.current || lessonStateRef.current.lastAssistantTranscript;
+      if (engagementStateRef.current !== "confirming") {
+        updateRecentTeachingContext(
+          assistantCheckpointConceptIdRef.current,
+          completedAssistantTranscript,
+        );
+      }
+      updateLessonState((state) => {
+        const assistantTranscript = completedAssistantTranscript || state.lastAssistantTranscript;
+        const checkpoint = deriveResumePoint(assistantTranscript, "");
+        const checkpointMatchesCurrent = Boolean(
+          checkpoint && state.currentNodeId &&
+          assistantCheckpointConceptIdRef.current === state.currentNodeId,
+        );
+        return {
+          ...state,
+          status: state.status === "idle" ? "idle" : "teaching",
+          lastAssistantTranscript: assistantTranscript,
+          resumePoint: checkpointMatchesCurrent ? checkpoint : state.resumePoint,
+        };
+      });
       resumptionPendingRef.current = false;
+      if (persistedResumeBriefingPendingRef.current) {
+        persistedResumeBriefingPendingRef.current = false;
+        addDebugMessage("Resume briefing completed");
+      }
       addDebugMessage("Assistant response completed");
     }
   };
@@ -704,6 +1106,7 @@ export default function Home() {
       const args = call.args ?? {};
       const action = args.action;
       const conceptId = args.conceptId;
+      const teachingPointIndex = args.teachingPointIndex;
       const isRoadmapNavigation = call.name === "lesson_state" &&
         action === "navigate" && roadmapNavigationPendingRef.current;
       const isLessonQuery = call.name === "lesson_state" && action === "query";
@@ -814,6 +1217,25 @@ export default function Home() {
         }
         addDebugMessage("Lesson state queried");
       } else if (
+        action === "progress" && typeof conceptId === "string" && conceptId &&
+        typeof teachingPointIndex === "number" && Number.isInteger(teachingPointIndex)
+      ) {
+        const transition = progressLessonTeachingPoint(
+          lessonStateRef.current,
+          conceptId,
+          teachingPointIndex,
+        );
+        result = transition.result;
+        events = transition.events;
+        if (transition.state !== lessonStateRef.current) {
+          lessonStateRef.current = transition.state;
+          setLessonState(transition.state);
+        }
+        if (transition.result.recoveryRequired && !silentLessonRecoveryPendingRef.current) {
+          silentLessonRecoveryPendingRef.current = true;
+          requestSilentRecovery = true;
+        }
+      } else if (
         (action === "navigate" || action === "complete" || action === "skip") &&
         typeof conceptId === "string" && conceptId
       ) {
@@ -833,6 +1255,16 @@ export default function Home() {
         if (transition.state !== lessonStateRef.current) {
           lessonStateRef.current = transition.state;
           setLessonState(transition.state);
+        }
+        if (transition.result.ok && (action === "navigate" || action === "complete")) {
+          const active = getCurrentConcept(transition.state);
+          if (active?.teaching) {
+            addDebugMessage(
+              `Teaching contract progress: concept=${active.title}, ` +
+              `next=${transition.state.teachingContractProgress[active.id]
+                ?.nextTeachingPointIndex ?? 0}, total=${active.teaching.teachingPoints.length}`,
+            );
+          }
         }
         if (action === "navigate") {
           if (isRoadmapNavigation) {
@@ -854,7 +1286,8 @@ export default function Home() {
         }
       } else {
         const snapshot = queryLessonState(lessonStateRef.current);
-        const missingConcept = action === "navigate" || action === "complete" || action === "skip";
+        const missingConcept = action === "navigate" || action === "progress" ||
+          action === "complete" || action === "skip";
         result = {
           ...snapshot,
           ok: false,
@@ -921,6 +1354,16 @@ export default function Home() {
     const preparedSource = preparedSourceRef.current;
     const lessonFocus = topicInput.trim();
     const lessonTopic = lessonFocus || `Main topics in ${activeSource.name}`;
+    const continuingSavedLesson = resumeExistingLessonRef.current;
+    const sessionStartMode: LessonSessionStartMode = continuingSavedLesson
+      ? "persisted-resume"
+      : "new";
+    const persistedResumeContext = continuingSavedLesson
+      ? getPersistedResumeContext(
+          lessonStateRef.current,
+          recentTeachingContextRef.current,
+        )
+      : null;
     const sessionInitialTeachingPreferences = { ...teachingPreferencesRef.current };
     const requestFreshToken = async () => {
       addDebugMessage("Gemini token requested");
@@ -954,12 +1397,21 @@ export default function Home() {
         newSessionExpiresAt: body.newSessionExpiresAt,
       };
     };
-    const initialLessonState = createLessonState(
-      lessonTopic,
-      preparedSource.lessonTree,
-    );
-    lessonStateRef.current = initialLessonState;
-    setLessonState(initialLessonState);
+    const initialLessonState = continuingSavedLesson
+      ? lessonStateRef.current
+      : createLessonState(lessonTopic, preparedSource.lessonTree);
+    if (!continuingSavedLesson) {
+      lessonStateRef.current = initialLessonState;
+      setLessonState(initialLessonState);
+    }
+    const startingConcept = getCurrentConcept(initialLessonState);
+    if (startingConcept?.teaching) {
+      addDebugMessage(
+        `Teaching contract progress: concept=${startingConcept.title}, ` +
+        `next=${initialLessonState.teachingContractProgress[startingConcept.id]
+          ?.nextTeachingPointIndex ?? 0}, total=${startingConcept.teaching.teachingPoints.length}`,
+      );
+    }
     setTopicInput(lessonFocus);
     userTranscriptRef.current = "";
     lastMeaningfulLearnerTranscriptRef.current = "";
@@ -967,8 +1419,12 @@ export default function Home() {
     lastAssistantTurnCompleteRef.current = true;
     setCurrentUtterance("");
     resumptionPendingRef.current = false;
-    addDebugMessage(`Lesson initialized from source: ${activeSource.name}`);
-    addDebugMessage("Lesson tree initialized");
+    addDebugMessage(
+      continuingSavedLesson
+        ? `Saved lesson continuation initialized: ${activeSource.name}`
+        : `Lesson initialized from source: ${activeSource.name}`,
+    );
+    addDebugMessage(continuingSavedLesson ? "Saved lesson tree restored" : "Lesson tree initialized");
     addDebugMessage(
       `Teaching preferences initialized: depth=${sessionInitialTeachingPreferences.explanationDepth}, ` +
       `speakingSpeed=${sessionInitialTeachingPreferences.speakingSpeed}`,
@@ -1029,6 +1485,7 @@ export default function Home() {
         lessonFocus,
         tokenBody.source.name,
         sessionInitialTeachingPreferences,
+        sessionStartMode,
       );
 
       const transport = new LiveTransportManager({
@@ -1053,9 +1510,11 @@ export default function Home() {
           );
         },
         seedFreshRecovery: (socket) => {
+          const coverage = queryLessonState(lessonStateRef.current);
           socket.seedRecoveryContext({ ...preparedSource, focus: lessonFocus }, {
-            coverage: queryLessonState(lessonStateRef.current),
+            coverage,
             currentTeachingContract: getCurrentConcept(lessonStateRef.current)?.teaching,
+            contractProgress: coverage.currentTeachingProgress,
             resumePoint: lessonStateRef.current.resumePoint,
             teachingPreferences: teachingPreferencesRef.current,
           });
@@ -1082,10 +1541,41 @@ export default function Home() {
       addDebugMessage("Live connection established");
       sourceGroundingPendingRef.current = true;
       addDebugMessage("Source seeding started");
-      session.seedInitialSource({
-        ...preparedSource,
-        focus: lessonFocus,
-      });
+      if (continuingSavedLesson) {
+        const current = getCurrentConcept(lessonStateRef.current);
+        const contractNext = current?.teaching
+          ? lessonStateRef.current.teachingContractProgress[current.id]?.nextTeachingPointIndex ?? 0
+          : 0;
+        const coverage = queryLessonState(lessonStateRef.current);
+        session.seedRecoveryContext({ ...preparedSource, focus: lessonFocus }, {
+          coverage,
+          currentTeachingContract: getCurrentConcept(lessonStateRef.current)?.teaching,
+          contractProgress: coverage.currentTeachingProgress,
+          persistedResumeContext,
+          resumePoint: lessonStateRef.current.resumePoint,
+          teachingPreferences: teachingPreferencesRef.current,
+        });
+        addDebugMessage(
+          `Persisted resume seed: concept=${persistedResumeContext?.currentConceptTitle || "current lesson topic"}, ` +
+          `status=${persistedResumeContext?.currentConceptStatus || "unknown"}, ` +
+          `resumePointAvailable=${persistedResumeContext?.resumePointAvailable ? "yes" : "no"}, ` +
+          `recentContextEntries=${persistedResumeContext?.recentTeachingContext.length ?? 0}`,
+        );
+        addDebugMessage(
+          `Persisted contract resume: concept=${current?.title || "current lesson topic"}, ` +
+          `next=${contractNext}, total=${current?.teaching?.teachingPoints.length ?? 0}`,
+        );
+        addDebugMessage(
+          `Persisted resume context delivered: ` +
+          `recentContextEntries=${persistedResumeContext?.recentTeachingContext.length ?? 0}, ` +
+          `resumePointAvailable=${persistedResumeContext?.resumePointAvailable ? "yes" : "no"}`,
+        );
+      } else {
+        session.seedInitialSource({
+          ...preparedSource,
+          focus: lessonFocus,
+        });
+      }
       addDebugMessage("Source seeded into Live context");
       addDebugMessage("Source grounding ready");
 
@@ -1115,15 +1605,36 @@ export default function Home() {
         ...current,
         status: "teaching",
       }));
+      resumeExistingLessonRef.current = true;
+      setResumeExistingLesson(true);
       addDebugMessage("Lesson started");
       lessonActiveRef.current = true;
       beginIdleMonitoring();
       void requestWakeLock();
-      transport.sendRealtimeInput({
-        text: `Begin the source-grounded spoken lesson now. Identify the uploaded material as "${tokenBody.source.name}", briefly preview what you will cover, then teach the first concept${
-          lessonFocus ? ` related to ${lessonFocus}` : " from the source"
-        }.`,
-      });
+      if (sessionStartMode === "persisted-resume") {
+        const current = getCurrentConcept(lessonStateRef.current);
+        const resumePoint = lessonStateRef.current.resumePoint.trim();
+        addDebugMessage("Persisted lesson continuation started");
+        addDebugMessage(`Resume briefing requested: concept=${current?.title || "current lesson topic"}`);
+        addDebugMessage(`Resume point available: ${resumePoint ? "yes" : "no"}`);
+        addDebugMessage(
+          `Teaching preferences on resume: depth=${sessionInitialTeachingPreferences.explanationDepth}, ` +
+          `speakingSpeed=${sessionInitialTeachingPreferences.speakingSpeed}`,
+        );
+        persistedResumeFirstResponseLoggedRef.current = false;
+        persistedResumeBriefingPendingRef.current = transport.sendLearnerText(
+          PERSISTED_LESSON_RESUME_CONTROL,
+        );
+        if (persistedResumeBriefingPendingRef.current) {
+          addDebugMessage("Resume briefing control sent");
+        }
+      } else {
+        transport.sendRealtimeInput({
+          text: `Begin the source-grounded spoken lesson now. Identify the uploaded material as "${tokenBody.source.name}", briefly preview what you will cover, then teach the first concept${
+            lessonFocus ? ` related to ${lessonFocus}` : " from the source"
+          }.`,
+        });
+      }
     } catch (error) {
       if (!isMountedRef.current || run !== conversationRunRef.current) return;
 
@@ -1165,9 +1676,44 @@ export default function Home() {
     conversationRunRef.current += 1;
     const hadMicrophone = Boolean(streamRef.current);
     const hadSession = Boolean(transportRef.current);
+    const currentBeforeStop = getCurrentConcept(lessonStateRef.current);
+    const checkpoint = deriveResumePoint(assistantTranscriptRef.current, "");
+    const checkpointMatchesCurrent = Boolean(
+      checkpoint && currentBeforeStop &&
+      assistantCheckpointConceptIdRef.current === currentBeforeStop.id,
+    );
+    if (checkpointMatchesCurrent) {
+      updateRecentTeachingContext(
+        assistantCheckpointConceptIdRef.current,
+        assistantTranscriptRef.current,
+      );
+    }
+    const stoppedLessonState = pauseLessonState(
+      lessonStateRef.current,
+      checkpointMatchesCurrent && currentBeforeStop
+        ? { conceptId: currentBeforeStop.id, resumePoint: checkpoint }
+        : undefined,
+    );
+    const persistedCurrent = getCurrentConcept(stoppedLessonState);
     setMicrophoneStatus("Not active");
     setAiConnectionStatus("Not connected");
-    updateLessonState((current) => ({ ...current, status: "idle" }));
+    lessonStateRef.current = stoppedLessonState;
+    setLessonState(stoppedLessonState);
+    addDebugMessage(
+      `Persisting resume state: concept=${persistedCurrent
+        ? `${persistedCurrent.id}/${persistedCurrent.title}`
+        : "none"}, status=${persistedCurrent?.status || "none"}, ` +
+      `resumePointAvailable=${stoppedLessonState.resumePoint ? "yes" : "no"}, ` +
+      `recentContextEntries=${recentTeachingContextRef.current.length}`,
+    );
+    if (persistedCurrent?.teaching) {
+      addDebugMessage(
+        `Persisting teaching progress: concept=${persistedCurrent.id}/${persistedCurrent.title}, ` +
+        `next=${stoppedLessonState.teachingContractProgress[persistedCurrent.id]
+          ?.nextTeachingPointIndex ?? 0}, total=${persistedCurrent.teaching.teachingPoints.length}`,
+      );
+    }
+    await persistCurrentLesson(stoppedLessonState);
     await disposeResources(true);
 
     if (reason === "inactivity") {
@@ -1205,20 +1751,23 @@ export default function Home() {
           </p>
         </header>
 
+        {!lessonActive && savedLessons.length > 0 && (
+          <RecentLessons
+            lessons={savedLessons}
+            activeLessonId={savedLessonId}
+            busyLessonId={lessonLibraryBusyId}
+            onContinue={(id) => void selectSavedLesson(id)}
+            onDelete={(saved) => void requestDeleteSavedLesson(saved)}
+            onNewLesson={startNewLessonFlow}
+          />
+        )}
+
         <div className="setup-only">
           <LearningSourceUpload
             source={learningSource}
-            disabled={microphoneActive || requestingPermission}
-            onChange={setLearningSource}
-            onPreparedChange={(source) => {
-              preparedSourceRef.current = source;
-              const outlineState = createLessonState(
-                source ? `Main topics in ${source.name}` : "Uploaded material",
-                source?.lessonTree ?? [],
-              );
-              lessonStateRef.current = outlineState;
-              setLessonState(outlineState);
-            }}
+            disabled={microphoneActive || requestingPermission || !persistenceHydrated}
+            onChange={handleLearningSourceChange}
+            onPreparedChange={handlePreparedSourceChange}
             onDebug={addDebugMessage}
           />
         </div>
@@ -1291,6 +1840,7 @@ export default function Home() {
         )}
 
         {userError && <p className="session-error" role="alert">{userError}</p>}
+        {persistenceNotice && <p className="session-error" role="status">{persistenceNotice}</p>}
 
         <div className="status-row" aria-label="Conversation status">
           <div className="status-item" aria-live="polite">
@@ -1354,14 +1904,16 @@ export default function Home() {
           onClick={microphoneActive ? () => void stopConversation() : startConversation}
           disabled={
             requestingPermission ||
-            (!microphoneActive && learningSource?.status !== "ready")
+            (!microphoneActive && (!persistenceHydrated || learningSource?.status !== "ready"))
           }
         >
           {microphoneActive
             ? "End Lesson"
             : requestingPermission
               ? "Requesting Permission..."
-              : "Start Conversation"}
+              : resumeExistingLesson
+                ? "Continue Lesson"
+                : "Start Conversation"}
         </button>
 
         <section className="lesson-state" aria-labelledby="lesson-state-title">
