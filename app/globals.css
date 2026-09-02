@@ -100,6 +100,124 @@ h1 {
   background: #f8fafb;
 }
 
+.cloud-account {
+  margin-bottom: 24px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #f8fafb;
+}
+
+.cloud-account-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.cloud-account-heading h2,
+.cloud-auth-form h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.cloud-kicker {
+  margin: 0 0 3px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.cloud-status {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  border-radius: 999px;
+  background: #eceff2;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.cloud-status.connected {
+  background: #e4f4e8;
+  color: #246334;
+}
+
+.cloud-note,
+.cloud-user p,
+.cloud-message,
+.cloud-error {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.cloud-message { color: #246334; }
+.cloud-error { color: #922727; }
+
+.cloud-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.cloud-actions button,
+.cloud-user button {
+  min-height: 44px;
+  padding: 9px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.cloud-actions button.secondary,
+.cloud-user button {
+  border-color: var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.cloud-user button { margin-top: 12px; }
+.cloud-actions button:disabled,
+.cloud-user button:disabled { cursor: wait; opacity: 0.6; }
+
+.cloud-auth-form {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.cloud-auth-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.cloud-auth-form input {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
 .recent-lessons-heading,
 .current-saved-lesson,
 .recent-lesson-actions {

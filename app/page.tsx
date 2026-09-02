@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { LearningSourceUpload } from "../components/learning-source-upload";
 import { LessonRoadmap } from "../components/lesson-roadmap";
 import { RecentLessons } from "../components/recent-lessons";
+import CloudAccount from "../components/cloud-account";
 import type {
   LearningSource,
   PreparedLearningSource,
@@ -1750,6 +1751,8 @@ export default function Home() {
             A simple workspace for realtime, voice-guided conversation.
           </p>
         </header>
+
+        {!lessonActive && <CloudAccount onDebug={addDebugMessage} />}
 
         {!lessonActive && savedLessons.length > 0 && (
           <RecentLessons
