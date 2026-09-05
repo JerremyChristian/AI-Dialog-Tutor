@@ -68,6 +68,7 @@ export function RecentLessons({
             return (
               <li key={lesson.id} className="recent-lesson-card">
                 <h3>{lesson.title}</h3>
+                <p>{lesson.sources.length} source{lesson.sources.length === 1 ? "" : "s"}</p>
                 <p>{covered} of {teachable.length} concepts covered</p>
                 {(partial > 0 || skipped > 0) && (
                   <p className="recent-lesson-secondary">

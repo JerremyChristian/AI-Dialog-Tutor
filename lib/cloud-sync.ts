@@ -185,6 +185,64 @@ export function uploadCloudLesson(
   });
 }
 
+function safeFilename(value: string) {
+  const cleaned = value.split(/[\\/]/).at(-1)?.normalize("NFKC")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 120);
+  return cleaned || "source";
+}
+
+export function uploadCloudLessonSources(
+  lesson: SavedLesson,
+  files: Map<string, File>,
+  expectedUserId: string,
+  debug?: (message: string) => void,
+) {
+  return serialize(async () => {
+    const { client, user } = await authenticatedClient(expectedUserId);
+    if (lesson.cloudOwnerId !== user.id || !isUuid(lesson.id)) throw new Error("cloud-lesson-ownership-invalid");
+    // The parent snapshot must exist before lesson_sources can satisfy its owned FK.
+    let updated = await uploadLesson(client, user, lesson, debug);
+    const nextSources = [...updated.sources];
+    for (const [index, source] of nextSources.entries()) {
+      if (source.storageStatus === "stored" && source.storagePath) continue;
+      const file = files.get(source.id);
+      if (!file) continue;
+      const storagePath = `${user.id}/${updated.id}/${source.id}/${safeFilename(source.name)}`;
+      debug?.(`Source upload started: lesson=${updated.id}, source=${source.id}`);
+      try {
+        const { error: uploadError } = await client.storage.from("lesson-sources")
+          .upload(storagePath, file, { contentType: source.mimeType, upsert: true });
+        if (uploadError) throw uploadError;
+        debug?.(`Source upload completed: source=${source.id}`);
+        const { error: rowError } = await client.from("lesson_sources").upsert({
+          id: source.id, lesson_id: updated.id, user_id: user.id, name: source.name,
+          mime_type: source.mimeType, size_bytes: source.sizeBytes, storage_path: storagePath, role: source.role,
+        }, { onConflict: "id" });
+        if (rowError) {
+          await client.storage.from("lesson-sources").remove([storagePath]);
+          throw rowError;
+        }
+        debug?.(`lesson_sources row upserted: source=${source.id}`);
+        nextSources[index] = { ...source, storagePath, storageStatus: "stored", storageError: undefined };
+      } catch {
+        nextSources[index] = { ...source, storagePath: null, storageStatus: "error", storageError: "Original source upload failed." };
+        debug?.(`Source upload failed: source=${source.id}, category=storage`);
+      }
+    }
+    updated = { ...updated, sources: nextSources, updatedAt: new Date().toISOString() };
+    await saveSavedLesson(updated);
+    return uploadLesson(client, user, updated, debug);
+  });
+}
+
+export async function downloadCloudLessonSource(source: { storagePath?: string | null }, expectedUserId: string) {
+  const { client } = await authenticatedClient(expectedUserId);
+  if (!source.storagePath || source.storagePath.split("/")[0] !== expectedUserId) throw new Error("cloud-source-path-invalid");
+  const { data, error } = await client.storage.from("lesson-sources").download(source.storagePath);
+  if (error || !data) throw new Error("cloud-source-download-failed");
+  return data;
+}
+
 function parseCloudRow(row: CloudLessonRow, ownerId: string): SavedLesson | null {
   if (row.user_id !== ownerId || row.snapshot_schema_version !== SAVED_LESSON_SCHEMA_VERSION) {
     return null;
@@ -292,6 +350,7 @@ export function reconcileCloudLessons(options: {
           cloudSync: undefined,
           createdAt: now,
           updatedAt: now,
+          sources: local.sources.map((source) => ({ ...source, storagePath: null, storageStatus: "local", storageError: undefined })),
         };
         const conflictCloudUpdatedAt = await upsertSnapshot(client, user, conflict);
         const syncedConflict: SavedLesson = {
@@ -343,6 +402,7 @@ export function reconcileCloudLessons(options: {
           cloudSync: undefined,
           createdAt: now,
           updatedAt: now,
+          sources: local.sources.map((source) => ({ ...source, storagePath: null, storageStatus: "local", storageError: undefined })),
         };
         const conflictCloudUpdatedAt = await upsertSnapshot(client, user, conflict);
         await saveSavedLesson({
@@ -373,6 +433,18 @@ export function reconcileCloudLessons(options: {
 export function deleteCloudLesson(id: string, expectedUserId: string, debug?: (message: string) => void) {
   return serialize(async () => {
     const { client } = await authenticatedClient(expectedUserId);
+    const { data: sources, error: sourceLookupError } = await client.from("lesson_sources")
+      .select("id,storage_path").eq("lesson_id", id).eq("user_id", expectedUserId);
+    if (sourceLookupError) throw new Error("cloud-source-lookup-failed");
+    const paths = (sources ?? []).flatMap((source) => typeof source.storage_path === "string" ? [source.storage_path] : []);
+    if (paths.length) {
+      const { error: storageError } = await client.storage.from("lesson-sources").remove(paths);
+      if (storageError) throw new Error("cloud-source-storage-delete-failed");
+      debug?.(`Cloud lesson source objects deleted: lesson=${id}, sources=${paths.length}`);
+    }
+    const { error: sourceDeleteError } = await client.from("lesson_sources").delete()
+      .eq("lesson_id", id).eq("user_id", expectedUserId);
+    if (sourceDeleteError) throw new Error("cloud-source-row-delete-failed");
     const { error, count } = await client.from("lessons")
       .delete({ count: "exact" })
       .eq("id", id);

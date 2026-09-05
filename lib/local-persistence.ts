@@ -1,4 +1,4 @@
-import type { LearningSource, PreparedLearningSource } from "./learning-source";
+import type { LearningSource, LessonSource, PreparedLearningSource } from "./learning-source";
 import {
   normalizeTeachingContractProgress,
   type CoverageStatus,
@@ -46,6 +46,7 @@ export type SavedLesson = {
     metadata: LearningSource;
     prepared: PreparedLearningSource;
   };
+  sources: LessonSource[];
   lessonState: LessonState;
   recentTeachingContext: RecentTeachingContextEntry[];
   teachingPreferences: TeachingPreferences;
@@ -334,6 +335,7 @@ export function parseSavedLesson(value: unknown): SavedLesson | null {
   if (typeof value.lessonFocus !== "string" || typeof value.hasStarted !== "boolean") return null;
   if (!isIsoDate(value.createdAt) || !isIsoDate(value.updatedAt)) return null;
   const source = parseSource(value.source);
+  const sources = parseLessonSources(value.sources, value.id, source?.metadata);
   const lessonState = parseLessonState(value.lessonState);
   const recentTeachingContext = parseRecentTeachingContext(
     value.recentTeachingContext,
@@ -346,7 +348,8 @@ export function parseSavedLesson(value: unknown): SavedLesson | null {
   if (cloudOwnerId === undefined) return null;
   const cloudSync = parseCloudSyncMetadata(value.cloudSync);
   if (value.cloudSync !== undefined && !cloudSync) return null;
-  if (!source || !lessonState || !recentTeachingContext || !teachingPreferences) return null;
+  if (!source || !sources || !lessonState || !recentTeachingContext || !teachingPreferences) return null;
+  normalizeLegacySourceReferences(source.prepared, sources[0].id);
   const sourceNodeIds = new Set(source.prepared.lessonTree.map((node) => node.id));
   const stateNodeIds = Object.keys(lessonState.nodes);
   if (sourceNodeIds.size !== stateNodeIds.length ||
@@ -358,6 +361,7 @@ export function parseSavedLesson(value: unknown): SavedLesson | null {
     lessonFocus: value.lessonFocus,
     hasStarted: value.hasStarted,
     source,
+    sources,
     lessonState,
     recentTeachingContext,
     teachingPreferences,
@@ -366,6 +370,78 @@ export function parseSavedLesson(value: unknown): SavedLesson | null {
     cloudOwnerId,
     ...(cloudSync ? { cloudSync } : {}),
   };
+}
+
+function normalizeLegacySourceReferences(prepared: PreparedLearningSource, sourceId: string) {
+  for (const node of prepared.lessonTree) {
+    const legacyNode = node as typeof node & { sourceReference?: unknown };
+    if (!node.sourceReferences && typeof legacyNode.sourceReference === "string") {
+      node.sourceReferences = [legacyReference(legacyNode.sourceReference, sourceId)];
+    }
+    const references = node.teaching?.sourceReferences as unknown;
+    if (node.teaching && Array.isArray(references)) {
+      node.teaching.sourceReferences = references.flatMap((reference) =>
+        typeof reference === "string" ? [legacyReference(reference, sourceId)] :
+          isRecord(reference) && typeof reference.sourceId === "string" ? [{
+            sourceId: reference.sourceId,
+            ...(typeof reference.page === "number" && Number.isInteger(reference.page) && reference.page > 0 ? { page: reference.page } : {}),
+            ...(typeof reference.section === "string" ? { section: reference.section } : {}),
+          }] : []
+      );
+    }
+  }
+}
+
+function legacyReference(value: string, sourceId: string) {
+  const page = value.match(/(?:page|slide)\s*(\d+)/i)?.[1];
+  return { sourceId, ...(page ? { page: Number(page) } : {}), section: value.slice(0, 200) };
+}
+
+function parseLessonSources(
+  value: unknown,
+  lessonId: string,
+  legacy: LearningSource | undefined,
+): LessonSource[] | null {
+  // Schema-1 lessons before M6.6 carried only source.metadata.
+  if (value === undefined && legacy) return [{
+    id: legacySourceId(lessonId),
+    name: legacy.name,
+    mimeType: legacy.mimeType as LessonSource["mimeType"],
+    sizeBytes: legacy.sizeBytes,
+    role: "other",
+    storageStatus: "local",
+  }];
+  if (!Array.isArray(value) || value.length < 1 || value.length > 6) return null;
+  const parsed: LessonSource[] = [];
+  for (const item of value) {
+    if (!isRecord(item) || !isUuid(item.id) || !isNonEmptyString(item.name) || item.name.length > 200 ||
+        (item.mimeType !== "application/pdf" && item.mimeType !== "text/plain") ||
+        typeof item.sizeBytes !== "number" || !Number.isInteger(item.sizeBytes) || item.sizeBytes < 0 ||
+        (item.role !== "slides" && item.role !== "transcript" && item.role !== "notes" && item.role !== "other") ||
+        (item.storageStatus !== undefined && item.storageStatus !== "local" && item.storageStatus !== "uploading" && item.storageStatus !== "stored" && item.storageStatus !== "error")) return null;
+    const storagePath = item.storagePath === undefined || item.storagePath === null ? null : typeof item.storagePath === "string" ? item.storagePath : undefined;
+    if (storagePath === undefined || (item.storageStatus === "stored" && !storagePath)) return null;
+    if (storagePath) {
+      const segments = storagePath.split("/");
+      if (segments.length !== 4 || segments[1] !== lessonId || segments[2] !== item.id) return null;
+    }
+    parsed.push({ id: item.id, name: item.name, mimeType: item.mimeType, sizeBytes: item.sizeBytes, role: item.role,
+      storagePath, storageStatus: item.storageStatus ?? (storagePath ? "stored" : "local"),
+      ...(typeof item.storageError === "string" ? { storageError: item.storageError.slice(0, 300) } : {}),
+    });
+  }
+  return parsed;
+}
+
+function legacySourceId(lessonId: string) {
+  let hash = 2166136261;
+  for (const character of lessonId) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+  const tail = Math.abs(hash >>> 0).toString(16).padStart(8, "0");
+  return `00000000-0000-4000-8000-${tail.padStart(12, "0")}`;
+}
+
+function isUuid(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function parseCloudSyncMetadata(value: unknown): CloudSyncMetadata | null {

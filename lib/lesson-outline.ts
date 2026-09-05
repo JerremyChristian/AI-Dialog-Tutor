@@ -3,6 +3,7 @@ import type {
   LessonTreeItem,
   TeachingImportance,
   TeachingNodeType,
+  SourceReference,
 } from "./learning-source";
 
 type Candidate = {
@@ -10,7 +11,7 @@ type Candidate = {
   title: string;
   parentId: string | null;
   order: number;
-  sourceReference?: string;
+  sourceReferences?: SourceReference[];
   teaching?: AtomicTeachingContract;
 };
 
@@ -22,7 +23,7 @@ const IMPORTANCE_LEVELS = new Set<TeachingImportance>([
   "core", "supporting", "optional",
 ]);
 
-export function normalizeLessonTree(value: unknown): LessonTreeItem[] {
+export function normalizeLessonTree(value: unknown, allowedSourceIds?: ReadonlySet<string>): LessonTreeItem[] {
   if (!Array.isArray(value)) return [];
   const candidates = value.flatMap((item, index): Candidate[] => {
     if (!item || typeof item !== "object") return [];
@@ -43,11 +44,8 @@ export function normalizeLessonTree(value: unknown): LessonTreeItem[] {
         typeof record.order === "number" && Number.isFinite(record.order)
           ? record.order
           : index + 1,
-      sourceReference:
-        typeof record.sourceReference === "string" && record.sourceReference.trim()
-          ? record.sourceReference.trim()
-          : undefined,
-      teaching: normalizeTeachingContract(record.teaching),
+      sourceReferences: normalizeSourceReferences(record.sourceReferences, allowedSourceIds),
+      teaching: normalizeTeachingContract(record.teaching, allowedSourceIds),
     }];
   });
 
@@ -86,7 +84,7 @@ export function normalizeLessonTree(value: unknown): LessonTreeItem[] {
       title: candidate.title,
       parentId: parent ? resolveId(parent) : null,
       order: candidate.order,
-      sourceReference: candidate.sourceReference,
+      sourceReferences: candidate.sourceReferences,
       teaching: parentOriginalIds.has(candidate.originalId)
         ? undefined
         : candidate.teaching,
@@ -94,7 +92,7 @@ export function normalizeLessonTree(value: unknown): LessonTreeItem[] {
   });
 }
 
-function normalizeTeachingContract(value: unknown): AtomicTeachingContract | undefined {
+function normalizeTeachingContract(value: unknown, allowedSourceIds?: ReadonlySet<string>): AtomicTeachingContract | undefined {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
   const objective = cleanString(record.objective, 300);
@@ -121,12 +119,28 @@ function normalizeTeachingContract(value: unknown): AtomicTeachingContract | und
     completionCriteria,
     type,
     importance,
-    sourceReferences: optionalList(record.sourceReferences, 6),
+    sourceReferences: normalizeSourceReferences(record.sourceReferences, allowedSourceIds),
     keyTerms: optionalList(record.keyTerms, 12),
     notation: optionalList(record.notation, 12),
     sourceConfidence,
     uncertaintyNote,
   };
+}
+
+function normalizeSourceReferences(value: unknown, allowedSourceIds?: ReadonlySet<string>): SourceReference[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const references = value.flatMap((item): SourceReference[] => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const record = item as Record<string, unknown>;
+    const sourceId = cleanString(record.sourceId, 64);
+    if (!sourceId || (allowedSourceIds && !allowedSourceIds.has(sourceId))) return [];
+    const page = typeof record.page === "number" && Number.isInteger(record.page) && record.page > 0
+      ? record.page
+      : undefined;
+    const section = cleanString(record.section, 200) || undefined;
+    return [{ sourceId, ...(page ? { page } : {}), ...(section ? { section } : {}) }];
+  }).slice(0, 8);
+  return references.length ? references : undefined;
 }
 
 function optionalList(value: unknown, limit: number) {

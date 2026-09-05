@@ -9,6 +9,7 @@ import { RecentLessons } from "../components/recent-lessons";
 import CloudAccount from "../components/cloud-account";
 import type {
   LearningSource,
+  LessonSource,
   PreparedLearningSource,
 } from "../lib/learning-source";
 import {
@@ -78,6 +79,7 @@ import {
   deleteCloudLesson,
   isUuid,
   reconcileCloudLessons,
+  uploadCloudLessonSources,
   type CloudSyncState,
 } from "../lib/cloud-sync";
 import { isSupabaseConfigured } from "../lib/supabase/config";
@@ -274,6 +276,10 @@ export default function Home() {
     createLessonState("Uploaded material"),
   );
   const [learningSource, setLearningSource] = useState<LearningSource | null>(null);
+  const [lessonSources, setLessonSources] = useState<LessonSource[]>([]);
+  const rawSourceFilesRef = useRef(new Map<string, File>());
+  const sourceUploadsInFlightRef = useRef(new Set<string>());
+  const sourceUploadsAttemptedRef = useRef(new Set<string>());
   const preparedSourceRef = useRef<PreparedLearningSource | null>(null);
   const savedLessonIdRef = useRef<string | null>(null);
   const savedLessonCreatedAtRef = useRef<string | null>(null);
@@ -520,6 +526,7 @@ export default function Home() {
         metadata: { ...source, status: "ready", error: undefined },
         prepared,
       },
+      sources: lessonSources,
       lessonState: {
         ...currentState,
         // M6.1 persists lesson continuity, not conversation history.
@@ -561,6 +568,26 @@ export default function Home() {
         addDebugMessage("Lesson autosaved");
       }
       scheduleCloudUpload(snapshot);
+      if (snapshot.cloudOwnerId && rawSourceFilesRef.current.size > 0 &&
+          snapshot.sources.some((item) => item.storageStatus !== "stored") &&
+          !sourceUploadsInFlightRef.current.has(snapshot.id)) {
+        if (sourceUploadsAttemptedRef.current.has(snapshot.id)) return;
+        sourceUploadsAttemptedRef.current.add(snapshot.id);
+        sourceUploadsInFlightRef.current.add(snapshot.id);
+        void uploadCloudLessonSources(snapshot, rawSourceFilesRef.current, snapshot.cloudOwnerId, addDebugMessage)
+          .then((synced) => {
+            setLessonSources(synced.sources);
+            applySyncedLessonMetadata(synced);
+            setCloudSyncState(synced.sources.some((item) => item.storageStatus === "error") ? "pending" : "synced");
+          })
+          .catch(() => {
+            setLessonSources((current) => current.map((item) => rawSourceFilesRef.current.has(item.id) && item.storageStatus !== "stored"
+              ? { ...item, storageStatus: "error", storageError: "Original source upload failed." }
+              : item));
+            setCloudSyncState("pending");
+          })
+          .finally(() => sourceUploadsInFlightRef.current.delete(snapshot.id));
+      }
     } catch {
       persistenceAvailableRef.current = false;
       setPersistenceNotice("Local lesson saving is unavailable on this device.");
@@ -587,6 +614,10 @@ export default function Home() {
     cloudSyncMetadataRef.current = saved.cloudSync;
     resumeExistingLessonRef.current = saved.hasStarted;
     setLearningSource(saved.source.metadata);
+    setLessonSources(saved.sources);
+    rawSourceFilesRef.current = new Map();
+    sourceUploadsAttemptedRef.current.clear();
+    saved.sources.forEach((item) => addDebugMessage(`Source restored from cloud metadata: source=${item.id}`));
     setLessonState(saved.lessonState);
     setTeachingPreferences(saved.teachingPreferences);
     setTopicInput(saved.lessonFocus);
@@ -614,6 +645,9 @@ export default function Home() {
     cloudSyncMetadataRef.current = undefined;
     resumeExistingLessonRef.current = false;
     setLearningSource(null);
+    setLessonSources([]);
+    rawSourceFilesRef.current = new Map();
+    sourceUploadsAttemptedRef.current.clear();
     setLessonState(emptyLesson);
     setTeachingPreferences(DEFAULT_TEACHING_PREFERENCES);
     setTopicInput("");
@@ -746,6 +780,22 @@ export default function Home() {
         addDebugMessage("Local persistence unavailable");
       });
     }
+  };
+
+  const handleLessonSourcesChange = (sources: LessonSource[], files: Map<string, File>) => {
+    setLessonSources(sources);
+    rawSourceFilesRef.current = files;
+  };
+
+  const retrySourceUpload = () => {
+    const id = savedLessonIdRef.current;
+    if (!id || rawSourceFilesRef.current.size === 0) {
+      setPersistenceNotice("Original files are no longer available in this browser session. Create a new lesson to reselect them.");
+      return;
+    }
+    sourceUploadsAttemptedRef.current.delete(id);
+    const snapshot = createCurrentLessonSnapshot();
+    if (snapshot) void persistLessonSnapshot(snapshot);
   };
 
   const changeActiveTeachingPreference = (update: TeachingPreferenceUpdate) => {
@@ -1065,6 +1115,7 @@ export default function Home() {
     persistenceHydrated,
     savedLessonId,
     learningSource,
+    lessonSources,
     lessonState.currentNodeId,
     lessonState.nodes,
     lessonState.teachingContractProgress,
@@ -2007,8 +2058,11 @@ export default function Home() {
         <div className="setup-only">
           <LearningSourceUpload
             source={learningSource}
+            sources={lessonSources}
             disabled={microphoneActive || requestingPermission || !persistenceHydrated}
             onChange={handleLearningSourceChange}
+            onSourcesChange={handleLessonSourcesChange}
+            onRetrySourceUpload={retrySourceUpload}
             onPreparedChange={handlePreparedSourceChange}
             onDebug={addDebugMessage}
           />
@@ -2259,7 +2313,10 @@ export default function Home() {
                 ))}
               </ul>
               {currentTeachingContract.sourceReferences?.length ? (
-                <p><strong>Source:</strong> {currentTeachingContract.sourceReferences.join(", ")}</p>
+                <p><strong>Source:</strong> {currentTeachingContract.sourceReferences.map((reference) => {
+                  const sourceName = lessonSources.find((source) => source.id === reference.sourceId)?.name ?? reference.sourceId;
+                  return `${sourceName}${reference.page ? ` page ${reference.page}` : ""}${reference.section ? ` (${reference.section})` : ""}`;
+                }).join(", ")}</p>
               ) : null}
               {currentTeachingContract.keyTerms?.length ? (
                 <p><strong>Terms:</strong> {currentTeachingContract.keyTerms.join(", ")}</p>
