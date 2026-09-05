@@ -1,6 +1,6 @@
 # Supabase cloud foundation setup
 
-M6.4 adds optional authentication and secured cloud infrastructure. Local IndexedDB lessons remain the active lesson store and are not uploaded yet.
+M6.4 adds optional authentication and secured cloud infrastructure. M6.5 synchronizes account-owned lesson snapshots while IndexedDB remains the immediate local cache.
 
 ## Configure Supabase
 
@@ -36,9 +36,9 @@ Add both public Supabase values to the required Development, Preview, and Produc
 
 ## Boundaries and verification
 
-- Lessons and original files are **not** uploaded in M6.4.
-- Recent Lessons remains IndexedDB-only.
+- Account-owned lesson snapshots are synchronized to `public.lessons`; Recent Lessons still renders from the scoped IndexedDB cache.
+- Original PDF/TXT files are not uploaded, and `lesson_sources` remains unused by the application.
 - Signing out never deletes local lessons.
-- Existing local lessons are not associated with whichever account signs in. M6.5 must define migration and ownership explicitly.
+- Existing unowned local lessons require the explicit “Sync local lessons to this account” action. They are never silently claimed at sign-in.
 - With the environment variables omitted, the tutor remains fully local-first and the Cloud card reports “Not configured.”
 - Test RLS with two users before enabling synchronization: neither database rows nor Storage paths belonging to the other user should be accessible.

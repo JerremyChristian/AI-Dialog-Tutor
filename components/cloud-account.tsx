@@ -2,10 +2,20 @@
 
 import type { User } from "@supabase/supabase-js";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CloudSyncState } from "../lib/cloud-sync";
 import { createSupabaseBrowserClient } from "../lib/supabase/client";
 
 type CloudStatus = { connected: boolean; cloudLessonCount?: number };
-type Props = { onDebug?: (message: string) => void };
+type Props = {
+  onDebug?: (message: string) => void;
+  onAuthResolved?: (user: User | null) => void;
+  onBeforeSignOut?: () => Promise<void>;
+  syncState?: CloudSyncState;
+  cloudLessonCount?: number;
+  localOnlyLessonCount?: number;
+  onSyncNow?: () => void;
+  onImportLocalLessons?: () => void;
+};
 
 function friendlyAuthError(message: string): string {
   const value = message.toLowerCase();
@@ -16,9 +26,19 @@ function friendlyAuthError(message: string): string {
   return "Cloud authentication is unavailable right now. Local learning still works.";
 }
 
-export default function CloudAccount({ onDebug }: Props) {
+export default function CloudAccount({
+  onDebug,
+  onAuthResolved,
+  onBeforeSignOut,
+  syncState = "local-only",
+  cloudLessonCount,
+  localOnlyLessonCount = 0,
+  onSyncNow,
+  onImportLocalLessons,
+}: Props) {
   const supabase = useMemo(() => createSupabaseBrowserClient(), []);
   const debugRef = useRef(onDebug);
+  const authResolvedRef = useRef(onAuthResolved);
   const [user, setUser] = useState<User | null>(null);
   const [checking, setChecking] = useState(Boolean(supabase));
   const [mode, setMode] = useState<"signin" | "signup" | null>(null);
@@ -31,7 +51,8 @@ export default function CloudAccount({ onDebug }: Props) {
 
   useEffect(() => {
     debugRef.current = onDebug;
-  }, [onDebug]);
+    authResolvedRef.current = onAuthResolved;
+  }, [onAuthResolved, onDebug]);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -55,16 +76,24 @@ export default function CloudAccount({ onDebug }: Props) {
     void supabase.auth.getUser().then(({ data, error: authError }) => {
       if (!active) return;
       setUser(data.user ?? null);
+      authResolvedRef.current?.(data.user ?? null);
       setChecking(false);
       if (authError) debugRef.current?.("Cloud unavailable: auth-check-failed");
       if (data.user) {
         debugRef.current?.("Cloud user authenticated");
         void loadStatus();
       }
+    }).catch(() => {
+      if (!active) return;
+      setChecking(false);
+      setUser(null);
+      authResolvedRef.current?.(null);
+      debugRef.current?.("Cloud unavailable: auth-check-failed");
     });
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!active) return;
       setUser(session?.user ?? null);
+      authResolvedRef.current?.(session?.user ?? null);
       setChecking(false);
       if (session?.user) {
         debugRef.current?.("Cloud user authenticated");
@@ -109,6 +138,7 @@ export default function CloudAccount({ onDebug }: Props) {
   const signOut = async () => {
     if (!supabase) return;
     setBusy(true);
+    await onBeforeSignOut?.().catch(() => undefined);
     const { error: authError } = await supabase.auth.signOut();
     setBusy(false);
     if (authError) setError("Cloud sign-out failed. Please try again.");
@@ -122,11 +152,17 @@ export default function CloudAccount({ onDebug }: Props) {
     ? "Not configured"
     : checking
       ? "Checking…"
-      : user && status?.connected
-        ? "Connected"
-        : user
-          ? "Connection issue"
-          : "Not signed in";
+      : user && syncState === "syncing"
+        ? "Syncing…"
+        : user && syncState === "synced"
+          ? "Synced"
+          : user && (syncState === "pending" || syncState === "error")
+            ? "Cloud pending"
+            : user && status?.connected
+              ? "Connected"
+              : user
+                ? "Connection issue"
+                : "Not signed in";
 
   return (
     <section className="cloud-account setup-only" aria-labelledby="cloud-account-title">
@@ -140,15 +176,30 @@ export default function CloudAccount({ onDebug }: Props) {
           <p>Signed in as <strong>{user.email ?? "authenticated user"}</strong></p>
           <p className="cloud-note">
             {status?.connected
-              ? `${status.cloudLessonCount ?? 0} cloud lessons · Synchronization is not enabled yet.`
+              ? `${cloudLessonCount ?? status.cloudLessonCount ?? 0} cloud lessons · ${
+                syncState === "pending" || syncState === "error"
+                  ? "Saved locally · Cloud pending."
+                  : "Local cache is synchronized."
+              }`
               : "Cloud status is unavailable. Local lessons are unaffected."}
           </p>
-          <button type="button" onClick={() => void signOut()} disabled={busy}>Sign out</button>
+          {localOnlyLessonCount > 0 && (
+            <div className="cloud-import">
+              <p>{localOnlyLessonCount} local {localOnlyLessonCount === 1 ? "lesson is" : "lessons are"} stored on this device.</p>
+              <button type="button" onClick={onImportLocalLessons} disabled={busy || syncState === "syncing"}>
+                Sync local lessons to this account
+              </button>
+            </div>
+          )}
+          <div className="cloud-actions">
+            <button type="button" onClick={onSyncNow} disabled={busy || syncState === "syncing"}>Sync now</button>
+            <button type="button" className="secondary" onClick={() => void signOut()} disabled={busy}>Sign out</button>
+          </div>
         </div>
       )}
       {supabase && !checking && !user && (
         <>
-          <p className="cloud-note">Sign in for the cloud foundation. Lessons remain local in this milestone.</p>
+          <p className="cloud-note">Sign in to synchronize account-owned lessons. Signed-out lessons remain local.</p>
           {!mode ? (
             <div className="cloud-actions">
               <button type="button" onClick={() => setMode("signin")}>Sign in</button>

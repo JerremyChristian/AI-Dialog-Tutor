@@ -1,6 +1,7 @@
 "use client";
 
 import type { FunctionCall, LiveServerMessage } from "@google/genai";
+import type { User } from "@supabase/supabase-js";
 import { useEffect, useRef, useState } from "react";
 import { LearningSourceUpload } from "../components/learning-source-upload";
 import { LessonRoadmap } from "../components/lesson-roadmap";
@@ -62,13 +63,24 @@ import {
   clearActiveLessonId,
   deleteSavedLesson,
   getSavedLesson,
+  getSavedLessonContentSignature,
   listSavedLessons,
   loadActiveLesson,
   saveActiveLesson,
+  saveSavedLesson,
   setActiveLessonId,
   type RecentTeachingContextEntry,
   type SavedLesson,
 } from "../lib/local-persistence";
+import {
+  createCloudCompatibleLessonId,
+  associateCloudLesson,
+  deleteCloudLesson,
+  isUuid,
+  reconcileCloudLessons,
+  type CloudSyncState,
+} from "../lib/cloud-sync";
+import { isSupabaseConfigured } from "../lib/supabase/config";
 
 type MicrophoneStatus =
   | "Not active"
@@ -250,6 +262,11 @@ export default function Home() {
   const [resumeExistingLesson, setResumeExistingLesson] = useState(false);
   const [savedLessons, setSavedLessons] = useState<SavedLesson[]>([]);
   const [lessonLibraryBusyId, setLessonLibraryBusyId] = useState<string | null>(null);
+  const [cloudUserId, setCloudUserId] = useState<string | null>(null);
+  const [cloudAuthReady, setCloudAuthReady] = useState(!isSupabaseConfigured());
+  const [cloudSyncState, setCloudSyncState] = useState<CloudSyncState>("local-only");
+  const [cloudLessonCount, setCloudLessonCount] = useState(0);
+  const [localOnlyLessonCount, setLocalOnlyLessonCount] = useState(0);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const [showIosInstallHint, setShowIosInstallHint] = useState(false);
   const [topicInput, setTopicInput] = useState("");
@@ -260,10 +277,18 @@ export default function Home() {
   const preparedSourceRef = useRef<PreparedLearningSource | null>(null);
   const savedLessonIdRef = useRef<string | null>(null);
   const savedLessonCreatedAtRef = useRef<string | null>(null);
+  const savedLessonUpdatedAtRef = useRef<string | null>(null);
+  const savedLessonContentSignatureRef = useRef<string | null>(null);
   const savedLessonWasPersistedRef = useRef(false);
   const resumeExistingLessonRef = useRef(false);
   const persistenceAvailableRef = useRef(true);
   const persistenceHydratedRef = useRef(false);
+  const workspaceOwnerIdRef = useRef<string | null>(null);
+  const cloudOwnerIdRef = useRef<string | null>(null);
+  const cloudSyncMetadataRef = useRef<SavedLesson["cloudSync"]>(undefined);
+  const cloudUploadTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const workspaceLoadGenerationRef = useRef(0);
+  const workspaceLoadedRef = useRef(false);
 
   const streamRef = useRef<MediaStream | null>(null);
   const transportRef = useRef<LiveTransportManager | null>(null);
@@ -415,6 +440,49 @@ export default function Home() {
     setTeachingPreferences(next);
   };
 
+  const applySyncedLessonMetadata = (synced: SavedLesson) => {
+    setSavedLessons((current) => current.map((lesson) =>
+      lesson.id === synced.id ? synced : lesson
+    ));
+    if (savedLessonIdRef.current === synced.id) {
+      cloudSyncMetadataRef.current = synced.cloudSync;
+    }
+  };
+
+  const scheduleCloudUpload = (snapshot: SavedLesson) => {
+    const ownerId = snapshot.cloudOwnerId ?? null;
+    if (!ownerId || ownerId !== cloudUserId) return;
+    const existing = cloudUploadTimersRef.current.get(snapshot.id);
+    if (existing) clearTimeout(existing);
+    setCloudSyncState("pending");
+    const timer = setTimeout(() => {
+      cloudUploadTimersRef.current.delete(snapshot.id);
+      setCloudSyncState("syncing");
+      void reconcileCloudLessons({
+        userId: ownerId,
+        deferDownloadLessonId: lessonActiveRef.current ? snapshot.id : null,
+        debug: addDebugMessage,
+      })
+        .then(async (summary) => {
+          const synced = await getSavedLesson(snapshot.id);
+          if (synced) {
+            applySyncedLessonMetadata(synced);
+          } else if (!lessonActiveRef.current && savedLessonIdRef.current === snapshot.id) {
+            resetIdleLessonWorkspace();
+            await clearActiveLessonId(ownerId);
+          }
+          await refreshScopedLibrary(ownerId);
+          setCloudLessonCount(summary.cloudLessonCount);
+          setCloudSyncState(summary.deferred > 0 ? "pending" : "synced");
+        })
+        .catch(() => {
+          setCloudSyncState("pending");
+          addDebugMessage("Cloud sync failed: category=lesson-upload");
+        });
+    }, 1_200);
+    cloudUploadTimersRef.current.set(snapshot.id, timer);
+  };
+
   const updateRecentTeachingContext = (conceptId: string | null, transcript: string) => {
     if (!conceptId || !lessonStateRef.current.nodes[conceptId]) return;
     const excerpt = createRecentTeachingExcerpt(transcript);
@@ -442,7 +510,7 @@ export default function Home() {
     const createdAt = savedLessonCreatedAtRef.current ?? now;
     savedLessonCreatedAtRef.current = createdAt;
     const currentState = stateOverride ?? lessonStateRef.current;
-    return structuredClone<SavedLesson>({
+    const candidate = structuredClone<SavedLesson>({
       schemaVersion: SAVED_LESSON_SCHEMA_VERSION,
       id,
       title: source.name,
@@ -461,23 +529,38 @@ export default function Home() {
       recentTeachingContext: recentTeachingContextRef.current,
       teachingPreferences: teachingPreferencesRef.current,
       createdAt,
-      updatedAt: now,
+      updatedAt: savedLessonUpdatedAtRef.current ?? now,
+      cloudOwnerId: cloudOwnerIdRef.current,
+      ...(cloudSyncMetadataRef.current ? { cloudSync: cloudSyncMetadataRef.current } : {}),
     });
+    const contentSignature = getSavedLessonContentSignature(candidate);
+    candidate.updatedAt = savedLessonContentSignatureRef.current === contentSignature &&
+      savedLessonUpdatedAtRef.current
+      ? savedLessonUpdatedAtRef.current
+      : now;
+    return candidate;
   };
 
   const persistLessonSnapshot = async (snapshot: SavedLesson) => {
     try {
       await saveActiveLesson(snapshot);
-      setSavedLessons((current) => [
-        snapshot,
-        ...current.filter((lesson) => lesson.id !== snapshot.id),
-      ].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+      if (savedLessonIdRef.current === snapshot.id) {
+        savedLessonUpdatedAtRef.current = snapshot.updatedAt;
+        savedLessonContentSignatureRef.current = getSavedLessonContentSignature(snapshot);
+      }
+      if ((snapshot.cloudOwnerId ?? null) === workspaceOwnerIdRef.current) {
+        setSavedLessons((current) => [
+          snapshot,
+          ...current.filter((lesson) => lesson.id !== snapshot.id),
+        ].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+      }
       if (savedLessonIdRef.current === snapshot.id && !savedLessonWasPersistedRef.current) {
         savedLessonWasPersistedRef.current = true;
         addDebugMessage(`Saved lesson created: ${snapshot.id}`);
       } else {
         addDebugMessage("Lesson autosaved");
       }
+      scheduleCloudUpload(snapshot);
     } catch {
       persistenceAvailableRef.current = false;
       setPersistenceNotice("Local lesson saving is unavailable on this device.");
@@ -497,7 +580,11 @@ export default function Home() {
     teachingPreferencesRef.current = saved.teachingPreferences;
     savedLessonIdRef.current = saved.id;
     savedLessonCreatedAtRef.current = saved.createdAt;
+    savedLessonUpdatedAtRef.current = saved.updatedAt;
+    savedLessonContentSignatureRef.current = getSavedLessonContentSignature(saved);
     savedLessonWasPersistedRef.current = true;
+    cloudOwnerIdRef.current = saved.cloudOwnerId ?? null;
+    cloudSyncMetadataRef.current = saved.cloudSync;
     resumeExistingLessonRef.current = saved.hasStarted;
     setLearningSource(saved.source.metadata);
     setLessonState(saved.lessonState);
@@ -520,7 +607,11 @@ export default function Home() {
     teachingPreferencesRef.current = DEFAULT_TEACHING_PREFERENCES;
     savedLessonIdRef.current = null;
     savedLessonCreatedAtRef.current = null;
+    savedLessonUpdatedAtRef.current = null;
+    savedLessonContentSignatureRef.current = null;
     savedLessonWasPersistedRef.current = false;
+    cloudOwnerIdRef.current = workspaceOwnerIdRef.current;
+    cloudSyncMetadataRef.current = undefined;
     resumeExistingLessonRef.current = false;
     setLearningSource(null);
     setLessonState(emptyLesson);
@@ -551,12 +642,12 @@ export default function Home() {
       const outgoingSnapshot = createCurrentLessonSnapshot();
       if (outgoingSnapshot) await persistLessonSnapshot(outgoingSnapshot);
       const saved = await getSavedLesson(id);
-      if (!saved) {
+      if (!saved || (saved.cloudOwnerId ?? null) !== workspaceOwnerIdRef.current) {
         setUserError("That saved lesson is unavailable or incompatible.");
         setSavedLessons((current) => current.filter((lesson) => lesson.id !== id));
         return;
       }
-      await setActiveLessonId(id);
+      await setActiveLessonId(id, workspaceOwnerIdRef.current);
       hydrateSavedLesson(saved);
       addDebugMessage(`Saved lesson selected: ${id}`);
       addDebugMessage(`Active lesson changed: ${id}`);
@@ -571,7 +662,10 @@ export default function Home() {
 
   const requestDeleteSavedLesson = async (saved: SavedLesson) => {
     if (lessonActiveRef.current || lessonLibraryBusyId) return;
-    if (!window.confirm(`Delete "${saved.title}"?\n\nThis removes its local source and progress.`)) {
+    const deleteScope = saved.cloudOwnerId
+      ? "This removes its cloud snapshot and local cached source and progress."
+      : "This removes its local source and progress.";
+    if (!window.confirm(`Delete "${saved.title}"?\n\n${deleteScope}`)) {
       return;
     }
     setLessonLibraryBusyId(saved.id);
@@ -580,13 +674,24 @@ export default function Home() {
         clearTimeout(persistenceSaveTimerRef.current);
         persistenceSaveTimerRef.current = null;
       }
+      if (saved.cloudOwnerId) {
+        if (saved.cloudOwnerId !== cloudUserId) {
+          throw new Error("cloud-owner-mismatch");
+        }
+        await deleteCloudLesson(saved.id, saved.cloudOwnerId, addDebugMessage);
+        setCloudLessonCount((count) => Math.max(0, count - 1));
+      }
       await deleteSavedLesson(saved.id);
       setSavedLessons((current) => current.filter((lesson) => lesson.id !== saved.id));
       if (savedLessonIdRef.current === saved.id) resetIdleLessonWorkspace();
       addDebugMessage(`Saved lesson deleted: ${saved.id}`);
     } catch {
-      setPersistenceNotice("That saved lesson could not be deleted on this device.");
-      addDebugMessage("Local persistence unavailable");
+      setPersistenceNotice(saved.cloudOwnerId
+        ? "That lesson could not be deleted from the cloud. Its local copy was kept."
+        : "That saved lesson could not be deleted on this device.");
+      addDebugMessage(saved.cloudOwnerId
+        ? "Cloud sync failed: category=lesson-delete"
+        : "Local persistence unavailable");
     } finally {
       setLessonLibraryBusyId(null);
     }
@@ -611,7 +716,11 @@ export default function Home() {
     const createdAt = new Date().toISOString();
     savedLessonIdRef.current = id;
     savedLessonCreatedAtRef.current = createdAt;
+    savedLessonUpdatedAtRef.current = null;
+    savedLessonContentSignatureRef.current = null;
     savedLessonWasPersistedRef.current = false;
+    cloudOwnerIdRef.current = workspaceOwnerIdRef.current;
+    cloudSyncMetadataRef.current = undefined;
     resumeExistingLessonRef.current = false;
     setSavedLessonId(id);
     setResumeExistingLesson(false);
@@ -622,6 +731,8 @@ export default function Home() {
     if (source !== null) return;
     savedLessonIdRef.current = null;
     savedLessonCreatedAtRef.current = null;
+    savedLessonUpdatedAtRef.current = null;
+    savedLessonContentSignatureRef.current = null;
     savedLessonWasPersistedRef.current = false;
     resumeExistingLessonRef.current = false;
     teachingPreferencesRef.current = DEFAULT_TEACHING_PREFERENCES;
@@ -629,7 +740,7 @@ export default function Home() {
     setResumeExistingLesson(false);
     setTeachingPreferences(DEFAULT_TEACHING_PREFERENCES);
     if (persistenceAvailableRef.current) {
-      void clearActiveLessonId().catch(() => {
+      void clearActiveLessonId(workspaceOwnerIdRef.current).catch(() => {
         persistenceAvailableRef.current = false;
         setPersistenceNotice("Local lesson saving is unavailable on this device.");
         addDebugMessage("Local persistence unavailable");
@@ -793,43 +904,149 @@ export default function Home() {
     }, 1_500);
   };
 
+  const refreshScopedLibrary = async (ownerId: string | null) => {
+    const library = await listSavedLessons();
+    const scoped = library.filter((lesson) => (lesson.cloudOwnerId ?? null) === ownerId);
+    setSavedLessons(scoped);
+    setLocalOnlyLessonCount(ownerId
+      ? library.filter((lesson) => !lesson.cloudOwnerId).length
+      : 0);
+    addDebugMessage(`Saved lesson library loaded: ${scoped.length} lessons`);
+    addDebugMessage(`Recent Lessons cache: scopedUniqueLessons=${new Set(scoped.map((lesson) => lesson.id)).size}`);
+    const titleIds = new Map<string, string[]>();
+    scoped.forEach((lesson) => {
+      titleIds.set(lesson.title, [...(titleIds.get(lesson.title) ?? []), lesson.id]);
+    });
+    titleIds.forEach((ids) => {
+      if (ids.length > 1) addDebugMessage(`Recent Lessons same-title IDs: ${ids.join(",")}`);
+    });
+    return scoped;
+  };
+
+  const syncCurrentAccount = async () => {
+    const ownerId = workspaceOwnerIdRef.current;
+    if (!ownerId || ownerId !== cloudUserId) return;
+    setCloudSyncState("syncing");
+    try {
+      await persistCurrentLesson();
+      const summary = await reconcileCloudLessons({
+        userId: ownerId,
+        deferDownloadLessonId: lessonActiveRef.current ? savedLessonIdRef.current : null,
+        debug: addDebugMessage,
+      });
+      setCloudLessonCount(summary.cloudLessonCount);
+      await refreshScopedLibrary(ownerId);
+      if (!lessonActiveRef.current && savedLessonIdRef.current) {
+        const refreshed = await getSavedLesson(savedLessonIdRef.current);
+        if (refreshed?.cloudOwnerId === ownerId) {
+          hydrateSavedLesson(refreshed);
+        } else {
+          resetIdleLessonWorkspace();
+          await clearActiveLessonId(ownerId);
+        }
+      }
+      setCloudSyncState(summary.deferred > 0 ? "pending" : "synced");
+    } catch {
+      setCloudSyncState("error");
+      addDebugMessage("Cloud sync failed: category=reconciliation");
+    }
+  };
+
+  const importLocalLessons = async () => {
+    const ownerId = workspaceOwnerIdRef.current;
+    if (!ownerId || ownerId !== cloudUserId || lessonActiveRef.current) return;
+    if (!window.confirm("Sync all unowned local lessons to this account? They will become associated with the signed-in account.")) return;
+    setCloudSyncState("syncing");
+    try {
+      const localOnly = (await listSavedLessons()).filter((lesson) => !lesson.cloudOwnerId);
+      let imported = 0;
+      for (const lesson of localOnly) {
+        const cloudId = isUuid(lesson.id) ? lesson.id : createCloudCompatibleLessonId();
+        const candidate: SavedLesson = {
+          ...structuredClone(lesson),
+          id: cloudId,
+          cloudOwnerId: ownerId,
+          cloudSync: undefined,
+        };
+        try {
+          const synced = await associateCloudLesson(candidate, ownerId, addDebugMessage);
+          await saveSavedLesson(synced);
+          if (synced.id !== lesson.id) await deleteSavedLesson(lesson.id);
+          addDebugMessage(
+            `Legacy import: localId=${lesson.id}, cloudId=${synced.id}, ` +
+            `identityChanged=${synced.id === lesson.id ? "no" : "yes"}`,
+          );
+          imported += 1;
+        } catch {
+          addDebugMessage(`Cloud sync failed: category=local-import, id=${lesson.id}`);
+        }
+      }
+      await clearActiveLessonId(null);
+      addDebugMessage(`Local lessons imported: ${imported}/${localOnly.length}`);
+      await syncCurrentAccount();
+    } catch {
+      setCloudSyncState("error");
+      addDebugMessage("Cloud sync failed: category=local-import");
+    }
+  };
+
   useEffect(() => {
-    let cancelled = false;
+    if (!cloudAuthReady || lessonActiveRef.current) return;
+    const ownerId = cloudUserId;
+    if (workspaceLoadedRef.current && workspaceOwnerIdRef.current === ownerId) return;
+    const generation = ++workspaceLoadGenerationRef.current;
     void (async () => {
       try {
-        const [result, library] = await Promise.all([
-          loadActiveLesson(),
-          listSavedLessons(),
+        if (persistenceHydratedRef.current) {
+          const outgoing = createCurrentLessonSnapshot();
+          if (outgoing) await persistLessonSnapshot(outgoing);
+        }
+        resetIdleLessonWorkspace();
+        workspaceOwnerIdRef.current = ownerId;
+        cloudOwnerIdRef.current = ownerId;
+        cloudSyncMetadataRef.current = undefined;
+
+        if (ownerId) {
+          setCloudSyncState("syncing");
+          try {
+            const summary = await reconcileCloudLessons({ userId: ownerId, debug: addDebugMessage });
+            setCloudLessonCount(summary.cloudLessonCount);
+            setCloudSyncState("synced");
+          } catch {
+            setCloudSyncState("error");
+            addDebugMessage("Cloud sync failed: category=initial-reconciliation");
+          }
+        } else {
+          setCloudSyncState("local-only");
+          setCloudLessonCount(0);
+        }
+
+        if (generation !== workspaceLoadGenerationRef.current) return;
+        const [result] = await Promise.all([
+          loadActiveLesson(ownerId),
+          refreshScopedLibrary(ownerId),
         ]);
-        if (cancelled) return;
         addDebugMessage("IndexedDB opened");
-        setSavedLessons(library);
-        addDebugMessage(`Saved lesson library loaded: ${library.length} lessons`);
         if (result.status === "incompatible") {
           addDebugMessage("Saved lesson schema incompatible");
-          await clearActiveLessonId();
+          await clearActiveLessonId(ownerId);
         } else if (result.status === "restored") {
-          const saved = result.lesson;
-          hydrateSavedLesson(saved);
-          addDebugMessage(`Restored saved lesson: ${saved.id}`);
+          hydrateSavedLesson(result.lesson);
+          addDebugMessage(`Restored saved lesson: ${result.lesson.id}`);
         }
+        workspaceLoadedRef.current = true;
       } catch {
-        if (!cancelled) {
-          persistenceAvailableRef.current = false;
-          setPersistenceNotice("Local lesson saving is unavailable on this device.");
-          addDebugMessage("Local persistence unavailable");
-        }
+        persistenceAvailableRef.current = false;
+        setPersistenceNotice("Local lesson saving is unavailable on this device.");
+        addDebugMessage("Local persistence unavailable");
       } finally {
-        if (!cancelled) {
+        if (generation === workspaceLoadGenerationRef.current) {
           persistenceHydratedRef.current = true;
           setPersistenceHydrated(true);
         }
       }
     })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  }, [aiConnectionStatus, cloudAuthReady, cloudUserId, microphoneStatus]);
 
   useEffect(() => {
     if (!persistenceHydrated || !savedLessonId || learningSource?.status !== "ready") return;
@@ -1752,7 +1969,29 @@ export default function Home() {
           </p>
         </header>
 
-        {!lessonActive && <CloudAccount onDebug={addDebugMessage} />}
+        {!lessonActive && (
+          <CloudAccount
+            onDebug={addDebugMessage}
+            onAuthResolved={(user: User | null) => {
+              const nextUserId = user?.id ?? null;
+              if (workspaceOwnerIdRef.current !== nextUserId) {
+                cloudUploadTimersRef.current.forEach((timer) => clearTimeout(timer));
+                cloudUploadTimersRef.current.clear();
+                workspaceLoadedRef.current = false;
+              }
+              setCloudUserId(nextUserId);
+              setCloudAuthReady(true);
+            }}
+            onBeforeSignOut={async () => {
+              await persistCurrentLesson();
+            }}
+            syncState={cloudSyncState}
+            cloudLessonCount={cloudLessonCount}
+            localOnlyLessonCount={localOnlyLessonCount}
+            onSyncNow={() => void syncCurrentAccount()}
+            onImportLocalLessons={() => void importLocalLessons()}
+          />
+        )}
 
         {!lessonActive && savedLessons.length > 0 && (
           <RecentLessons

@@ -191,6 +191,17 @@ h1 {
 .cloud-actions button:disabled,
 .cloud-user button:disabled { cursor: wait; opacity: 0.6; }
 
+.cloud-import {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+}
+
+.cloud-import p { margin-top: 0; }
+.cloud-import button { width: 100%; }
+
 .cloud-auth-form {
   display: grid;
   gap: 12px;

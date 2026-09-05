@@ -18,7 +18,7 @@ export const MAX_RECENT_TEACHING_EXCERPT_LENGTH = 360;
 
 const SAVED_LESSONS_STORE = "savedLessons";
 const APP_STATE_STORE = "appState";
-const ACTIVE_LESSON_KEY = "activeLessonId";
+const LEGACY_ACTIVE_LESSON_KEY = "activeLessonId";
 let mutationQueue: Promise<void> = Promise.resolve();
 const COVERAGE_STATUSES = new Set<CoverageStatus>([
   "not-started",
@@ -51,6 +51,13 @@ export type SavedLesson = {
   teachingPreferences: TeachingPreferences;
   createdAt: string;
   updatedAt: string;
+  cloudOwnerId?: string | null;
+  cloudSync?: CloudSyncMetadata;
+};
+
+export type CloudSyncMetadata = {
+  lastSyncedLocalUpdatedAt: string;
+  lastKnownCloudUpdatedAt: string;
 };
 
 export type RecentTeachingContextEntry = {
@@ -58,18 +65,28 @@ export type RecentTeachingContextEntry = {
   excerpt: string;
 };
 
+export function getSavedLessonContentSignature(lesson: SavedLesson): string {
+  const content = structuredClone(lesson) as SavedLesson;
+  delete content.cloudOwnerId;
+  delete content.cloudSync;
+  const withoutInfrastructure = content as unknown as Record<string, unknown>;
+  delete withoutInfrastructure.createdAt;
+  delete withoutInfrastructure.updatedAt;
+  return canonicalStringify(withoutInfrastructure);
+}
+
 export type ActiveLessonLoadResult =
   | { status: "none"; lesson: null }
   | { status: "incompatible"; lesson: null }
   | { status: "restored"; lesson: SavedLesson };
 
-export function saveActiveLesson(lesson: SavedLesson) {
-  const write = () => writeActiveLesson(lesson);
+export function saveActiveLesson(lesson: SavedLesson, ownerId = lesson.cloudOwnerId ?? null) {
+  const write = () => writeActiveLesson(lesson, ownerId);
   mutationQueue = mutationQueue.then(write, write);
   return mutationQueue;
 }
 
-async function writeActiveLesson(lesson: SavedLesson) {
+async function writeActiveLesson(lesson: SavedLesson, ownerId: string | null) {
   const database = await openTutorDatabase();
   try {
     const transaction = database.transaction(
@@ -78,7 +95,7 @@ async function writeActiveLesson(lesson: SavedLesson) {
     );
     transaction.objectStore(SAVED_LESSONS_STORE).put(lesson);
     transaction.objectStore(APP_STATE_STORE).put({
-      key: ACTIVE_LESSON_KEY,
+      key: activeLessonKey(ownerId),
       value: lesson.id,
     });
     await transactionComplete(transaction);
@@ -87,14 +104,21 @@ async function writeActiveLesson(lesson: SavedLesson) {
   }
 }
 
-export async function loadActiveLesson(): Promise<ActiveLessonLoadResult> {
+export async function loadActiveLesson(ownerId: string | null = null): Promise<ActiveLessonLoadResult> {
   const database = await openTutorDatabase();
   try {
-    const pointer = await requestResult<{ key: string; value?: unknown } | undefined>(
-      database.transaction(APP_STATE_STORE, "readonly")
-        .objectStore(APP_STATE_STORE)
-        .get(ACTIVE_LESSON_KEY),
+    const appState = database.transaction(APP_STATE_STORE, "readonly")
+      .objectStore(APP_STATE_STORE);
+    let pointer = await requestResult<{ key: string; value?: unknown } | undefined>(
+      appState.get(activeLessonKey(ownerId)),
     );
+    if (!ownerId && !pointer) {
+      pointer = await requestResult<{ key: string; value?: unknown } | undefined>(
+        database.transaction(APP_STATE_STORE, "readonly")
+          .objectStore(APP_STATE_STORE)
+          .get(LEGACY_ACTIVE_LESSON_KEY),
+      );
+    }
     if (typeof pointer?.value !== "string" || !pointer.value) {
       return { status: "none", lesson: null };
     }
@@ -104,6 +128,9 @@ export async function loadActiveLesson(): Promise<ActiveLessonLoadResult> {
         .get(pointer.value),
     );
     const lesson = parseSavedLesson(candidate);
+    if (lesson && (lesson.cloudOwnerId ?? null) !== ownerId) {
+      return { status: "none", lesson: null };
+    }
     return lesson
       ? { status: "restored", lesson }
       : { status: "incompatible", lesson: null };
@@ -144,17 +171,71 @@ export async function getSavedLesson(id: string): Promise<SavedLesson | null> {
   }
 }
 
-export function setActiveLessonId(id: string) {
-  const set = () => writeActiveLessonId(id);
+export function saveSavedLesson(lesson: SavedLesson) {
+  const save = () => writeSavedLesson(lesson);
+  mutationQueue = mutationQueue.then(save, save);
+  return mutationQueue;
+}
+
+export function updateSavedLessonCloudSync(
+  id: string,
+  expectedUpdatedAt: string,
+  cloudSync: CloudSyncMetadata,
+) {
+  let result: SavedLesson | null = null;
+  const update = async () => {
+    result = await writeSavedLessonCloudSync(id, expectedUpdatedAt, cloudSync);
+  };
+  mutationQueue = mutationQueue.then(update, update);
+  return mutationQueue.then(() => result);
+}
+
+async function writeSavedLessonCloudSync(
+  id: string,
+  expectedUpdatedAt: string,
+  cloudSync: CloudSyncMetadata,
+) {
+  const database = await openTutorDatabase();
+  let updated: SavedLesson | null = null;
+  try {
+    const transaction = database.transaction(SAVED_LESSONS_STORE, "readwrite");
+    const store = transaction.objectStore(SAVED_LESSONS_STORE);
+    const request = store.get(id);
+    request.onsuccess = () => {
+      const current = parseSavedLesson(request.result);
+      if (!current || current.updatedAt !== expectedUpdatedAt) return;
+      updated = { ...current, cloudSync };
+      store.put(updated);
+    };
+    await transactionComplete(transaction);
+    return updated;
+  } finally {
+    database.close();
+  }
+}
+
+async function writeSavedLesson(lesson: SavedLesson) {
+  const database = await openTutorDatabase();
+  try {
+    const transaction = database.transaction(SAVED_LESSONS_STORE, "readwrite");
+    transaction.objectStore(SAVED_LESSONS_STORE).put(lesson);
+    await transactionComplete(transaction);
+  } finally {
+    database.close();
+  }
+}
+
+export function setActiveLessonId(id: string, ownerId: string | null = null) {
+  const set = () => writeActiveLessonId(id, ownerId);
   mutationQueue = mutationQueue.then(set, set);
   return mutationQueue;
 }
 
-async function writeActiveLessonId(id: string) {
+async function writeActiveLessonId(id: string, ownerId: string | null) {
   const database = await openTutorDatabase();
   try {
     const transaction = database.transaction(APP_STATE_STORE, "readwrite");
-    transaction.objectStore(APP_STATE_STORE).put({ key: ACTIVE_LESSON_KEY, value: id });
+    transaction.objectStore(APP_STATE_STORE).put({ key: activeLessonKey(ownerId), value: id });
     await transactionComplete(transaction);
   } finally {
     database.close();
@@ -176,11 +257,14 @@ async function deleteSavedLessonRecord(id: string) {
     );
     const lessons = transaction.objectStore(SAVED_LESSONS_STORE);
     const appState = transaction.objectStore(APP_STATE_STORE);
-    const pointerRequest = appState.get(ACTIVE_LESSON_KEY);
+    lessons.delete(id);
+    const pointerRequest = appState.openCursor();
     pointerRequest.onsuccess = () => {
-      lessons.delete(id);
-      const pointer = pointerRequest.result as { value?: unknown } | undefined;
-      if (pointer?.value === id) appState.delete(ACTIVE_LESSON_KEY);
+      const cursor = pointerRequest.result;
+      if (!cursor) return;
+      const pointer = cursor.value as { value?: unknown };
+      if (pointer.value === id) cursor.delete();
+      cursor.continue();
     };
     await transactionComplete(transaction);
   } finally {
@@ -188,17 +272,18 @@ async function deleteSavedLessonRecord(id: string) {
   }
 }
 
-export function clearActiveLessonId() {
-  const clear = () => deleteActiveLessonId();
+export function clearActiveLessonId(ownerId: string | null = null) {
+  const clear = () => deleteActiveLessonId(ownerId);
   mutationQueue = mutationQueue.then(clear, clear);
   return mutationQueue;
 }
 
-async function deleteActiveLessonId() {
+async function deleteActiveLessonId(ownerId: string | null) {
   const database = await openTutorDatabase();
   try {
     const transaction = database.transaction(APP_STATE_STORE, "readwrite");
-    transaction.objectStore(APP_STATE_STORE).delete(ACTIVE_LESSON_KEY);
+    transaction.objectStore(APP_STATE_STORE).delete(activeLessonKey(ownerId));
+    if (!ownerId) transaction.objectStore(APP_STATE_STORE).delete(LEGACY_ACTIVE_LESSON_KEY);
     await transactionComplete(transaction);
   } finally {
     database.close();
@@ -243,7 +328,7 @@ function transactionComplete(transaction: IDBTransaction) {
   });
 }
 
-function parseSavedLesson(value: unknown): SavedLesson | null {
+export function parseSavedLesson(value: unknown): SavedLesson | null {
   if (!isRecord(value) || value.schemaVersion !== SAVED_LESSON_SCHEMA_VERSION) return null;
   if (!isNonEmptyString(value.id) || !isNonEmptyString(value.title)) return null;
   if (typeof value.lessonFocus !== "string" || typeof value.hasStarted !== "boolean") return null;
@@ -255,6 +340,12 @@ function parseSavedLesson(value: unknown): SavedLesson | null {
     lessonState?.nodes,
   );
   const teachingPreferences = parseTeachingPreferences(value.teachingPreferences);
+  const cloudOwnerId = value.cloudOwnerId === undefined || value.cloudOwnerId === null
+    ? null
+    : isNonEmptyString(value.cloudOwnerId) ? value.cloudOwnerId : undefined;
+  if (cloudOwnerId === undefined) return null;
+  const cloudSync = parseCloudSyncMetadata(value.cloudSync);
+  if (value.cloudSync !== undefined && !cloudSync) return null;
   if (!source || !lessonState || !recentTeachingContext || !teachingPreferences) return null;
   const sourceNodeIds = new Set(source.prepared.lessonTree.map((node) => node.id));
   const stateNodeIds = Object.keys(lessonState.nodes);
@@ -272,7 +363,22 @@ function parseSavedLesson(value: unknown): SavedLesson | null {
     teachingPreferences,
     createdAt: value.createdAt,
     updatedAt: value.updatedAt,
+    cloudOwnerId,
+    ...(cloudSync ? { cloudSync } : {}),
   };
+}
+
+function parseCloudSyncMetadata(value: unknown): CloudSyncMetadata | null {
+  if (!isRecord(value) || !isIsoDate(value.lastSyncedLocalUpdatedAt) ||
+      !isIsoDate(value.lastKnownCloudUpdatedAt)) return null;
+  return {
+    lastSyncedLocalUpdatedAt: value.lastSyncedLocalUpdatedAt,
+    lastKnownCloudUpdatedAt: value.lastKnownCloudUpdatedAt,
+  };
+}
+
+function activeLessonKey(ownerId: string | null) {
+  return ownerId ? `activeLessonId:user:${ownerId}` : "activeLessonId:anonymous";
 }
 
 function parseRecentTeachingContext(
@@ -352,4 +458,17 @@ function isNonEmptyString(value: unknown): value is string {
 
 function isIsoDate(value: unknown): value is string {
   return typeof value === "string" && !Number.isNaN(Date.parse(value));
+}
+
+function canonicalStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) =>
+    canonicalStringify(item === undefined ? null : item)
+  ).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).filter((key) => record[key] !== undefined).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalStringify(record[key])}`
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
