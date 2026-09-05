@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { LearningSourceUpload } from "../components/learning-source-upload";
 import { LessonRoadmap } from "../components/lesson-roadmap";
 import { RecentLessons } from "../components/recent-lessons";
+import { SourceVisual } from "../components/source-visual";
 import CloudAccount from "../components/cloud-account";
 import type {
   LearningSource,
@@ -2096,8 +2097,17 @@ export default function Home() {
           </section>
         )}
 
-        {learningSource && lessonActive && (
-          <section className="active-summary" aria-label="Active lesson overview">
+        {lessonActive && <div className="active-learning-grid">
+          <SourceVisual
+            conceptId={currentConcept?.id ?? null}
+            conceptTitle={currentConcept?.title}
+            contract={currentTeachingContract}
+            sources={lessonSources}
+            cloudOwnerId={cloudUserId}
+            onDebug={addDebugMessage}
+          />
+          <div className="active-learning-sidebar">
+          {learningSource && <section className="active-summary" aria-label="Active lesson overview">
             <p className="active-source" title={learningSource.name}>{learningSource.name}</p>
             <p className="active-label">Current concept</p>
             <h2>{currentConcept?.title || "Preparing lesson…"}</h2>
@@ -2109,10 +2119,8 @@ export default function Home() {
                 ? `“${currentUtterance}”`
                 : "Listening for the lesson to begin…"}
             </p>
-          </section>
-        )}
+          </section>}
 
-        {lessonActive && (
           <details className="active-teaching-preferences">
             <summary>Teaching style</summary>
             <TeachingStyleControls
@@ -2124,9 +2132,16 @@ export default function Home() {
               <p className="preference-pending" role="status">Updating teaching style…</p>
             )}
           </details>
-        )}
+          {lessonState.rootNodeIds.length > 0 && <LessonRoadmap
+            lessonState={lessonState}
+            lessonActive={lessonActive}
+            navigationPending={roadmapNavigationPending}
+            onNavigate={navigateFromRoadmap}
+          />}
+          </div>
+        </div>}
 
-        {lessonState.rootNodeIds.length > 0 && (
+        {!lessonActive && lessonState.rootNodeIds.length > 0 && (
           <LessonRoadmap
             lessonState={lessonState}
             lessonActive={lessonActive}
