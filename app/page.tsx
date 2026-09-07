@@ -7,6 +7,7 @@ import { LearningSourceUpload } from "../components/learning-source-upload";
 import { LessonRoadmap } from "../components/lesson-roadmap";
 import { RecentLessons } from "../components/recent-lessons";
 import { SourceVisual } from "../components/source-visual";
+import { ProcessingQueue } from "../components/processing-queue";
 import CloudAccount from "../components/cloud-account";
 import type {
   LearningSource,
@@ -80,10 +81,10 @@ import {
   deleteCloudLesson,
   isUuid,
   reconcileCloudLessons,
-  uploadCloudLessonSources,
   type CloudSyncState,
 } from "../lib/cloud-sync";
 import { isSupabaseConfigured } from "../lib/supabase/config";
+import { useLessonProcessingQueue } from "../lib/use-lesson-processing-queue";
 
 type MicrophoneStatus =
   | "Not active"
@@ -199,13 +200,6 @@ function capitalize(value: string) {
   return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
 }
 
-function createLocalLessonId() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `lesson-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
 function getPersistedResumeContext(
   state: LessonState,
   recentTeachingContext: RecentTeachingContextEntry[],
@@ -278,9 +272,6 @@ export default function Home() {
   );
   const [learningSource, setLearningSource] = useState<LearningSource | null>(null);
   const [lessonSources, setLessonSources] = useState<LessonSource[]>([]);
-  const rawSourceFilesRef = useRef(new Map<string, File>());
-  const sourceUploadsInFlightRef = useRef(new Set<string>());
-  const sourceUploadsAttemptedRef = useRef(new Set<string>());
   const preparedSourceRef = useRef<PreparedLearningSource | null>(null);
   const savedLessonIdRef = useRef<string | null>(null);
   const savedLessonCreatedAtRef = useRef<string | null>(null);
@@ -295,6 +286,7 @@ export default function Home() {
   const cloudSyncMetadataRef = useRef<SavedLesson["cloudSync"]>(undefined);
   const cloudUploadTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const workspaceLoadGenerationRef = useRef(0);
+  const lessonHydrationGenerationRef = useRef(0);
   const workspaceLoadedRef = useRef(false);
 
   const streamRef = useRef<MediaStream | null>(null);
@@ -322,6 +314,7 @@ export default function Home() {
   const nextMessageIdRef = useRef(0);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const lessonActiveRef = useRef(false);
+  const lessonStartupPendingRef = useRef(false);
   const engagementStateRef = useRef<EngagementState>("ended");
   const lastAcousticActivityAtRef = useRef<number | null>(null);
   const lastCandidateLearnerActivityAtRef = useRef<number | null>(null);
@@ -474,7 +467,8 @@ export default function Home() {
           const synced = await getSavedLesson(snapshot.id);
           if (synced) {
             applySyncedLessonMetadata(synced);
-          } else if (!lessonActiveRef.current && savedLessonIdRef.current === snapshot.id) {
+          } else if (!lessonActiveRef.current && !lessonStartupPendingRef.current &&
+              savedLessonIdRef.current === snapshot.id) {
             resetIdleLessonWorkspace();
             await clearActiveLessonId(ownerId);
           }
@@ -569,26 +563,6 @@ export default function Home() {
         addDebugMessage("Lesson autosaved");
       }
       scheduleCloudUpload(snapshot);
-      if (snapshot.cloudOwnerId && rawSourceFilesRef.current.size > 0 &&
-          snapshot.sources.some((item) => item.storageStatus !== "stored") &&
-          !sourceUploadsInFlightRef.current.has(snapshot.id)) {
-        if (sourceUploadsAttemptedRef.current.has(snapshot.id)) return;
-        sourceUploadsAttemptedRef.current.add(snapshot.id);
-        sourceUploadsInFlightRef.current.add(snapshot.id);
-        void uploadCloudLessonSources(snapshot, rawSourceFilesRef.current, snapshot.cloudOwnerId, addDebugMessage)
-          .then((synced) => {
-            setLessonSources(synced.sources);
-            applySyncedLessonMetadata(synced);
-            setCloudSyncState(synced.sources.some((item) => item.storageStatus === "error") ? "pending" : "synced");
-          })
-          .catch(() => {
-            setLessonSources((current) => current.map((item) => rawSourceFilesRef.current.has(item.id) && item.storageStatus !== "stored"
-              ? { ...item, storageStatus: "error", storageError: "Original source upload failed." }
-              : item));
-            setCloudSyncState("pending");
-          })
-          .finally(() => sourceUploadsInFlightRef.current.delete(snapshot.id));
-      }
     } catch {
       persistenceAvailableRef.current = false;
       setPersistenceNotice("Local lesson saving is unavailable on this device.");
@@ -601,7 +575,12 @@ export default function Home() {
     if (snapshot) await persistLessonSnapshot(snapshot);
   };
 
-  const hydrateSavedLesson = (saved: SavedLesson) => {
+  const hydrateSavedLesson = (saved: SavedLesson, requestedGeneration?: number) => {
+    if (lessonActiveRef.current || lessonStartupPendingRef.current ||
+        (requestedGeneration !== undefined && requestedGeneration !== lessonHydrationGenerationRef.current)) {
+      addDebugMessage(`Stale workspace hydration skipped: reason=${lessonActiveRef.current ? "lesson-active" : lessonStartupPendingRef.current ? "startup-pending" : "request-stale"}`);
+      return false;
+    }
     preparedSourceRef.current = saved.source.prepared;
     lessonStateRef.current = saved.lessonState;
     recentTeachingContextRef.current = saved.recentTeachingContext;
@@ -616,8 +595,6 @@ export default function Home() {
     resumeExistingLessonRef.current = saved.hasStarted;
     setLearningSource(saved.source.metadata);
     setLessonSources(saved.sources);
-    rawSourceFilesRef.current = new Map();
-    sourceUploadsAttemptedRef.current.clear();
     saved.sources.forEach((item) => addDebugMessage(`Source restored from cloud metadata: source=${item.id}`));
     setLessonState(saved.lessonState);
     setTeachingPreferences(saved.teachingPreferences);
@@ -629,6 +606,7 @@ export default function Home() {
     addDebugMessage(
       `Restored resume teaching context: entries=${saved.recentTeachingContext.length}`,
     );
+    return true;
   };
 
   const resetIdleLessonWorkspace = () => {
@@ -647,8 +625,6 @@ export default function Home() {
     resumeExistingLessonRef.current = false;
     setLearningSource(null);
     setLessonSources([]);
-    rawSourceFilesRef.current = new Map();
-    sourceUploadsAttemptedRef.current.clear();
     setLessonState(emptyLesson);
     setTeachingPreferences(DEFAULT_TEACHING_PREFERENCES);
     setTopicInput("");
@@ -671,6 +647,7 @@ export default function Home() {
   const selectSavedLesson = async (id: string) => {
     if (lessonActiveRef.current || lessonLibraryBusyId) return;
     setLessonLibraryBusyId(id);
+    const hydrationGeneration = ++lessonHydrationGenerationRef.current;
     try {
       if (persistenceSaveTimerRef.current) clearTimeout(persistenceSaveTimerRef.current);
       persistenceSaveTimerRef.current = null;
@@ -683,7 +660,7 @@ export default function Home() {
         return;
       }
       await setActiveLessonId(id, workspaceOwnerIdRef.current);
-      hydrateSavedLesson(saved);
+      if (!hydrateSavedLesson(saved, hydrationGeneration)) return;
       addDebugMessage(`Saved lesson selected: ${id}`);
       addDebugMessage(`Active lesson changed: ${id}`);
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -730,73 +707,6 @@ export default function Home() {
     } finally {
       setLessonLibraryBusyId(null);
     }
-  };
-
-  const handlePreparedSourceChange = (source: PreparedLearningSource | null) => {
-    if (!source) {
-      const outgoingSnapshot = createCurrentLessonSnapshot();
-      if (outgoingSnapshot) void persistLessonSnapshot(outgoingSnapshot);
-    }
-    preparedSourceRef.current = source;
-    recentTeachingContextRef.current = [];
-    const outlineState = createLessonState(
-      source ? `Main topics in ${source.name}` : "Uploaded material",
-      source?.lessonTree ?? [],
-    );
-    lessonStateRef.current = outlineState;
-    setLessonState(outlineState);
-    if (!source) return;
-
-    const id = createLocalLessonId();
-    const createdAt = new Date().toISOString();
-    savedLessonIdRef.current = id;
-    savedLessonCreatedAtRef.current = createdAt;
-    savedLessonUpdatedAtRef.current = null;
-    savedLessonContentSignatureRef.current = null;
-    savedLessonWasPersistedRef.current = false;
-    cloudOwnerIdRef.current = workspaceOwnerIdRef.current;
-    cloudSyncMetadataRef.current = undefined;
-    resumeExistingLessonRef.current = false;
-    setSavedLessonId(id);
-    setResumeExistingLesson(false);
-  };
-
-  const handleLearningSourceChange = (source: LearningSource | null) => {
-    setLearningSource(source);
-    if (source !== null) return;
-    savedLessonIdRef.current = null;
-    savedLessonCreatedAtRef.current = null;
-    savedLessonUpdatedAtRef.current = null;
-    savedLessonContentSignatureRef.current = null;
-    savedLessonWasPersistedRef.current = false;
-    resumeExistingLessonRef.current = false;
-    teachingPreferencesRef.current = DEFAULT_TEACHING_PREFERENCES;
-    setSavedLessonId(null);
-    setResumeExistingLesson(false);
-    setTeachingPreferences(DEFAULT_TEACHING_PREFERENCES);
-    if (persistenceAvailableRef.current) {
-      void clearActiveLessonId(workspaceOwnerIdRef.current).catch(() => {
-        persistenceAvailableRef.current = false;
-        setPersistenceNotice("Local lesson saving is unavailable on this device.");
-        addDebugMessage("Local persistence unavailable");
-      });
-    }
-  };
-
-  const handleLessonSourcesChange = (sources: LessonSource[], files: Map<string, File>) => {
-    setLessonSources(sources);
-    rawSourceFilesRef.current = files;
-  };
-
-  const retrySourceUpload = () => {
-    const id = savedLessonIdRef.current;
-    if (!id || rawSourceFilesRef.current.size === 0) {
-      setPersistenceNotice("Original files are no longer available in this browser session. Create a new lesson to reselect them.");
-      return;
-    }
-    sourceUploadsAttemptedRef.current.delete(id);
-    const snapshot = createCurrentLessonSnapshot();
-    if (snapshot) void persistLessonSnapshot(snapshot);
   };
 
   const changeActiveTeachingPreference = (update: TeachingPreferenceUpdate) => {
@@ -955,13 +865,14 @@ export default function Home() {
     }, 1_500);
   };
 
-  const refreshScopedLibrary = async (ownerId: string | null) => {
+  const refreshScopedLibrary = async (ownerId: string | null, reason = "workspace") => {
     const library = await listSavedLessons();
     const scoped = library.filter((lesson) => (lesson.cloudOwnerId ?? null) === ownerId);
     setSavedLessons(scoped);
     setLocalOnlyLessonCount(ownerId
       ? library.filter((lesson) => !lesson.cloudOwnerId).length
       : 0);
+    addDebugMessage(`Library refreshed: reason=${reason}, activeLessonHydrated=no`);
     addDebugMessage(`Saved lesson library loaded: ${scoped.length} lessons`);
     addDebugMessage(`Recent Lessons cache: scopedUniqueLessons=${new Set(scoped.map((lesson) => lesson.id)).size}`);
     const titleIds = new Map<string, string[]>();
@@ -973,6 +884,15 @@ export default function Home() {
     });
     return scoped;
   };
+
+  const processingQueue = useLessonProcessingQueue({
+    ownerId: cloudUserId,
+    onDebug: addDebugMessage,
+    onLessonReady: async () => {
+      await refreshScopedLibrary(workspaceOwnerIdRef.current, "processing-ready");
+      setPersistenceNotice("Your processed lesson is ready in the library.");
+    },
+  });
 
   const syncCurrentAccount = async () => {
     const ownerId = workspaceOwnerIdRef.current;
@@ -986,12 +906,13 @@ export default function Home() {
         debug: addDebugMessage,
       });
       setCloudLessonCount(summary.cloudLessonCount);
-      await refreshScopedLibrary(ownerId);
+      await refreshScopedLibrary(ownerId, "cloud-sync");
       if (!lessonActiveRef.current && savedLessonIdRef.current) {
+        const hydrationGeneration = lessonHydrationGenerationRef.current;
         const refreshed = await getSavedLesson(savedLessonIdRef.current);
         if (refreshed?.cloudOwnerId === ownerId) {
-          hydrateSavedLesson(refreshed);
-        } else {
+          hydrateSavedLesson(refreshed, hydrationGeneration);
+        } else if (!lessonActiveRef.current && !lessonStartupPendingRef.current) {
           resetIdleLessonWorkspace();
           await clearActiveLessonId(ownerId);
         }
@@ -1042,7 +963,7 @@ export default function Home() {
   };
 
   useEffect(() => {
-    if (!cloudAuthReady || lessonActiveRef.current) return;
+    if (!cloudAuthReady || lessonActiveRef.current || lessonStartupPendingRef.current) return;
     const ownerId = cloudUserId;
     if (workspaceLoadedRef.current && workspaceOwnerIdRef.current === ownerId) return;
     const generation = ++workspaceLoadGenerationRef.current;
@@ -1051,6 +972,11 @@ export default function Home() {
         if (persistenceHydratedRef.current) {
           const outgoing = createCurrentLessonSnapshot();
           if (outgoing) await persistLessonSnapshot(outgoing);
+        }
+        if (generation !== workspaceLoadGenerationRef.current ||
+            lessonActiveRef.current || lessonStartupPendingRef.current) {
+          addDebugMessage(`Stale workspace hydration skipped: reason=${lessonActiveRef.current ? "lesson-active" : lessonStartupPendingRef.current ? "startup-pending" : "request-stale"}`);
+          return;
         }
         resetIdleLessonWorkspace();
         workspaceOwnerIdRef.current = ownerId;
@@ -1075,15 +1001,21 @@ export default function Home() {
         if (generation !== workspaceLoadGenerationRef.current) return;
         const [result] = await Promise.all([
           loadActiveLesson(ownerId),
-          refreshScopedLibrary(ownerId),
+          refreshScopedLibrary(ownerId, "workspace-restore"),
         ]);
         addDebugMessage("IndexedDB opened");
         if (result.status === "incompatible") {
           addDebugMessage("Saved lesson schema incompatible");
           await clearActiveLessonId(ownerId);
         } else if (result.status === "restored") {
-          hydrateSavedLesson(result.lesson);
-          addDebugMessage(`Restored saved lesson: ${result.lesson.id}`);
+          const hydrationGeneration = lessonHydrationGenerationRef.current;
+          if (generation !== workspaceLoadGenerationRef.current ||
+              ownerId !== workspaceOwnerIdRef.current ||
+              lessonActiveRef.current || lessonStartupPendingRef.current) {
+            addDebugMessage(`Stale workspace hydration skipped: reason=${lessonActiveRef.current ? "lesson-active" : lessonStartupPendingRef.current ? "startup-pending" : "request-stale"}`);
+          } else if (hydrateSavedLesson(result.lesson, hydrationGeneration)) {
+            addDebugMessage(`Restored saved lesson: ${result.lesson.id}`);
+          }
         }
         workspaceLoadedRef.current = true;
       } catch {
@@ -1620,6 +1552,10 @@ export default function Home() {
       return;
     }
 
+    lessonStartupPendingRef.current = true;
+    workspaceLoadGenerationRef.current += 1;
+    lessonHydrationGenerationRef.current += 1;
+
     const activeSource = learningSource;
     const preparedSource = preparedSourceRef.current;
     const lessonFocus = topicInput.trim();
@@ -1879,6 +1815,7 @@ export default function Home() {
       setResumeExistingLesson(true);
       addDebugMessage("Lesson started");
       lessonActiveRef.current = true;
+      lessonStartupPendingRef.current = false;
       beginIdleMonitoring();
       void requestWakeLock();
       if (sessionStartMode === "persisted-resume") {
@@ -1939,6 +1876,8 @@ export default function Home() {
         addDebugMessage(`Microphone error: ${message}`);
         await player.close();
       }
+    } finally {
+      lessonStartupPendingRef.current = false;
     }
   };
 
@@ -2059,18 +1998,25 @@ export default function Home() {
           />
         )}
 
-        <div className="setup-only">
-          <LearningSourceUpload
-            source={learningSource}
-            sources={lessonSources}
-            disabled={microphoneActive || requestingPermission || !persistenceHydrated}
-            onChange={handleLearningSourceChange}
-            onSourcesChange={handleLessonSourcesChange}
-            onRetrySourceUpload={retrySourceUpload}
-            onPreparedChange={handlePreparedSourceChange}
-            onDebug={addDebugMessage}
-          />
-        </div>
+        <ProcessingQueue
+          jobs={processingQueue.jobs}
+          lessonActive={lessonActive}
+          onOpen={(lessonId) => void selectSavedLesson(lessonId)}
+          onRetry={(job) => void processingQueue.retry(job)}
+          onReselect={(job, files) => void processingQueue.reselect(job, files).catch((error) => {
+            setPersistenceNotice(error instanceof Error ? error.message : "Those sources did not match the queued lesson.");
+          })}
+          onDiscard={(job) => void processingQueue.discard(job).catch(() => {
+            setPersistenceNotice("The queued lesson could not be discarded safely.");
+          })}
+        />
+
+        <LearningSourceUpload
+          disabled={!persistenceHydrated}
+          cloudUserId={cloudUserId}
+          onQueueBundle={processingQueue.enqueue}
+          onDebug={addDebugMessage}
+        />
 
         <label className="topic-field setup-only">
           <span>Lesson topic or focus (optional)</span>

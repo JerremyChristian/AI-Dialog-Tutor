@@ -13,12 +13,13 @@ import {
 
 export const SAVED_LESSON_SCHEMA_VERSION = 1 as const;
 export const TUTOR_DATABASE_NAME = "ai-dialog-tutor";
-export const TUTOR_DATABASE_VERSION = 1;
+export const TUTOR_DATABASE_VERSION = 2;
 export const MAX_RECENT_TEACHING_CONTEXT_ENTRIES = 3;
 export const MAX_RECENT_TEACHING_EXCERPT_LENGTH = 360;
 
 const SAVED_LESSONS_STORE = "savedLessons";
 const APP_STATE_STORE = "appState";
+export const PROCESSING_JOBS_STORE = "processingJobs";
 const LEGACY_ACTIVE_LESSON_KEY = "activeLessonId";
 let mutationQueue: Promise<void> = Promise.resolve();
 const COVERAGE_STATUSES = new Set<CoverageStatus>([
@@ -292,7 +293,7 @@ async function deleteActiveLessonId(ownerId: string | null) {
   }
 }
 
-function openTutorDatabase() {
+export function openTutorDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {
     if (typeof indexedDB === "undefined") {
       reject(new Error("IndexedDB is unavailable"));
@@ -308,6 +309,10 @@ function openTutorDatabase() {
       if (!database.objectStoreNames.contains(APP_STATE_STORE)) {
         database.createObjectStore(APP_STATE_STORE, { keyPath: "key" });
       }
+      if (!database.objectStoreNames.contains(PROCESSING_JOBS_STORE)) {
+        const jobs = database.createObjectStore(PROCESSING_JOBS_STORE, { keyPath: "id" });
+        jobs.createIndex("createdAt", "createdAt");
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("IndexedDB open failed"));
@@ -315,14 +320,14 @@ function openTutorDatabase() {
   });
 }
 
-function requestResult<T>(request: IDBRequest<T>) {
+export function requestResult<T>(request: IDBRequest<T>) {
   return new Promise<T>((resolve, reject) => {
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("IndexedDB request failed"));
   });
 }
 
-function transactionComplete(transaction: IDBTransaction) {
+export function transactionComplete(transaction: IDBTransaction) {
   return new Promise<void>((resolve, reject) => {
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(transaction.error ?? new Error("IndexedDB transaction failed"));

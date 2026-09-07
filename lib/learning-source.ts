@@ -1,5 +1,6 @@
 export const MAX_SOURCE_BYTES = 20 * 1024 * 1024;
 export const MAX_SOURCE_BUNDLE_BYTES = 4 * 1024 * 1024;
+export const MAX_CLOUD_SOURCE_BUNDLE_BYTES = 40 * 1024 * 1024;
 export const MAX_LESSON_SOURCES = 6;
 export const SUPPORTED_SOURCE_TYPES = ["application/pdf", "text/plain"] as const;
 

@@ -100,6 +100,56 @@ h1 {
   background: #f8fafb;
 }
 
+.processing-queue {
+  margin-bottom: 24px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #f8fafb;
+}
+
+.processing-queue-heading,
+.processing-job {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.processing-queue-heading h2 {
+  margin-bottom: 4px;
+  font-size: 0.9rem;
+}
+
+.processing-queue-heading p,
+.processing-queue-heading span,
+.processing-job span,
+.processing-job small {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.processing-queue-heading p { margin-bottom: 0; }
+.processing-queue ol { margin: 14px 0 0; padding: 0; list-style: none; }
+.processing-job { padding: 12px 0; border-top: 1px solid var(--border); }
+.processing-job strong,
+.processing-job span,
+.processing-job small { display: block; overflow-wrap: anywhere; }
+.processing-job small { margin-top: 4px; color: #922727; }
+.processing-job-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 6px; }
+.processing-job-actions button {
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 700;
+}
+.processing-job-actions button:disabled { cursor: not-allowed; opacity: 0.6; }
+.processing-reselect-input { display: none; }
+
 .cloud-account {
   margin-bottom: 24px;
   padding: 16px;
