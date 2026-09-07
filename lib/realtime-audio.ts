@@ -93,6 +93,48 @@ export class PcmAudioPlayer {
   private context: AudioContext | null = null;
   private nextStartTime = 0;
   private sources = new Set<AudioBufferSourceNode>();
+  private batch: {
+    id: number;
+    sources: Set<AudioBufferSourceNode>;
+    providerComplete: boolean;
+    cancelled: boolean;
+    hadAudio: boolean;
+    drained: boolean;
+    onNaturalDrain: (id: number) => void;
+  } | null = null;
+
+  beginBatch(id: number, onNaturalDrain: (id: number) => void) {
+    if (this.batch && !this.batch.drained && !this.batch.cancelled) {
+      throw new Error("A playback batch is already active");
+    }
+    this.batch = {
+      id,
+      sources: new Set(),
+      providerComplete: false,
+      cancelled: false,
+      hadAudio: false,
+      drained: false,
+      onNaturalDrain,
+    };
+  }
+
+  completeBatch(id: number) {
+    if (!this.batch || this.batch.id !== id || this.batch.cancelled) return;
+    this.batch.providerComplete = true;
+    this.maybeReportNaturalDrain();
+  }
+
+  getBatchStatus() {
+    const batch = this.batch;
+    return batch ? {
+      id: batch.id,
+      providerComplete: batch.providerComplete,
+      cancelled: batch.cancelled,
+      pendingNodes: batch.sources.size,
+      hadAudio: batch.hadAudio,
+      drained: batch.drained,
+    } : null;
+  }
 
   async prepare() {
     if (!this.context || this.context.state === "closed") {
@@ -124,7 +166,18 @@ export class PcmAudioPlayer {
     const source = context.createBufferSource();
     source.buffer = audioBuffer;
     source.connect(context.destination);
-    source.onended = () => this.sources.delete(source);
+    const batch = this.batch;
+    if (batch && !batch.cancelled) {
+      batch.hadAudio = true;
+      batch.sources.add(source);
+    }
+    source.onended = () => {
+      this.sources.delete(source);
+      if (batch && this.batch === batch) {
+        batch.sources.delete(source);
+        this.maybeReportNaturalDrain();
+      }
+    };
 
     const startTime = Math.max(context.currentTime + 0.02, this.nextStartTime);
     source.start(startTime);
@@ -133,6 +186,7 @@ export class PcmAudioPlayer {
   }
 
   clear() {
+    if (this.batch) this.batch.cancelled = true;
     for (const source of this.sources) {
       try {
         source.stop();
@@ -141,6 +195,7 @@ export class PcmAudioPlayer {
       }
     }
     this.sources.clear();
+    this.batch = null;
 
     if (this.context) {
       this.nextStartTime = this.context.currentTime;
@@ -155,6 +210,14 @@ export class PcmAudioPlayer {
     if (context && context.state !== "closed") {
       await context.close();
     }
+  }
+
+  private maybeReportNaturalDrain() {
+    const batch = this.batch;
+    if (!batch || batch.cancelled || batch.drained || !batch.providerComplete ||
+        !batch.hadAudio || batch.sources.size > 0) return;
+    batch.drained = true;
+    batch.onNaturalDrain(batch.id);
   }
 }
 

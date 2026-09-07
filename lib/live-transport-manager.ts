@@ -380,6 +380,7 @@ export class LiveTransportManager {
     let socket: GeminiLiveWebSocket;
     socket = new GeminiLiveWebSocket({
       onMessage: (message) => this.handleMessage(socket, message),
+      onDebug: this.options.onDebug,
       onError: (message) => {
         if (socket === this.activeSocket) this.options.onDebug(`Realtime error: ${message}`);
       },

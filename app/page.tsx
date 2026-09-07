@@ -7,6 +7,7 @@ import { LearningSourceUpload } from "../components/learning-source-upload";
 import { LessonRoadmap } from "../components/lesson-roadmap";
 import { RecentLessons } from "../components/recent-lessons";
 import { SourceVisual } from "../components/source-visual";
+import { ProcessingQueue } from "../components/processing-queue";
 import CloudAccount from "../components/cloud-account";
 import type {
   LearningSource,
@@ -37,7 +38,6 @@ import {
   buildLessonInstruction,
   completeLessonConcept,
   createLessonState,
-  deriveResumePoint,
   GEMINI_LIVE_MODEL,
   getCurrentConcept,
   getLessonTreeRows,
@@ -59,7 +59,6 @@ import {
   type TeachingPreferences,
 } from "../lib/teaching-preferences";
 import {
-  MAX_RECENT_TEACHING_CONTEXT_ENTRIES,
   MAX_RECENT_TEACHING_EXCERPT_LENGTH,
   SAVED_LESSON_SCHEMA_VERSION,
   clearActiveLessonId,
@@ -71,7 +70,6 @@ import {
   saveActiveLesson,
   saveSavedLesson,
   setActiveLessonId,
-  type RecentTeachingContextEntry,
   type SavedLesson,
 } from "../lib/local-persistence";
 import {
@@ -84,6 +82,7 @@ import {
   type CloudSyncState,
 } from "../lib/cloud-sync";
 import { isSupabaseConfigured } from "../lib/supabase/config";
+import { useLessonProcessingQueue } from "../lib/use-lesson-processing-queue";
 
 type MicrophoneStatus =
   | "Not active"
@@ -107,13 +106,33 @@ type InstallPromptEvent = Event & {
 
 type QuickResponse = "Yes" | "Repeat" | "Continue";
 type TeachingPreferenceUpdate = Partial<TeachingPreferences>;
+type AfterDelivery = "continue" | "await-learner";
+type GenerationMode = "teaching-point" | "clarification" | "control";
+type GenerationIntent = {
+  mode: GenerationMode;
+  conceptId?: string;
+  teachingPointIndex?: number;
+};
+type ActiveTeachingGeneration = GenerationIntent & {
+  generationId: number;
+  progressRequested: boolean;
+  closing: boolean;
+  afterDelivery: AfterDelivery;
+  generationComplete: boolean;
+  playbackComplete: boolean;
+  cancelled: boolean;
+  transcript: string;
+  acceptedAudioEvents: number;
+  suppressedAudioEvents: number;
+  suppressedTranscriptEvents: number;
+};
+type TurnOrigin = "learner" | "app-control";
 
 type ConversationContinuity = {
   lastMeaningfulLearnerTranscript?: string;
   lastAssistantTranscript?: string;
   lastAssistantTurnComplete: boolean;
   interruptedAssistantTranscript?: string;
-  resumePoint?: string;
   learnerUtteranceActive: boolean;
   learnerUtteranceOpen: boolean;
   interruptionAlreadyRegistered: boolean;
@@ -208,9 +227,9 @@ function createLocalLessonId() {
 
 function getPersistedResumeContext(
   state: LessonState,
-  recentTeachingContext: RecentTeachingContextEntry[],
 ) {
   const current = getCurrentConcept(state);
+  const progress = current ? state.teachingContractProgress[current.id] : undefined;
   const atomicConcepts = getLessonTreeRows(state)
     .map(({ node }) => node)
     .filter((node) => node.childrenIds.length === 0 && Boolean(node.teaching));
@@ -224,13 +243,8 @@ function getPersistedResumeContext(
   return {
     currentConceptTitle: current?.title ?? null,
     currentConceptStatus: current?.status ?? null,
-    resumePointAvailable: Boolean(state.resumePoint.trim()),
     previousCoveredConceptTitle: previousCovered?.title ?? null,
-    recentTeachingContext: current
-      ? recentTeachingContext
-        .filter((entry) => entry.conceptId === current.id)
-        .map((entry) => entry.excerpt)
-      : [],
+    lastCompletedCheckpoint: progress?.lastCompletedCheckpoint ?? null,
   };
 }
 
@@ -240,6 +254,28 @@ function createRecentTeachingExcerpt(transcript: string) {
   return concise.length <= MAX_RECENT_TEACHING_EXCERPT_LENGTH
     ? concise
     : `${concise.slice(0, MAX_RECENT_TEACHING_EXCERPT_LENGTH - 3).trimEnd()}...`;
+}
+
+// Gemini Live output transcription is an incremental stream for the current
+// generation. Preserve the provider's ordering and append each fragment once;
+// cumulative-hypothesis merging belongs only to interim input transcription.
+function appendTranscriptDelta(current: string, fragment: string) {
+  if (!fragment) return current;
+  if (!current) return fragment.trimStart();
+  const needsSpace = !/\s$/.test(current) && !/^\s|^[.,!?;:]/.test(fragment);
+  return `${current}${needsSpace ? " " : ""}${fragment}`;
+}
+
+function describeLiveProviderEvent(message: LiveServerMessage) {
+  if (message.serverContent?.modelTurn) return "serverContent.modelTurn";
+  if (message.serverContent?.outputTranscription) return "serverContent.outputTranscription";
+  if (message.serverContent?.generationComplete) return "serverContent.generationComplete";
+  if (message.serverContent?.turnComplete) return "serverContent.turnComplete";
+  if (message.serverContent?.interrupted) return "serverContent.interrupted";
+  if (message.toolCall) return "toolCall";
+  if (message.sessionResumptionUpdate) return "sessionResumptionUpdate";
+  if (message.goAway) return "goAway";
+  return "other";
 }
 
 export default function Home() {
@@ -259,6 +295,7 @@ export default function Home() {
   );
   const [preferenceUpdatePending, setPreferenceUpdatePending] = useState(false);
   const [roadmapNavigationPending, setRoadmapNavigationPending] = useState(false);
+  const [generationDiagnostic, setGenerationDiagnostic] = useState<ActiveTeachingGeneration | null>(null);
   const [persistenceHydrated, setPersistenceHydrated] = useState(false);
   const [persistenceNotice, setPersistenceNotice] = useState("");
   const [savedLessonId, setSavedLessonId] = useState<string | null>(null);
@@ -304,8 +341,17 @@ export default function Home() {
   const tokenRequestRef = useRef<AbortController | null>(null);
   const isMountedRef = useRef(true);
   const conversationRunRef = useRef(0);
+  const lastAuthorityNodeIdRef = useRef<string | null>(null);
+  const conversationStartPendingRef = useRef(false);
   const assistantSpeakingRef = useRef(false);
   const assistantTurnActiveRef = useRef(false);
+  const assistantGenerationSequenceRef = useRef(0);
+  const nextGenerationIntentRef = useRef<GenerationIntent>({ mode: "clarification" });
+  const pendingTurnOriginRef = useRef<TurnOrigin | null>(null);
+  const activeTeachingGenerationRef = useRef<ActiveTeachingGeneration | null>(null);
+  const startupFirstProviderEventPendingRef = useRef(false);
+  const startupFirstAudioPendingRef = useRef(false);
+  const startupSessionRef = useRef(0);
   const userTranscriptRef = useRef("");
   const lastMeaningfulLearnerTranscriptRef = useRef("");
   const assistantTranscriptRef = useRef("");
@@ -314,8 +360,8 @@ export default function Home() {
   const resumptionPendingRef = useRef(false);
   const persistedResumeBriefingPendingRef = useRef(false);
   const persistedResumeFirstResponseLoggedRef = useRef(false);
+  const persistedResumeFirstAudioLoggedRef = useRef(false);
   const assistantCheckpointConceptIdRef = useRef<string | null>(null);
-  const recentTeachingContextRef = useRef<RecentTeachingContextEntry[]>([]);
   const sourceGroundingPendingRef = useRef(false);
   const toolResultsRef = useRef(new Map<string, Record<string, unknown>>());
   const cancelledToolCallIdsRef = useRef(new Set<string>());
@@ -362,7 +408,134 @@ export default function Home() {
     setLessonState(next);
   };
 
+  const cancelActiveTeachingGeneration = (reason: string) => {
+    const active = activeTeachingGenerationRef.current;
+    if (!active) return;
+    active.cancelled = true;
+    addDebugMessage(`Teaching generation cancelled: generation=${active.generationId}, reason=${reason}`);
+    if (active.progressRequested) {
+      addDebugMessage(
+        `Pending progress discarded: generation=${active.generationId}, ` +
+        `point=${active.teachingPointIndex ?? "-"}, reason=${reason}`,
+      );
+    }
+    activeTeachingGenerationRef.current = null;
+    setGenerationDiagnostic(null);
+  };
+
+  const currentTeachingIntent = (): GenerationIntent => {
+    const current = getCurrentConcept(lessonStateRef.current);
+    if (!current?.teaching) return { mode: "control" };
+    return {
+      mode: "teaching-point",
+      conceptId: current.id,
+      teachingPointIndex:
+        lessonStateRef.current.teachingContractProgress[current.id]?.nextTeachingPointIndex ?? 0,
+    };
+  };
+
+  const tryCommitTeachingGeneration = (generationId: number) => {
+    const active = activeTeachingGenerationRef.current;
+    if (!active || active.generationId !== generationId || active.cancelled ||
+        !active.generationComplete || !active.playbackComplete) return;
+    if (active.mode !== "teaching-point" || !active.progressRequested ||
+        !active.conceptId || active.teachingPointIndex === undefined) {
+      activeTeachingGenerationRef.current = null;
+      setGenerationDiagnostic(null);
+      addDebugMessage(`Generation delivered without teaching commit: generation=${generationId}, mode=${active.mode}`);
+      return;
+    }
+    const excerpt = createRecentTeachingExcerpt(active.transcript).slice(0, 420);
+    const transition = progressLessonTeachingPoint(
+      lessonStateRef.current,
+      active.conceptId,
+      active.teachingPointIndex,
+      excerpt || undefined,
+    );
+    if (transition.state !== lessonStateRef.current) {
+      lessonStateRef.current = transition.state;
+      setLessonState(transition.state);
+    }
+    let committedState = transition.state;
+    const node = committedState.nodes[active.conceptId];
+    const next = committedState.teachingContractProgress[active.conceptId]?.nextTeachingPointIndex;
+    if (node?.teaching && next === node.teaching.teachingPoints.length) {
+      committedState = completeLessonConcept(committedState, active.conceptId).state;
+    }
+    if (committedState !== lessonStateRef.current) {
+      lessonStateRef.current = committedState;
+      setLessonState(committedState);
+    }
+    addDebugMessage(
+      `Teaching point committed: generation=${generationId}, concept=${active.conceptId}, ` +
+      `point=${active.teachingPointIndex}, next=${next}, checkpointTranscript=${excerpt ? "yes" : "no"}`,
+    );
+    const shouldContinue = active.afterDelivery === "continue";
+    activeTeachingGenerationRef.current = null;
+    setGenerationDiagnostic(null);
+    if (!shouldContinue || !lessonActiveRef.current) return;
+    const nextIntent = (() => {
+      const current = getCurrentConcept(committedState);
+      if (!current?.teaching) return null;
+      const point = committedState.teachingContractProgress[current.id]?.nextTeachingPointIndex ?? 0;
+      return point < current.teaching.teachingPoints.length
+        ? { mode: "teaching-point" as const, conceptId: current.id, teachingPointIndex: point }
+        : null;
+    })();
+    if (!nextIntent) return;
+    nextGenerationIntentRef.current = nextIntent;
+    pendingTurnOriginRef.current = "app-control";
+    if (transportRef.current?.sendRealtimeInput({
+      text: `[[APP_CONTROL:TEACH_POINT:${nextIntent.conceptId}:${nextIntent.teachingPointIndex}]]`,
+    })) {
+      addDebugMessage(`Next teaching generation requested: concept=${nextIntent.conceptId}, point=${nextIntent.teachingPointIndex}`);
+    } else {
+      nextGenerationIntentRef.current = { mode: "clarification" };
+      addDebugMessage("Next teaching generation not sent: transport-not-ready");
+    }
+  };
+
+  const ensureActiveGeneration = () => {
+    const existing = activeTeachingGenerationRef.current;
+    if (existing) return existing;
+    const intent = nextGenerationIntentRef.current;
+    nextGenerationIntentRef.current = { mode: "clarification" };
+    pendingTurnOriginRef.current = null;
+    const active: ActiveTeachingGeneration = {
+      ...intent,
+      generationId: ++assistantGenerationSequenceRef.current,
+      progressRequested: false,
+      closing: false,
+      afterDelivery: "await-learner",
+      generationComplete: false,
+      playbackComplete: false,
+      cancelled: false,
+      transcript: "",
+      acceptedAudioEvents: 0,
+      suppressedAudioEvents: 0,
+      suppressedTranscriptEvents: 0,
+    };
+    activeTeachingGenerationRef.current = active;
+    setGenerationDiagnostic({ ...active });
+    playerRef.current?.beginBatch(active.generationId, (id) => {
+      const current = activeTeachingGenerationRef.current;
+      if (!current || current.generationId !== id || current.cancelled) return;
+      current.playbackComplete = true;
+      setGenerationDiagnostic({ ...current });
+      addDebugMessage(`Playback batch natural drain: generation=${id}`);
+      tryCommitTeachingGeneration(id);
+    });
+    addDebugMessage(
+      `Teaching generation started: generation=${active.generationId}, mode=${active.mode}, ` +
+      `concept=${active.conceptId ?? "-"}, point=${active.teachingPointIndex ?? "-"}`,
+    );
+    return active;
+  };
+
   const disposeResources = async (sendAudioStreamEnd: boolean) => {
+    cancelActiveTeachingGeneration("session-disposed");
+    pendingTurnOriginRef.current = null;
+    conversationStartPendingRef.current = false;
     tokenRequestRef.current?.abort();
     tokenRequestRef.current = null;
 
@@ -381,10 +554,13 @@ export default function Home() {
     await player?.close();
     assistantSpeakingRef.current = false;
     assistantTurnActiveRef.current = false;
+    startupFirstProviderEventPendingRef.current = false;
+    startupFirstAudioPendingRef.current = false;
     lastAssistantTurnCompleteRef.current = true;
     resumptionPendingRef.current = false;
     persistedResumeBriefingPendingRef.current = false;
     persistedResumeFirstResponseLoggedRef.current = false;
+    persistedResumeFirstAudioLoggedRef.current = false;
     assistantCheckpointConceptIdRef.current = null;
     sourceGroundingPendingRef.current = false;
     toolResultsRef.current.clear();
@@ -447,6 +623,16 @@ export default function Home() {
     setTeachingPreferences(next);
   };
 
+  const processingQueue = useLessonProcessingQueue({
+    ownerId: cloudUserId,
+    onDebug: addDebugMessage,
+    onLessonReady: (lesson) => {
+      setSavedLessons((current) => [lesson, ...current.filter((item) => item.id !== lesson.id)]
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+      setPersistenceNotice(`${lesson.title} is ready to study.`);
+    },
+  });
+
   const applySyncedLessonMetadata = (synced: SavedLesson) => {
     setSavedLessons((current) => current.map((lesson) =>
       lesson.id === synced.id ? synced : lesson
@@ -490,23 +676,6 @@ export default function Home() {
     cloudUploadTimersRef.current.set(snapshot.id, timer);
   };
 
-  const updateRecentTeachingContext = (conceptId: string | null, transcript: string) => {
-    if (!conceptId || !lessonStateRef.current.nodes[conceptId]) return;
-    const excerpt = createRecentTeachingExcerpt(transcript);
-    if (!excerpt) return;
-    const matching = recentTeachingContextRef.current
-      .filter((entry) => entry.conceptId === conceptId);
-    if (matching.at(-1)?.excerpt === excerpt) return;
-    recentTeachingContextRef.current = [
-      ...matching,
-      { conceptId, excerpt },
-    ].slice(-MAX_RECENT_TEACHING_CONTEXT_ENTRIES);
-    addDebugMessage(
-      `Resume teaching context updated: concept=${conceptId}, ` +
-      `entries=${recentTeachingContextRef.current.length}`,
-    );
-  };
-
   const createCurrentLessonSnapshot = (stateOverride?: LessonState) => {
     if (!persistenceAvailableRef.current || !persistenceHydratedRef.current) return;
     const id = savedLessonIdRef.current;
@@ -534,7 +703,7 @@ export default function Home() {
         lastUserTranscript: "",
         lastAssistantTranscript: "",
       },
-      recentTeachingContext: recentTeachingContextRef.current,
+      recentTeachingContext: [],
       teachingPreferences: teachingPreferencesRef.current,
       createdAt,
       updatedAt: savedLessonUpdatedAtRef.current ?? now,
@@ -604,7 +773,6 @@ export default function Home() {
   const hydrateSavedLesson = (saved: SavedLesson) => {
     preparedSourceRef.current = saved.source.prepared;
     lessonStateRef.current = saved.lessonState;
-    recentTeachingContextRef.current = saved.recentTeachingContext;
     teachingPreferencesRef.current = saved.teachingPreferences;
     savedLessonIdRef.current = saved.id;
     savedLessonCreatedAtRef.current = saved.createdAt;
@@ -626,16 +794,12 @@ export default function Home() {
     setResumeExistingLesson(saved.hasStarted);
     setCurrentUtterance("");
     setUserError("");
-    addDebugMessage(
-      `Restored resume teaching context: entries=${saved.recentTeachingContext.length}`,
-    );
   };
 
   const resetIdleLessonWorkspace = () => {
     const emptyLesson = createLessonState("Uploaded material", []);
     preparedSourceRef.current = null;
     lessonStateRef.current = emptyLesson;
-    recentTeachingContextRef.current = [];
     teachingPreferencesRef.current = DEFAULT_TEACHING_PREFERENCES;
     savedLessonIdRef.current = null;
     savedLessonCreatedAtRef.current = null;
@@ -738,7 +902,6 @@ export default function Home() {
       if (outgoingSnapshot) void persistLessonSnapshot(outgoingSnapshot);
     }
     preparedSourceRef.current = source;
-    recentTeachingContextRef.current = [];
     const outlineState = createLessonState(
       source ? `Main topics in ${source.name}` : "Uploaded material",
       source?.lessonTree ?? [],
@@ -811,10 +974,12 @@ export default function Home() {
     const text = update.explanationDepth
       ? `Please use ${update.explanationDepth} explanations from now on.`
       : `Please use a ${update.speakingSpeed} speaking speed from now on.`;
+    pendingTurnOriginRef.current = "learner";
     if (!transportRef.current?.sendLearnerText(text)) {
       setUserError("The teaching style could not be updated while reconnecting. Try again.");
       return;
     }
+    nextGenerationIntentRef.current = { mode: "clarification" };
     markMeaningfulActivity();
     addDebugMessage(`Teaching preference update requested: ${requested}`);
     setPreferenceUpdatePending(true);
@@ -840,6 +1005,12 @@ export default function Home() {
       parentId = parent.parentId;
     }
     const text = `Go to "${path.join(" > ")}" in the lesson roadmap.`;
+    nextGenerationIntentRef.current = {
+      mode: "teaching-point",
+      conceptId: node.id,
+      teachingPointIndex: lessonStateRef.current.teachingContractProgress[node.id]?.nextTeachingPointIndex ?? 0,
+    };
+    pendingTurnOriginRef.current = "app-control";
     if (!transportRef.current?.sendLearnerText(text)) {
       setUserError("That lesson navigation could not be sent while reconnecting. Try again.");
       return;
@@ -877,6 +1048,8 @@ export default function Home() {
     addDebugMessage("Possible inactivity");
     updateEngagementState("confirming");
     addDebugMessage("Idle confirmation requested");
+    pendingTurnOriginRef.current = "app-control";
+    nextGenerationIntentRef.current = { mode: "control" };
     transportRef.current?.sendRealtimeInput({
       text: "[[APP_CONTROL:IDLE_CONFIRMATION]]",
     });
@@ -930,6 +1103,10 @@ export default function Home() {
       text = "Please repeat the question asking whether I want to continue.";
     }
 
+    nextGenerationIntentRef.current = response === "Repeat"
+      ? { mode: "clarification" }
+      : currentTeachingIntent();
+    pendingTurnOriginRef.current = "learner";
     if (!transportRef.current?.sendLearnerText(text)) {
       setUserError("The quick response could not be sent while reconnecting. Try again.");
       return;
@@ -1042,7 +1219,36 @@ export default function Home() {
   };
 
   useEffect(() => {
-    if (!cloudAuthReady || lessonActiveRef.current) return;
+    const currentNode = lessonState.currentNodeId
+      ? lessonState.nodes[lessonState.currentNodeId]
+      : undefined;
+    console.log("[LessonState authority]", {
+      currentNodeId: lessonState.currentNodeId,
+      currentConcept: currentNode?.title ?? null,
+      status: currentNode?.status ?? null,
+    });
+    if (lastAuthorityNodeIdRef.current !== lessonState.currentNodeId) {
+      const previous = lastAuthorityNodeIdRef.current
+        ? lessonState.nodes[lastAuthorityNodeIdRef.current]
+        : undefined;
+      addDebugMessage(
+        `Lesson concept transition: from=${lastAuthorityNodeIdRef.current ?? "none"}/${previous?.title ?? "none"}, ` +
+        `to=${lessonState.currentNodeId ?? "none"}/${currentNode?.title ?? "none"}`,
+      );
+      lastAuthorityNodeIdRef.current = lessonState.currentNodeId;
+    }
+  }, [
+    lessonState.currentNodeId,
+    lessonState.currentNodeId
+      ? lessonState.nodes[lessonState.currentNodeId]?.title
+      : undefined,
+    lessonState.currentNodeId
+      ? lessonState.nodes[lessonState.currentNodeId]?.status
+      : undefined,
+  ]);
+
+  useEffect(() => {
+    if (!cloudAuthReady || lessonActiveRef.current || conversationStartPendingRef.current) return;
     const ownerId = cloudUserId;
     if (workspaceLoadedRef.current && workspaceOwnerIdRef.current === ownerId) return;
     const generation = ++workspaceLoadGenerationRef.current;
@@ -1077,6 +1283,10 @@ export default function Home() {
           loadActiveLesson(ownerId),
           refreshScopedLibrary(ownerId),
         ]);
+        if (lessonActiveRef.current || conversationStartPendingRef.current) {
+          addDebugMessage("Stale workspace restore ignored: lesson start is authoritative");
+          return;
+        }
         addDebugMessage("IndexedDB opened");
         if (result.status === "incompatible") {
           addDebugMessage("Saved lesson schema incompatible");
@@ -1120,7 +1330,6 @@ export default function Home() {
     lessonState.currentNodeId,
     lessonState.nodes,
     lessonState.teachingContractProgress,
-    lessonState.resumePoint,
     lessonState.status,
     teachingPreferences,
     topicInput,
@@ -1185,6 +1394,7 @@ export default function Home() {
     if (serverContent?.inputTranscription?.text) {
       const transcriptFragment = serverContent.inputTranscription.text;
       if (isMeaningfulLearnerTranscript(transcriptFragment)) {
+        pendingTurnOriginRef.current = "learner";
         lastMeaningfulLearnerTranscriptRef.current = mergeTranscript(
           lastMeaningfulLearnerTranscriptRef.current,
           transcriptFragment,
@@ -1217,11 +1427,20 @@ export default function Home() {
     }
 
     if (serverContent?.outputTranscription?.text) {
+      const closingGeneration = activeTeachingGenerationRef.current;
+      if (closingGeneration?.closing) {
+        closingGeneration.suppressedTranscriptEvents += 1;
+        setGenerationDiagnostic({ ...closingGeneration });
+        addDebugMessage(
+          `Post-progress transcript suppressed: generation=${closingGeneration.generationId}`,
+        );
+      } else {
       lastAssistantTurnCompleteRef.current = false;
       if (!assistantTurnActiveRef.current) {
         assistantTurnActiveRef.current = true;
         assistantTranscriptRef.current = "";
         assistantCheckpointConceptIdRef.current = lessonStateRef.current.currentNodeId;
+        ensureActiveGeneration();
       }
       if (persistedResumeBriefingPendingRef.current &&
           !persistedResumeFirstResponseLoggedRef.current) {
@@ -1231,20 +1450,27 @@ export default function Home() {
       if (engagementStateRef.current === "confirming" && !assistantSpeakingRef.current) {
         addDebugMessage("Idle confirmation spoken");
       }
-      assistantTranscriptRef.current = mergeTranscript(
+      assistantTranscriptRef.current = appendTranscriptDelta(
         assistantTranscriptRef.current,
         serverContent.outputTranscription.text,
       );
+      const activeGeneration = activeTeachingGenerationRef.current;
+      if (activeGeneration) {
+        activeGeneration.transcript = assistantTranscriptRef.current;
+        setGenerationDiagnostic({ ...activeGeneration });
+      }
       setCurrentUtterance(assistantTranscriptRef.current);
       updateLessonState((current) => ({
         ...current,
         lastAssistantTranscript: assistantTranscriptRef.current,
       }));
+      }
     }
 
     if (serverContent?.interrupted) {
       // Gemini cuts playback immediately. Smoothing a mid-phoneme cutoff is a
       // later UX refinement; yielding to the learner remains the priority.
+      cancelActiveTeachingGeneration("interruption");
       playerRef.current?.clear();
       assistantSpeakingRef.current = false;
       const interruption = transportRef.current?.registerInterruption(
@@ -1257,21 +1483,15 @@ export default function Home() {
         const current = lessonStateRef.current;
         const interruptedTranscript =
           assistantTranscriptRef.current || current.lastAssistantTranscript;
-        const currentConcept = getCurrentConcept(current)?.title || "current concept";
-        const resumePoint = deriveResumePoint(
-          interruptedTranscript,
-          currentConcept,
-        );
         updateLessonState((state) => ({
           ...state,
           status: "interrupted",
-          resumePoint,
           interruptionCount: state.interruptionCount + 1,
           lastAssistantTranscript: interruptedTranscript,
         }));
         resumptionPendingRef.current = true;
         addDebugMessage("Assistant interrupted");
-        addDebugMessage(`Resume point saved: ${resumePoint}`);
+        addDebugMessage("Resume point preserved: reason=incomplete-assistant-turn");
       }
     }
 
@@ -1296,8 +1516,24 @@ export default function Home() {
     for (const part of serverContent.modelTurn?.parts ?? []) {
       const audio = part.inlineData;
       if (!audio?.data || !audio.mimeType?.startsWith("audio/")) continue;
+      const closingGeneration = activeTeachingGenerationRef.current;
+      if (closingGeneration?.closing) {
+        closingGeneration.suppressedAudioEvents += 1;
+        setGenerationDiagnostic({ ...closingGeneration });
+        addDebugMessage(
+          `Post-progress model audio suppressed: generation=${closingGeneration.generationId}, ` +
+          `count=${closingGeneration.suppressedAudioEvents}`,
+        );
+        continue;
+      }
 
       if (!assistantSpeakingRef.current) {
+        if (startupFirstAudioPendingRef.current) {
+          startupFirstAudioPendingRef.current = false;
+          addDebugMessage(
+            `First startup audio received: session=${startupSessionRef.current}`,
+          );
+        }
         assistantSpeakingRef.current = true;
         transportRef.current?.setAssistantSpeaking(true);
         sourceGroundingPendingRef.current = false;
@@ -1305,11 +1541,19 @@ export default function Home() {
           assistantTurnActiveRef.current = true;
           assistantTranscriptRef.current = "";
           assistantCheckpointConceptIdRef.current = lessonStateRef.current.currentNodeId;
+          ensureActiveGeneration();
         }
         if (persistedResumeBriefingPendingRef.current &&
             !persistedResumeFirstResponseLoggedRef.current) {
           persistedResumeFirstResponseLoggedRef.current = true;
           addDebugMessage("First persisted-resume response received");
+        }
+        if (persistedResumeBriefingPendingRef.current &&
+            !persistedResumeFirstAudioLoggedRef.current) {
+          persistedResumeFirstAudioLoggedRef.current = true;
+          addDebugMessage(
+            `First resume audio received: session=${conversationRunRef.current}`,
+          );
         }
         if (resumptionPendingRef.current) {
           updateLessonState((current) => ({
@@ -1320,34 +1564,33 @@ export default function Home() {
         }
         addDebugMessage("Assistant response started");
       }
+      const activeGeneration = activeTeachingGenerationRef.current;
+      if (activeGeneration) activeGeneration.acceptedAudioEvents += 1;
       playerRef.current?.play(audio.data);
     }
 
-    if (serverContent.generationComplete) {
+    if (serverContent.generationComplete && assistantTurnActiveRef.current) {
       assistantSpeakingRef.current = false;
       assistantTurnActiveRef.current = false;
       lastAssistantTurnCompleteRef.current = true;
       transportRef.current?.setAssistantSpeaking(false);
+      const activeGeneration = activeTeachingGenerationRef.current;
+      if (activeGeneration) {
+        activeGeneration.generationComplete = true;
+        activeGeneration.transcript = assistantTranscriptRef.current;
+        setGenerationDiagnostic({ ...activeGeneration });
+        playerRef.current?.completeBatch(activeGeneration.generationId);
+        addDebugMessage(`Provider generation complete: generation=${activeGeneration.generationId}`);
+        tryCommitTeachingGeneration(activeGeneration.generationId);
+      }
       const completedAssistantTranscript =
         assistantTranscriptRef.current || lessonStateRef.current.lastAssistantTranscript;
-      if (engagementStateRef.current !== "confirming") {
-        updateRecentTeachingContext(
-          assistantCheckpointConceptIdRef.current,
-          completedAssistantTranscript,
-        );
-      }
       updateLessonState((state) => {
         const assistantTranscript = completedAssistantTranscript || state.lastAssistantTranscript;
-        const checkpoint = deriveResumePoint(assistantTranscript, "");
-        const checkpointMatchesCurrent = Boolean(
-          checkpoint && state.currentNodeId &&
-          assistantCheckpointConceptIdRef.current === state.currentNodeId,
-        );
         return {
           ...state,
           status: state.status === "idle" ? "idle" : "teaching",
           lastAssistantTranscript: assistantTranscript,
-          resumePoint: checkpointMatchesCurrent ? checkpoint : state.resumePoint,
         };
       });
       resumptionPendingRef.current = false;
@@ -1356,6 +1599,9 @@ export default function Home() {
         addDebugMessage("Resume briefing completed");
       }
       addDebugMessage("Assistant response completed");
+      addDebugMessage(
+        `Assistant transcript finalized: generation=${assistantGenerationSequenceRef.current}`,
+      );
     }
   };
 
@@ -1377,6 +1623,9 @@ export default function Home() {
       const action = args.action;
       const conceptId = args.conceptId;
       const teachingPointIndex = args.teachingPointIndex;
+      const afterDelivery: AfterDelivery = args.afterDelivery === "continue"
+        ? "continue"
+        : "await-learner";
       const isRoadmapNavigation = call.name === "lesson_state" &&
         action === "navigate" && roadmapNavigationPendingRef.current;
       const isLessonQuery = call.name === "lesson_state" && action === "query";
@@ -1451,6 +1700,47 @@ export default function Home() {
           addDebugMessage("Idle confirmation unclear");
           result = { ok: true, action: "unclear", message: "Remain in confirmation" };
         }
+      } else if (call.name === "learner_turn_intent") {
+        const intent = args.intent;
+        const appControl = pendingTurnOriginRef.current === "app-control";
+        const route = appControl
+          ? nextGenerationIntentRef.current
+          : intent === "continue"
+            ? currentTeachingIntent()
+            : { mode: "clarification" as const };
+        if (!activeTeachingGenerationRef.current) {
+          nextGenerationIntentRef.current = route;
+        }
+        const authority = queryLessonState(lessonStateRef.current);
+        result = {
+          ok: true,
+          intent,
+          generationMode: route.mode,
+          currentNodeId: authority.currentNodeId,
+          currentConcept: authority.currentNodeTitle ?? null,
+          status: authority.currentNodeStatus ?? null,
+          nextTeachingPointIndex:
+            authority.currentTeachingProgress?.nextTeachingPointIndex ?? null,
+          totalTeachingPoints: authority.totalTeachingPoints ?? null,
+          pointsHeard: authority.pointsHeard ?? null,
+          nextConcept: authority.nextSequentialNode ?? null,
+          ...(route.mode === "teaching-point"
+            ? {
+                assignedConceptId: route.conceptId,
+                assignedTeachingPointIndex: route.teachingPointIndex,
+                instruction: "Teach exactly this assigned point in this response.",
+              }
+            : appControl
+              ? { instruction: "This is an application control. Follow its explicit control instruction; do not classify it as learner speech." }
+            : intent === "query-state"
+              ? { instruction: "Answer the learner only from this authoritative state." }
+              : { instruction: "Answer this learner turn without committing teaching progress." }),
+        };
+        addDebugMessage(
+          `${appControl ? "APP_CONTROL intent bypassed" : "Learner turn routed"}: ` +
+          `intent=${String(intent)}, mode=${route.mode}, ` +
+          `concept=${route.conceptId ?? "-"}, point=${route.teachingPointIndex ?? "-"}`,
+        );
       } else if (call.name !== "lesson_state") {
         result = { ok: false, error: `Unknown function: ${call.name || "missing"}` };
       } else if (action === "query") {
@@ -1465,7 +1755,6 @@ export default function Home() {
             !lastAssistantTurnCompleteRef.current
               ? assistantTranscriptRef.current || state.lastAssistantTranscript || undefined
               : undefined,
-          resumePoint: state.resumePoint || undefined,
           ...(transportRef.current?.getInterruptionContinuity() ?? {
             learnerUtteranceActive: false,
             learnerUtteranceOpen: false,
@@ -1490,20 +1779,47 @@ export default function Home() {
         action === "progress" && typeof conceptId === "string" && conceptId &&
         typeof teachingPointIndex === "number" && Number.isInteger(teachingPointIndex)
       ) {
-        const transition = progressLessonTeachingPoint(
-          lessonStateRef.current,
-          conceptId,
-          teachingPointIndex,
-        );
-        result = transition.result;
-        events = transition.events;
-        if (transition.state !== lessonStateRef.current) {
-          lessonStateRef.current = transition.state;
-          setLessonState(transition.state);
-        }
-        if (transition.result.recoveryRequired && !silentLessonRecoveryPendingRef.current) {
-          silentLessonRecoveryPendingRef.current = true;
-          requestSilentRecovery = true;
+        const active = activeTeachingGenerationRef.current ?? ensureActiveGeneration();
+        const authoritativeNext = lessonStateRef.current.teachingContractProgress[conceptId]
+          ?.nextTeachingPointIndex ?? 0;
+        const valid = active.mode === "teaching-point" && !active.cancelled &&
+          !active.progressRequested && active.conceptId === conceptId &&
+          active.teachingPointIndex === teachingPointIndex && authoritativeNext === teachingPointIndex;
+        if (valid) {
+          active.progressRequested = true;
+          active.closing = true;
+          // Interactive tutoring is learner-paced. Keep the requested value in
+          // the schema for a future explicit lecture mode, but normal lessons
+          // always wait for real learner input after an audio-confirmed point.
+          active.afterDelivery = "await-learner";
+          setGenerationDiagnostic({ ...active });
+          result = {
+            ...queryLessonState(lessonStateRef.current),
+            ok: true,
+            action: "progress",
+            message: "Teaching-point completion registered for this generation. Do not begin the next teaching point in this response.",
+          };
+          addDebugMessage(
+            `Teaching progress requested: generation=${active.generationId}, concept=${conceptId}, ` +
+            `point=${teachingPointIndex}, requestedAfterDelivery=${afterDelivery}, ` +
+            `effectiveAfterDelivery=await-learner`,
+          );
+          addDebugMessage(
+            `Teaching generation closing: generation=${active.generationId}, point=${teachingPointIndex}`,
+          );
+        } else {
+          result = {
+            ...queryLessonState(lessonStateRef.current),
+            ok: false,
+            action: "progress",
+            error: "invalid_transition",
+            message: active.mode === "teaching-point"
+              ? `This generation is assigned only to point ${active.teachingPointIndex ?? "-"}.`
+              : "This response is not an assigned teaching-point generation.",
+          };
+          addDebugMessage(
+            `Teaching progress rejected: generation=${active.generationId}, concept=${conceptId}, point=${teachingPointIndex}`,
+          );
         }
       } else if (
         (action === "navigate" || action === "complete" || action === "skip") &&
@@ -1600,6 +1916,8 @@ export default function Home() {
         addDebugMessage("Silent lesson-state recovery complete");
       } else if (requestSilentRecovery) {
         addDebugMessage("Silent lesson-state recovery started");
+        pendingTurnOriginRef.current = "app-control";
+        nextGenerationIntentRef.current = { mode: "control" };
         transportRef.current?.sendRealtimeInput({
           text: "[[APP_CONTROL:LESSON_STATE_RECOVERY]]",
         });
@@ -1611,12 +1929,18 @@ export default function Home() {
   };
 
   const startConversation = async () => {
+    if (conversationStartPendingRef.current || lessonActiveRef.current) {
+      addDebugMessage("Duplicate lesson start suppressed");
+      return;
+    }
+    conversationStartPendingRef.current = true;
     setUserError("");
     if (
       learningSource?.status !== "ready" ||
       !preparedSourceRef.current
     ) {
       addDebugMessage("Source grounding failed: a ready learning source is required");
+      conversationStartPendingRef.current = false;
       return;
     }
 
@@ -1628,11 +1952,13 @@ export default function Home() {
     const sessionStartMode: LessonSessionStartMode = continuingSavedLesson
       ? "persisted-resume"
       : "new";
+    if (continuingSavedLesson) {
+      addDebugMessage(
+        `Persisted resume requested: lesson=${savedLessonIdRef.current || "unsaved"}`,
+      );
+    }
     const persistedResumeContext = continuingSavedLesson
-      ? getPersistedResumeContext(
-          lessonStateRef.current,
-          recentTeachingContextRef.current,
-        )
+      ? getPersistedResumeContext(lessonStateRef.current)
       : null;
     const sessionInitialTeachingPreferences = { ...teachingPreferencesRef.current };
     const requestFreshToken = async () => {
@@ -1708,6 +2034,10 @@ export default function Home() {
     }
 
     const run = ++conversationRunRef.current;
+    addDebugMessage(
+      `Lesson start requested: lesson=${savedLessonIdRef.current || "unsaved"}, ` +
+      `mode=${sessionStartMode}, session=${run}`,
+    );
     setMicrophoneStatus("Requesting permission");
     setAiConnectionStatus("Not connected");
     addDebugMessage("Microphone permission requested");
@@ -1764,12 +2094,24 @@ export default function Home() {
         requestToken: requestFreshToken,
         onMessage: (message) => {
           if (isMountedRef.current && run === conversationRunRef.current) {
+            if (startupFirstProviderEventPendingRef.current) {
+              startupFirstProviderEventPendingRef.current = false;
+              addDebugMessage(
+                `First provider event after startup: session=${run}, ` +
+                `type=${describeLiveProviderEvent(message)}`,
+              );
+            }
             handleLiveMessage(message);
           }
         },
         onDebug: addDebugMessage,
         onStateChange: (state) => {
           if (!isMountedRef.current || run !== conversationRunRef.current) return;
+          if (state === "handoff" || state === "recovering") {
+            cancelActiveTeachingGeneration(`transport-${state}`);
+            playerRef.current?.clear();
+            nextGenerationIntentRef.current = { mode: "control" };
+          }
           setTransportState(state);
           setAiConnectionStatus(
             state === "active" || state === "rollover-ready"
@@ -1785,7 +2127,6 @@ export default function Home() {
             coverage,
             currentTeachingContract: getCurrentConcept(lessonStateRef.current)?.teaching,
             contractProgress: coverage.currentTeachingProgress,
-            resumePoint: lessonStateRef.current.resumePoint,
             teachingPreferences: teachingPreferencesRef.current,
           });
         },
@@ -1800,6 +2141,7 @@ export default function Home() {
         },
       });
       transportRef.current = transport;
+      addDebugMessage(`Live logical session created: session=${run}`);
       const session = await transport.connectInitial(tokenBody.token);
 
       if (!isMountedRef.current || run !== conversationRunRef.current) {
@@ -1809,9 +2151,13 @@ export default function Home() {
 
       setAiConnectionStatus("Connected");
       addDebugMessage("Live connection established");
+      addDebugMessage(`Live session opened: session=${run}`);
       sourceGroundingPendingRef.current = true;
       addDebugMessage("Source seeding started");
       if (continuingSavedLesson) {
+        persistedResumeFirstResponseLoggedRef.current = false;
+        persistedResumeFirstAudioLoggedRef.current = false;
+        persistedResumeBriefingPendingRef.current = true;
         const current = getCurrentConcept(lessonStateRef.current);
         const contractNext = current?.teaching
           ? lessonStateRef.current.teachingContractProgress[current.id]?.nextTeachingPointIndex ?? 0
@@ -1822,31 +2168,57 @@ export default function Home() {
           currentTeachingContract: getCurrentConcept(lessonStateRef.current)?.teaching,
           contractProgress: coverage.currentTeachingProgress,
           persistedResumeContext,
-          resumePoint: lessonStateRef.current.resumePoint,
           teachingPreferences: teachingPreferencesRef.current,
         });
+        addDebugMessage("Resume history completed: turnComplete=true, modelCall=no");
         addDebugMessage(
           `Persisted resume seed: concept=${persistedResumeContext?.currentConceptTitle || "current lesson topic"}, ` +
           `status=${persistedResumeContext?.currentConceptStatus || "unknown"}, ` +
-          `resumePointAvailable=${persistedResumeContext?.resumePointAvailable ? "yes" : "no"}, ` +
-          `recentContextEntries=${persistedResumeContext?.recentTeachingContext.length ?? 0}`,
+          `checkpoint=${persistedResumeContext?.lastCompletedCheckpoint?.teachingPointIndex ?? "none"}`,
         );
         addDebugMessage(
           `Persisted contract resume: concept=${current?.title || "current lesson topic"}, ` +
           `next=${contractNext}, total=${current?.teaching?.teachingPoints.length ?? 0}`,
         );
-        addDebugMessage(
-          `Persisted resume context delivered: ` +
-          `recentContextEntries=${persistedResumeContext?.recentTeachingContext.length ?? 0}, ` +
-          `resumePointAvailable=${persistedResumeContext?.resumePointAvailable ? "yes" : "no"}`,
-        );
+        addDebugMessage("Persisted checkpoint context delivered");
       } else {
         session.seedInitialSource({
           ...preparedSource,
           focus: lessonFocus,
         });
+        addDebugMessage("New lesson history completed: turnComplete=true, modelCall=no");
       }
       addDebugMessage("Source seeded into Live context");
+      addDebugMessage(`Initial history seeded: session=${run}`);
+      const initialTeachingControl = continuingSavedLesson
+        ? PERSISTED_LESSON_RESUME_CONTROL
+        : `Begin the source-grounded spoken lesson now. Identify the uploaded material as "${tokenBody.source.name}", briefly preview what you will cover, then teach the first concept${
+          lessonFocus ? ` related to ${lessonFocus}` : " from the source"
+        }.`;
+      startupSessionRef.current = run;
+      nextGenerationIntentRef.current = currentTeachingIntent();
+      pendingTurnOriginRef.current = "app-control";
+      startupFirstProviderEventPendingRef.current = true;
+      startupFirstAudioPendingRef.current = true;
+      const initialTriggerSent = transport.sendRealtimeInput({
+        text: initialTeachingControl,
+      });
+      if (!initialTriggerSent) {
+        startupFirstProviderEventPendingRef.current = false;
+        startupFirstAudioPendingRef.current = false;
+        addDebugMessage(
+          `Initial teaching trigger not sent: session=${run}, reason=transport-not-ready`,
+        );
+        throw new Error("The Live connection was not ready for the lesson start request");
+      }
+      addDebugMessage(
+        `Realtime startup input sent: session=${run}, trigger=${sessionStartMode}, count=1`,
+      );
+      if (continuingSavedLesson) {
+        addDebugMessage(
+          `Persisted resume realtime trigger sent: session=${run}`,
+        );
+      }
       addDebugMessage("Source grounding ready");
 
       const microphoneStreamer = new MicrophonePcmStreamer(stream, (chunk) => {
@@ -1879,34 +2251,24 @@ export default function Home() {
       setResumeExistingLesson(true);
       addDebugMessage("Lesson started");
       lessonActiveRef.current = true;
+      conversationStartPendingRef.current = false;
       beginIdleMonitoring();
       void requestWakeLock();
       if (sessionStartMode === "persisted-resume") {
         const current = getCurrentConcept(lessonStateRef.current);
-        const resumePoint = lessonStateRef.current.resumePoint.trim();
         addDebugMessage("Persisted lesson continuation started");
         addDebugMessage(`Resume briefing requested: concept=${current?.title || "current lesson topic"}`);
-        addDebugMessage(`Resume point available: ${resumePoint ? "yes" : "no"}`);
         addDebugMessage(
           `Teaching preferences on resume: depth=${sessionInitialTeachingPreferences.explanationDepth}, ` +
           `speakingSpeed=${sessionInitialTeachingPreferences.speakingSpeed}`,
         );
-        persistedResumeFirstResponseLoggedRef.current = false;
-        persistedResumeBriefingPendingRef.current = transport.sendLearnerText(
-          PERSISTED_LESSON_RESUME_CONTROL,
-        );
         if (persistedResumeBriefingPendingRef.current) {
           addDebugMessage("Resume briefing control sent");
         }
-      } else {
-        transport.sendRealtimeInput({
-          text: `Begin the source-grounded spoken lesson now. Identify the uploaded material as "${tokenBody.source.name}", briefly preview what you will cover, then teach the first concept${
-            lessonFocus ? ` related to ${lessonFocus}` : " from the source"
-          }.`,
-        });
       }
     } catch (error) {
       if (!isMountedRef.current || run !== conversationRunRef.current) return;
+      conversationStartPendingRef.current = false;
 
       const permissionDenied =
         error instanceof DOMException &&
@@ -1946,24 +2308,11 @@ export default function Home() {
     conversationRunRef.current += 1;
     const hadMicrophone = Boolean(streamRef.current);
     const hadSession = Boolean(transportRef.current);
-    const currentBeforeStop = getCurrentConcept(lessonStateRef.current);
-    const checkpoint = deriveResumePoint(assistantTranscriptRef.current, "");
-    const checkpointMatchesCurrent = Boolean(
-      checkpoint && currentBeforeStop &&
-      assistantCheckpointConceptIdRef.current === currentBeforeStop.id,
-    );
-    if (checkpointMatchesCurrent) {
-      updateRecentTeachingContext(
-        assistantCheckpointConceptIdRef.current,
-        assistantTranscriptRef.current,
-      );
-    }
-    const stoppedLessonState = pauseLessonState(
-      lessonStateRef.current,
-      checkpointMatchesCurrent && currentBeforeStop
-        ? { conceptId: currentBeforeStop.id, resumePoint: checkpoint }
-        : undefined,
-    );
+    const pending = activeTeachingGenerationRef.current;
+    cancelActiveTeachingGeneration("end-lesson");
+    cancelActiveTeachingGeneration("navigation");
+    playerRef.current?.clear();
+    const stoppedLessonState = pauseLessonState(lessonStateRef.current);
     const persistedCurrent = getCurrentConcept(stoppedLessonState);
     setMicrophoneStatus("Not active");
     setAiConnectionStatus("Not connected");
@@ -1973,8 +2322,7 @@ export default function Home() {
       `Persisting resume state: concept=${persistedCurrent
         ? `${persistedCurrent.id}/${persistedCurrent.title}`
         : "none"}, status=${persistedCurrent?.status || "none"}, ` +
-      `resumePointAvailable=${stoppedLessonState.resumePoint ? "yes" : "no"}, ` +
-      `recentContextEntries=${recentTeachingContextRef.current.length}`,
+      `pending=${pending?.progressRequested ? pending.teachingPointIndex : "none"}, partialOutputPersisted=no`,
     );
     if (persistedCurrent?.teaching) {
       addDebugMessage(
@@ -1999,8 +2347,10 @@ export default function Home() {
   const microphoneActive = microphoneStatus === "Active";
   const aiConnected = aiConnectionStatus === "Connected";
   const requestingPermission = microphoneStatus === "Requesting permission";
-  const currentTeachingContract = getCurrentConcept(lessonState)?.teaching;
-  const currentConcept = getCurrentConcept(lessonState);
+  const currentConcept = lessonState.currentNodeId
+    ? lessonState.nodes[lessonState.currentNodeId]
+    : undefined;
+  const currentTeachingContract = currentConcept?.teaching;
   const lessonActive = microphoneActive || requestingPermission || aiConnected;
 
   const requestInstall = async () => {
@@ -2056,6 +2406,21 @@ export default function Home() {
           />
         )}
 
+        <ProcessingQueue
+          jobs={processingQueue.jobs}
+          lessonActive={lessonActive}
+          onStudy={(lessonId, job) => {
+            void processingQueue.discard(job).then(() => selectSavedLesson(lessonId));
+          }}
+          onRetry={(job) => void processingQueue.retry(job)}
+          onReselect={(job, files) => void processingQueue.reselect(job, files).catch((error) => {
+            setPersistenceNotice(error instanceof Error ? error.message : "Those sources did not match the queued lesson.");
+          })}
+          onDiscard={(job) => void processingQueue.discard(job).catch(() => {
+            setPersistenceNotice("The queued lesson could not be discarded safely.");
+          })}
+        />
+
         <div className="setup-only">
           <LearningSourceUpload
             source={learningSource}
@@ -2064,6 +2429,8 @@ export default function Home() {
             onChange={handleLearningSourceChange}
             onSourcesChange={handleLessonSourcesChange}
             onRetrySourceUpload={retrySourceUpload}
+            cloudUserId={cloudUserId}
+            onQueueBundle={processingQueue.enqueue}
             onPreparedChange={handlePreparedSourceChange}
             onDebug={addDebugMessage}
           />
@@ -2242,12 +2609,54 @@ export default function Home() {
               <dd>{lessonState.status}</dd>
             </div>
             <div>
-              <dt>Current concept</dt>
-              <dd>{getCurrentConcept(lessonState)?.title || "-"}</dd>
+              <dt>Current node ID</dt>
+              <dd>{lessonState.currentNodeId || "-"}</dd>
             </div>
             <div>
-              <dt>Resume point</dt>
-              <dd>{lessonState.resumePoint || "-"}</dd>
+              <dt>Current concept</dt>
+              <dd>{currentConcept?.title || "-"}</dd>
+            </div>
+            <div>
+              <dt>Teaching progress</dt>
+              <dd>{currentTeachingContract
+                ? `${lessonState.teachingContractProgress[currentConcept?.id ?? ""]?.nextTeachingPointIndex ?? 0} / ${currentTeachingContract.teachingPoints.length} points heard`
+                : "-"}</dd>
+            </div>
+            <div>
+              <dt>Current authoritative point</dt>
+              <dd>{currentConcept?.id
+                ? lessonState.teachingContractProgress[currentConcept.id]?.nextTeachingPointIndex ?? 0
+                : "-"}</dd>
+            </div>
+            <div>
+              <dt>Last completed point</dt>
+              <dd>{currentConcept?.id
+                ? lessonState.teachingContractProgress[currentConcept.id]?.lastCompletedCheckpoint?.teachingPoint ?? "-"
+                : "-"}</dd>
+            </div>
+            <div>
+              <dt>Checkpoint transcript</dt>
+              <dd>{currentConcept?.id
+                ? lessonState.teachingContractProgress[currentConcept.id]?.lastCompletedCheckpoint?.transcriptExcerpt ?? "-"
+                : "-"}</dd>
+            </div>
+            <div>
+              <dt>Generation mode</dt>
+              <dd>{generationDiagnostic?.mode ?? "-"}</dd>
+            </div>
+            <div>
+              <dt>Active teaching point</dt>
+              <dd>{generationDiagnostic?.teachingPointIndex ?? "-"}</dd>
+            </div>
+            <div>
+              <dt>Progress requested</dt>
+              <dd>{generationDiagnostic ? (generationDiagnostic.progressRequested ? "yes" : "no") : "-"}</dd>
+            </div>
+            <div>
+              <dt>Generation / playback complete</dt>
+              <dd>{generationDiagnostic
+                ? `${generationDiagnostic.generationComplete ? "yes" : "no"} / ${generationDiagnostic.playbackComplete ? "yes" : "no"}`
+                : "-"}</dd>
             </div>
             <div>
               <dt>Interruptions</dt>

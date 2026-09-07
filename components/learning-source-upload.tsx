@@ -1,12 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState, type ChangeEvent } from "react";
+import { useEffect, useState, type ChangeEvent } from "react";
 import {
-  MAX_LESSON_SOURCES, MAX_SOURCE_BUNDLE_BYTES, MAX_SOURCE_BYTES, SUPPORTED_SOURCE_TYPES,
-  type LearningSource, type LessonSource, type LessonSourceRole, type LessonTreeItem,
+  MAX_CLOUD_SOURCE_BUNDLE_BYTES, MAX_LESSON_SOURCES, MAX_SOURCE_BUNDLE_BYTES, MAX_SOURCE_BYTES, SUPPORTED_SOURCE_TYPES,
+  type LearningSource, type LessonSource, type LessonSourceRole,
   type PreparedLearningSource, type SupportedSourceType,
 } from "../lib/learning-source";
-import { isSourceProcessingErrorResponse } from "../lib/source-processing-error";
 
 type Props = {
   source: LearningSource | null; sources: LessonSource[]; disabled: boolean;
@@ -14,11 +13,11 @@ type Props = {
   onSourcesChange: (sources: LessonSource[], files: Map<string, File>) => void;
   onPreparedChange: (source: PreparedLearningSource | null) => void;
   onRetrySourceUpload: () => void;
+  cloudUserId: string | null;
+  onQueueBundle: (sources: LessonSource[], files: Map<string, File>, title: string) => Promise<void>;
   onDebug: (message: string) => void;
 };
-type BundleResponse = { lessonTitle?: string; structuredText?: string; lessonTree?: LessonTreeItem[]; model?: string };
 type SelectedSource = { metadata: LessonSource; file: File };
-const CLIENT_TIMEOUT_MS = 315_000;
 
 function inferRole(name: string): LessonSourceRole {
   const normalized = name.toLowerCase();
@@ -36,11 +35,9 @@ function aggregateName(sources: LessonSource[], title?: string) {
   return sources[0]?.name.replace(/\.(pdf|txt)$/i, "").replace(/\b(slides?|transcript|notes?|summary)\b/ig, "").trim() || `${sources.length} source lesson`;
 }
 
-export function LearningSourceUpload({ source, sources, disabled, onChange, onSourcesChange, onPreparedChange, onRetrySourceUpload, onDebug }: Props) {
+export function LearningSourceUpload({ source, sources, disabled, onChange, onSourcesChange, onPreparedChange, onRetrySourceUpload, cloudUserId, onQueueBundle, onDebug }: Props) {
   const [selected, setSelected] = useState<SelectedSource[]>([]);
   const [failure, setFailure] = useState<{ message: string; retryable: boolean } | null>(null);
-  const requestRef = useRef<AbortController | null>(null);
-  useEffect(() => () => requestRef.current?.abort(), []);
   useEffect(() => {
     if (!sources.length) setSelected([]);
     else setSelected((current) => current.map((item) => ({ ...item, metadata: sources.find((source) => source.id === item.metadata.id) ?? item.metadata })));
@@ -64,7 +61,8 @@ export function LearningSourceUpload({ source, sources, disabled, onChange, onSo
     const next = [...selected, ...accepted]; if (!next.length) return;
     publish(next); onPreparedChange(null);
     const total = next.reduce((n, i) => n + i.file.size, 0);
-    setFailure(total > MAX_SOURCE_BUNDLE_BYTES ? { message: "This bundle exceeds the 4 MB deployed request limit. Remove one or more sources.", retryable: false } : null);
+    const limit = cloudUserId ? MAX_CLOUD_SOURCE_BUNDLE_BYTES : MAX_SOURCE_BUNDLE_BYTES;
+    setFailure(total > limit ? { message: `This bundle exceeds the ${cloudUserId ? "40" : "4"} MB ${cloudUserId ? "cloud" : "signed-out"} limit. Remove one or more sources.`, retryable: false } : null);
     onChange({ name: aggregateName(next.map(i => i.metadata)), mimeType: next[0].metadata.mimeType, sizeBytes: total, status: "preparing" });
     onDebug(`Source bundle selected: sources=${next.length}, pdfs=${next.filter(i => i.file.type === "application/pdf").length}, txt=${next.filter(i => i.file.type === "text/plain").length}, totalBytes=${total}`);
   };
@@ -80,40 +78,25 @@ export function LearningSourceUpload({ source, sources, disabled, onChange, onSo
   const processBundle = async () => {
     if (!selected.length) return;
     const total = selected.reduce((n, i) => n + i.file.size, 0);
-    if (total > MAX_SOURCE_BUNDLE_BYTES) { const message = "This bundle exceeds the 4 MB deployed request limit."; setFailure({ message, retryable: false }); onChange({ name: aggregateName(sources), mimeType: selected[0].metadata.mimeType, sizeBytes: total, status: "error", error: message }); return; }
-    setFailure(null); onPreparedChange(null);
-    onChange({ name: aggregateName(sources), mimeType: selected[0].metadata.mimeType, sizeBytes: total, status: "processing" });
-    onDebug(`Lesson source preprocessing started: sources=${selected.length}`);
-    const controller = new AbortController(); requestRef.current = controller;
-    const timer = window.setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
+    const limit = cloudUserId ? MAX_CLOUD_SOURCE_BUNDLE_BYTES : MAX_SOURCE_BUNDLE_BYTES;
+    if (total > limit) { const message = `This bundle exceeds the ${cloudUserId ? "40" : "4"} MB limit.`; setFailure({ message, retryable: false }); onChange({ name: aggregateName(sources), mimeType: selected[0].metadata.mimeType, sizeBytes: total, status: "error", error: message }); return; }
     try {
-      const form = new FormData(); form.append("metadata", JSON.stringify(selected.map(i => i.metadata)));
-      selected.forEach(i => form.append("sources", i.file, i.file.name));
-      const response = await fetch("/api/lesson-sources", { method: "POST", body: form, signal: controller.signal });
-      const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) { if (isSourceProcessingErrorResponse(body)) throw body; throw { message: "The source bundle could not be processed.", retryable: response.status >= 500 }; }
-      const result = body as BundleResponse;
-      if (!result.structuredText?.trim() || !result.lessonTree?.length) throw { message: "The model returned no usable lesson material.", retryable: false };
-      const name = aggregateName(sources, result.lessonTitle);
-      onPreparedChange({ name, mimeType: selected[0].metadata.mimeType, text: result.structuredText, lessonTree: result.lessonTree });
-      onChange({ name, mimeType: selected[0].metadata.mimeType, sizeBytes: total, status: "ready" });
-      onDebug(`Bundle preprocessing completed: model=${result.model || "server-selected"}, sources=${selected.length}`);
+      await onQueueBundle(selected.map((item) => item.metadata), new Map(selected.map((item) => [item.metadata.id, item.file])), aggregateName(selected.map((item) => item.metadata)));
+      setSelected([]); setFailure(null); onSourcesChange([], new Map()); onPreparedChange(null); onChange(null);
+      return;
     } catch (error) {
-      const retryable = Boolean(error && typeof error === "object" && "retryable" in error && error.retryable);
-      const message = error && typeof error === "object" && "message" in error && typeof error.message === "string" ? error.message : "A network error interrupted source processing.";
-      setFailure({ message, retryable: retryable || error instanceof DOMException });
-      onChange({ name: aggregateName(sources), mimeType: selected[0].metadata.mimeType, sizeBytes: total, status: "error", error: message });
-      onDebug(`Bundle preprocessing failed: retryable=${retryable ? "yes" : "no"}`);
-    } finally { window.clearTimeout(timer); if (requestRef.current === controller) requestRef.current = null; }
+      setFailure({ message: error instanceof Error ? error.message : "The lesson could not be queued.", retryable: true });
+      return;
+    }
   };
   const totalBytes = selected.reduce((n, i) => n + i.file.size, 0);
   return <section className="source-upload" aria-labelledby="source-upload-title">
-    <div className="source-upload-heading"><div><h2 id="source-upload-title">Sources</h2><p>Choose up to {MAX_LESSON_SOURCES} PDFs or TXT files. 20 MB per file; {formatBytes(MAX_SOURCE_BUNDLE_BYTES)} total.</p></div><span className={`source-status source-status-${source?.status || "none"}`}>{source ? source.status : "No material"}</span></div>
+    <div className="source-upload-heading"><div><h2 id="source-upload-title">Sources</h2><p>Choose up to {MAX_LESSON_SOURCES} PDFs or TXT files. 20 MB per file; {formatBytes(cloudUserId ? MAX_CLOUD_SOURCE_BUNDLE_BYTES : MAX_SOURCE_BUNDLE_BYTES)} total. {!cloudUserId && "Sign in for larger durable jobs."}</p></div><span className={`source-status source-status-${source?.status || "none"}`}>{source ? source.status : "No material"}</span></div>
     {selected.map(({ metadata }) => <div className="source-details" key={metadata.id}><div><strong>{metadata.name}</strong><small>{metadata.mimeType === "application/pdf" ? "PDF" : "TXT"} · {formatBytes(metadata.sizeBytes)}</small><small>{metadata.storageStatus === "stored" ? "Stored in cloud" : metadata.storageStatus === "error" ? "Cloud upload failed" : metadata.storageStatus === "uploading" ? "Uploading to cloud…" : "Local original"}</small></div><div className="source-actions"><select aria-label={`Role for ${metadata.name}`} value={metadata.role} onChange={e => updateRole(metadata.id, e.target.value as LessonSourceRole)} disabled={disabled || source?.status === "processing" || source?.status === "ready"}><option value="slides">Slides</option><option value="transcript">Transcript</option><option value="notes">Notes</option><option value="other">Other</option></select><button type="button" className="source-remove" onClick={() => remove(metadata.id)} disabled={disabled || source?.status === "processing" || source?.status === "ready"}>Remove</button></div></div>)}
     <input className="source-file-input" type="file" multiple accept="application/pdf,text/plain,.pdf,.txt" onChange={selectFiles} disabled={disabled || selected.length >= MAX_LESSON_SOURCES || source?.status === "processing" || source?.status === "ready"} />
     {selected.length > 0 && <p className="source-bundle-total">{selected.length} source{selected.length === 1 ? "" : "s"} · {formatBytes(totalBytes)} total</p>}
     {failure && <p className="source-error" role="alert">{failure.message}</p>}
     {sources.some((item) => item.storageStatus === "error") && <button type="button" className="source-retry" onClick={onRetrySourceUpload} disabled={disabled}>Retry source upload</button>}
-    {selected.length > 0 && source?.status !== "ready" && <button type="button" className="source-retry" onClick={() => void processBundle()} disabled={disabled || source?.status === "processing" || totalBytes > MAX_SOURCE_BUNDLE_BYTES}>{source?.status === "processing" ? "Processing lesson…" : failure?.retryable ? "Retry processing" : "Process lesson"}</button>}
+    {selected.length > 0 && source?.status !== "ready" && <button type="button" className="source-retry" onClick={() => void processBundle()} disabled={disabled || source?.status === "processing" || totalBytes > (cloudUserId ? MAX_CLOUD_SOURCE_BUNDLE_BYTES : MAX_SOURCE_BUNDLE_BYTES)}>Add lesson to queue</button>}
   </section>;
 }

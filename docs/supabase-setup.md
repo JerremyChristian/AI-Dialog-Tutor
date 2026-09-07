@@ -1,6 +1,6 @@
 # Supabase cloud foundation setup
 
-M6.4 adds optional authentication and secured cloud infrastructure. M6.5 synchronizes account-owned lesson snapshots while IndexedDB remains the immediate local cache. M6.6 uploads original files for newly processed signed-in lessons to the private `lesson-sources` bucket.
+M6.4 adds optional authentication and secured cloud infrastructure. M6.5 synchronizes account-owned lesson snapshots while IndexedDB remains the immediate local cache. M6.6 uploads original files for signed-in lessons. M6.8 uploads sources before preprocessing and keeps a client-driven processing queue in IndexedDB.
 
 ## Configure Supabase
 
@@ -37,7 +37,9 @@ Add both public Supabase values to the required Development, Preview, and Produc
 ## Boundaries and verification
 
 - Account-owned lesson snapshots are synchronized to `public.lessons`; Recent Lessons still renders from the scoped IndexedDB cache.
-- Original PDF/TXT files for newly processed signed-in lessons are uploaded after preprocessing succeeds. Metadata is upserted into `lesson_sources`; raw bytes are never included in lesson snapshot JSON.
+- Original PDF/TXT files for newly queued signed-in lessons are uploaded before preprocessing. Metadata is upserted into `lesson_sources` only after finalization; raw bytes are never included in lesson snapshot JSON.
+- New signed-in jobs now upload directly from the browser to private Storage with resumable TUS uploads, then send only source metadata and paths to the preprocessing route. Storage objects can safely precede the `lessons` row because object policies are scoped to the authenticated user's first path segment. The `lesson_sources` rows are still created only after the completed `lessons` row exists.
+- The processing queue is local IndexedDB state, not a server worker. It resumes when the same account reopens the app, but does not execute while the browser/PWA is suspended or closed.
 - Signed-out lessons and old imported lessons without their original browser `File` remain fully usable from their processed snapshots, but their original files cannot be restored for future visuals.
 - Signing out never deletes local lessons.
 - Existing unowned local lessons require the explicit “Sync local lessons to this account” action. They are never silently claimed at sign-in.

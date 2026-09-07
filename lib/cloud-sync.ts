@@ -1,5 +1,8 @@
 import type { SupabaseClient, User } from "@supabase/supabase-js";
+import { Upload } from "tus-js-client";
 import { createSupabaseBrowserClient } from "./supabase/client";
+import { getSupabasePublicConfig } from "./supabase/config";
+import type { LessonSource } from "./learning-source";
 import {
   SAVED_LESSON_SCHEMA_VERSION,
   deleteSavedLesson,
@@ -185,6 +188,30 @@ export function uploadCloudLesson(
   });
 }
 
+export function finalizeCloudLesson(
+  lesson: SavedLesson,
+  expectedUserId: string,
+  debug?: (message: string) => void,
+) {
+  return serialize(async () => {
+    const { client, user } = await authenticatedClient(expectedUserId);
+    const { data, error } = await client.from("lessons")
+      .select("id,user_id,title,lesson_focus,has_started,snapshot_schema_version,snapshot,created_at,updated_at")
+      .eq("id", lesson.id).maybeSingle();
+    if (error) throw new Error("cloud-finalize-lookup-failed");
+    if (data) {
+      const existing = parseCloudRow(data as CloudLessonRow, user.id);
+      if (!existing || getSavedLessonContentSignature(existing) !== getSavedLessonContentSignature(lesson)) {
+        throw new Error("cloud-finalize-identity-conflict");
+      }
+      const recovered = { ...lesson, updatedAt: existing.updatedAt, cloudSync: existing.cloudSync };
+      await saveSavedLesson(recovered);
+      return recovered;
+    }
+    return uploadLesson(client, user, lesson, debug);
+  });
+}
+
 function safeFilename(value: string) {
   const cleaned = value.split(/[\\/]/).at(-1)?.normalize("NFKC")
     .replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 120);
@@ -241,6 +268,66 @@ export async function downloadCloudLessonSource(source: { storagePath?: string |
   const { data, error } = await client.storage.from("lesson-sources").download(source.storagePath);
   if (error || !data) throw new Error("cloud-source-download-failed");
   return data;
+}
+
+export async function createQueuedSourceUpload(
+  file: File,
+  source: LessonSource,
+  lessonId: string,
+  expectedUserId: string,
+) {
+  const { client, user } = await authenticatedClient(expectedUserId);
+  const config = getSupabasePublicConfig();
+  if (!config || user.id !== expectedUserId || !isUuid(lessonId) || !isUuid(source.id)) throw new Error("cloud-source-upload-invalid");
+  const { data, error } = await client.auth.getSession();
+  if (error || !data.session?.access_token) throw new Error("cloud-auth-required");
+  const storagePath = `${user.id}/${lessonId}/${source.id}/${safeFilename(source.name)}`;
+  let upload!: Upload;
+  const promise = new Promise<string>((resolve, reject) => {
+    upload = new Upload(file, {
+      endpoint: resumableUploadEndpoint(config.url),
+      headers: { authorization: `Bearer ${data.session!.access_token}`, "x-upsert": "true" },
+      metadata: { bucketName: "lesson-sources", objectName: storagePath, contentType: source.mimeType, cacheControl: "3600" },
+      uploadDataDuringCreation: true,
+      removeFingerprintOnSuccess: true,
+      chunkSize: 6 * 1024 * 1024,
+      retryDelays: [0, 3_000, 5_000, 10_000],
+      onError: reject,
+      onSuccess: () => resolve(storagePath),
+    });
+    upload.start();
+  });
+  return { promise, abort: () => upload.abort(true) };
+}
+
+function resumableUploadEndpoint(projectUrl: string) {
+  const url = new URL(projectUrl);
+  if (url.hostname.endsWith(".supabase.co")) {
+    const projectRef = url.hostname.split(".")[0];
+    return `${url.protocol}//${projectRef}.storage.supabase.co/storage/v1/upload/resumable`;
+  }
+  return `${projectUrl.replace(/\/$/, "")}/storage/v1/upload/resumable`;
+}
+
+export async function upsertStoredLessonSources(lesson: SavedLesson, expectedUserId: string, debug?: (message: string) => void) {
+  const { client, user } = await authenticatedClient(expectedUserId);
+  if (lesson.cloudOwnerId !== user.id) throw new Error("cloud-lesson-ownership-invalid");
+  const rows = lesson.sources.filter((source) => source.storageStatus === "stored" && source.storagePath).map((source) => ({
+    id: source.id, lesson_id: lesson.id, user_id: user.id, name: source.name, mime_type: source.mimeType,
+    size_bytes: source.sizeBytes, storage_path: source.storagePath!, role: source.role,
+  }));
+  if (!rows.length) return;
+  const { error } = await client.from("lesson_sources").upsert(rows, { onConflict: "id" });
+  if (error) throw new Error("cloud-source-row-upsert-failed");
+  rows.forEach((row) => debug?.(`lesson_sources row upserted: source=${row.id}`));
+}
+
+export async function deletePreLessonSourceObjects(paths: string[], expectedUserId: string) {
+  if (!paths.length) return;
+  const { client, user } = await authenticatedClient(expectedUserId);
+  if (paths.some((path) => path.split("/")[0] !== user.id)) throw new Error("cloud-source-path-invalid");
+  const { error } = await client.storage.from("lesson-sources").remove(paths);
+  if (error) throw new Error("cloud-source-storage-delete-failed");
 }
 
 function parseCloudRow(row: CloudLessonRow, ownerId: string): SavedLesson | null {

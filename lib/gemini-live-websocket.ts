@@ -11,6 +11,7 @@ type LiveCallbacks = {
   onMessage: (message: LiveServerMessage) => void;
   onError: (message: string) => void;
   onClose: (details: { code: number; reason: string }) => void;
+  onDebug: (message: string) => void;
 };
 
 type SetupConfig = {
@@ -50,7 +51,7 @@ function buildLiveSetup(config: SetupConfig) {
           {
             name: "lesson_state",
             description:
-              "Synchronize authoritative hierarchical lesson coverage and teaching-contract progress. After fully delivering one ordered teaching point, call progress for that point. Use navigate only for explicit learner-directed movement, skip for explicit subtree skipping, complete only after all teaching points are reported and the current atomic concept is meaningfully finished, and query for authoritative state. A successful complete automatically advances to the next eligible atomic concept.",
+              "Synchronize authoritative lesson coverage. A structured teaching response is assigned at most one point. After generating that point, call progress once with afterDelivery; this only registers pending completion until local audio naturally drains. Never teach another point after the result. Use navigate only for learner-directed movement, skip for explicit skipping, complete only when queried state proves the contract complete, and query for authoritative state.",
             parametersJsonSchema: {
               type: "object",
               properties: {
@@ -67,10 +68,32 @@ function buildLiveSetup(config: SetupConfig) {
                   type: "integer",
                   minimum: 0,
                   description:
-                    "Zero-based teachingPoints array index just fully delivered. Required only for progress.",
+                    "Zero-based teachingPoints array index generated in this assigned teaching generation. Required only for progress.",
+                },
+                afterDelivery: {
+                  type: "string",
+                  enum: ["continue", "await-learner"],
+                  description:
+                    "Normal interactive teaching must use await-learner. Continue is reserved for a future explicit lecture mode and is currently overridden by the application.",
                 },
               },
               required: ["action"],
+              additionalProperties: false,
+            },
+          },
+          {
+            name: "learner_turn_intent",
+            description:
+              "Route each real post-start learner turn before producing learner-facing output. Use continue for acknowledgements/readiness to proceed, clarify for substantive questions, repeat for re-explanation requests, query-state for lesson-position/coverage questions, and other otherwise. This does not advance lesson progress.",
+            parametersJsonSchema: {
+              type: "object",
+              properties: {
+                intent: {
+                  type: "string",
+                  enum: ["continue", "clarify", "repeat", "query-state", "other"],
+                },
+              },
+              required: ["intent"],
               additionalProperties: false,
             },
           },
@@ -145,6 +168,7 @@ export class GeminiLiveWebSocket {
 
             if ("setupComplete" in message && !setupComplete) {
               setupComplete = true;
+              this.callbacks.onDebug("Live setupComplete received");
               resolve();
               return;
             }
@@ -209,15 +233,22 @@ export class GeminiLiveWebSocket {
             parts,
           },
         ],
-        // With initialHistoryInClientContent enabled, this completes history
-        // processing without triggering generation. Realtime input may begin
-        // only after this history-completion marker has been sent.
+        // With initialHistoryInClientContent enabled, this true value completes
+        // initial-history ingestion without invoking the model. Realtime input
+        // may only begin after this history-completion boundary.
         turnComplete: true,
       },
     });
+    this.callbacks.onDebug(
+      "clientContent sent: sequence=1, turns=1, roles=[user], parts=[text], " +
+      "finalRole=user, hasStartupInstruction=no, turnComplete=true, purpose=initial-history",
+    );
   }
 
-  seedRecoveryContext(source: InitialSource, lessonSnapshot: unknown) {
+  seedRecoveryContext(
+    source: InitialSource,
+    lessonSnapshot: unknown,
+  ) {
     const currentSource = source.mimeType === "application/pdf" ? "PDF" : "PLAIN_TEXT";
     this.send({
       clientContent: {
@@ -227,9 +258,15 @@ export class GeminiLiveWebSocket {
             text: `RECOVERED_APPLICATION_CONTEXT. Continue the existing spoken lesson naturally; do not greet or restart it. The application lesson state below is authoritative.\n\nSOURCE_FILENAME:\n${source.name}\n\nSOURCE_TYPE:\n${currentSource}\n\nLESSON_STATE:\n${JSON.stringify(lessonSnapshot)}\n\nBEGIN SOURCE_CONTENT\n${source.text}\nEND SOURCE_CONTENT`,
           }],
         }],
+        // This completes initial history but does not invoke the model because
+        // initialHistoryInClientContent is enabled for every fresh socket.
         turnComplete: true,
       },
     });
+    this.callbacks.onDebug(
+      "clientContent sent: sequence=1, turns=1, roles=[user], parts=[text], " +
+      "finalRole=user, hasStartupInstruction=no, turnComplete=true, purpose=recovery-history",
+    );
   }
 
   sendRealtimeInput(input: Record<string, unknown>) {

@@ -2,11 +2,13 @@ import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { NextResponse } from "next/server";
 import {
   MAX_LESSON_SOURCES,
+  MAX_CLOUD_SOURCE_BUNDLE_BYTES,
   MAX_SOURCE_BUNDLE_BYTES,
   MAX_SOURCE_BYTES,
   SUPPORTED_SOURCE_TYPES,
   type LessonSource,
 } from "../../../lib/learning-source";
+import { createSupabaseServerClient } from "../../../lib/supabase/server";
 import { normalizeLessonTree } from "../../../lib/lesson-outline";
 import type { SourceProcessingErrorCode, SourceProcessingErrorResponse } from "../../../lib/source-processing-error";
 
@@ -18,7 +20,7 @@ const MODELS = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gem
 const MODEL_TIMEOUT_MS = 180_000;
 const OPERATION_TIMEOUT_MS = 300_000;
 
-type SourceDescriptor = Pick<LessonSource, "id" | "name" | "mimeType" | "sizeBytes" | "role">;
+type SourceDescriptor = Pick<LessonSource, "id" | "name" | "mimeType" | "sizeBytes" | "role"> & { storagePath?: string };
 
 function failure(code: SourceProcessingErrorCode, retryable: boolean, message: string, status: number) {
   return NextResponse.json<SourceProcessingErrorResponse>({ code, retryable, message }, { status });
@@ -116,13 +118,40 @@ Use structured sourceReferences with an exact sourceId from the catalog. PDF pag
 export async function POST(request: Request) {
   if (!process.env.GEMINI_API_KEY) return failure("UNKNOWN", false, "Source processing is unavailable.", 500);
   try {
-    const form = await request.formData();
-    const descriptors = parseDescriptors(form.get("metadata"));
-    const files = form.getAll("sources");
-    if (!descriptors || files.length !== descriptors.length || !files.every((file) => file instanceof File)) {
-      return failure("INVALID_SOURCE", false, "Select between 1 and 6 PDF or TXT sources.", 400);
+    const storageFirst = request.headers.get("content-type")?.includes("application/json") ?? false;
+    let descriptors: SourceDescriptor[] | null;
+    let typedFiles: File[];
+    let lessonId: string | null = null;
+    if (storageFirst) {
+      const body = await request.json() as { lessonId?: unknown; sources?: unknown };
+      lessonId = typeof body.lessonId === "string" && isUuid(body.lessonId) ? body.lessonId : null;
+      descriptors = parseDescriptors(JSON.stringify(body.sources));
+      if (!lessonId || !descriptors || descriptors.some((source) => typeof source.storagePath !== "string")) {
+        return failure("INVALID_SOURCE", false, "Stored source metadata is invalid.", 400);
+      }
+      const supabase = await createSupabaseServerClient();
+      const { data: auth, error: authError } = supabase ? await supabase.auth.getUser() : { data: { user: null }, error: new Error("unavailable") };
+      if (authError || !auth.user) return failure("INVALID_SOURCE", false, "Sign in to process stored sources.", 401);
+      typedFiles = [];
+      for (const descriptor of descriptors) {
+        const segments = descriptor.storagePath!.split("/");
+        if (segments.length !== 4 || segments[0] !== auth.user.id || segments[1] !== lessonId || segments[2] !== descriptor.id || !segments[3]) {
+          return failure("INVALID_SOURCE", false, "A stored source path is outside this lesson.", 403);
+        }
+        const { data: blob, error } = await supabase!.storage.from("lesson-sources").download(descriptor.storagePath!);
+        if (error || !blob || blob.size !== descriptor.sizeBytes) return failure("INVALID_SOURCE", false, `Stored source ${descriptor.name} is unavailable or changed.`, 422);
+        typedFiles.push(new File([blob], descriptor.name, { type: descriptor.mimeType }));
+      }
+      console.info(`Storage-first preprocessing request: lesson=${lessonId}, sources=${descriptors.length}, rawBrowserPayload=no`);
+    } else {
+      const form = await request.formData();
+      descriptors = parseDescriptors(form.get("metadata"));
+      const files = form.getAll("sources");
+      if (!descriptors || files.length !== descriptors.length || !files.every((file) => file instanceof File)) {
+        return failure("INVALID_SOURCE", false, "Select between 1 and 6 PDF or TXT sources.", 400);
+      }
+      typedFiles = files as File[];
     }
-    const typedFiles = files as File[];
     let totalBytes = 0;
     const contents: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [{ text: prompt(descriptors) }];
     for (const [index, descriptor] of descriptors.entries()) {
@@ -131,7 +160,8 @@ export async function POST(request: Request) {
         return failure("INVALID_SOURCE", false, "Source metadata does not match the selected files.", 400);
       }
       totalBytes += file.size;
-      if (totalBytes > MAX_SOURCE_BUNDLE_BYTES) return failure("INVALID_SOURCE", false, "The source bundle exceeds the 4 MB deployed request limit.", 413);
+      const bundleLimit = storageFirst ? MAX_CLOUD_SOURCE_BUNDLE_BYTES : MAX_SOURCE_BUNDLE_BYTES;
+      if (totalBytes > bundleLimit) return failure("INVALID_SOURCE", false, `The source bundle exceeds the ${storageFirst ? "40" : "4"} MB limit.`, 413);
       const bytes = await file.arrayBuffer();
       if (descriptor.mimeType === "application/pdf") {
         if (new TextDecoder("ascii").decode(bytes.slice(0, 5)) !== "%PDF-") return failure("INVALID_SOURCE", false, `${file.name} is not a valid PDF.`, 400);
@@ -143,8 +173,8 @@ export async function POST(request: Request) {
         contents.push({ text: `SOURCE id=${descriptor.id} role=${descriptor.role} name=${descriptor.name}\n\n${text}` });
       }
     }
-    console.info(`Source bundle selected: sources=${files.length}, pdfs=${descriptors.filter(s => s.mimeType === "application/pdf").length}, txt=${descriptors.filter(s => s.mimeType === "text/plain").length}, totalBytes=${totalBytes}`);
-    console.info(`Lesson source preprocessing started: sources=${files.length}`);
+    console.info(`Source bundle selected: sources=${typedFiles.length}, pdfs=${descriptors.filter(s => s.mimeType === "application/pdf").length}, txt=${descriptors.filter(s => s.mimeType === "text/plain").length}, totalBytes=${totalBytes}`);
+    console.info(`Lesson source preprocessing started: sources=${typedFiles.length}`);
     const client = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY, httpOptions: { timeout: MODEL_TIMEOUT_MS, retryOptions: { attempts: 1 } } });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), OPERATION_TIMEOUT_MS);
@@ -164,7 +194,7 @@ export async function POST(request: Request) {
           const lessonTitle = typeof parsed.lessonTitle === "string" ? parsed.lessonTitle.trim().slice(0, 160) : "";
           const lessonTree = normalizeLessonTree(parsed.lessonTree, new Set(descriptors.map((source) => source.id)));
           if (!structuredText || !lessonTree.length) throw new Error("No structured content returned");
-          console.info(`Bundle preprocessing completed: model=${model}, sources=${files.length}`);
+          console.info(`Bundle preprocessing completed: model=${model}, sources=${typedFiles.length}`);
           return NextResponse.json({ lessonTitle, structuredText, lessonTree, model }, { headers: { "Cache-Control": "no-store" } });
         } catch (error) {
           lastFailure = classify(error);
