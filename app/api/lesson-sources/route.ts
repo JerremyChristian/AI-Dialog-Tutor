@@ -84,6 +84,10 @@ const lessonTreeSchema = {
           type: { type: "string", enum: ["overview", "concept", "definition", "procedure", "worked-example", "comparison", "summary"] },
           importance: { type: "string", enum: ["core", "supporting", "optional"] },
           objective: { type: "string" }, teachingPoints: { type: "array", items: { type: "string" } },
+          teachingPointSourceReferences: {
+            type: "array",
+            items: { type: "array", items: sourceReferenceSchema },
+          },
           completionCriteria: { type: "array", items: { type: "string" } },
           sourceReferences: { type: "array", items: sourceReferenceSchema },
           keyTerms: { type: "array", items: { type: "string" } }, notation: { type: "array", items: { type: "string" } },
@@ -110,7 +114,9 @@ Merge overlapping explanations conservatively into one concept. Preserve useful 
 
 Return JSON with lessonTitle, structuredSource, and lessonTree. The tree is a flat hierarchical node array. Atomic leaves have teaching contracts; structural parents do not. Contracts contain a short objective, 3-7 source-derived teachingPoints, 2-5 tutor-facing completionCriteria, type, importance, and optional keyTerms/notation/confidence.
 
-Use structured sourceReferences with an exact sourceId from the catalog. PDF page is the 1-based physical PDF page index; omit page for TXT and never invent one. Contract-level references are sufficient. Include node references when useful. Do not use opaque filename/page strings as references.`;
+Use structured sourceReferences with an exact sourceId from the catalog. PDF page is the 1-based physical PDF page index; omit page for TXT and never invent one. Include node and contract references when useful.
+
+For every teachingPoints entry, return the index-aligned teachingPointSourceReferences entry containing every source location materially useful for teaching that specific point. A point may cite zero, one, or multiple locations, including consecutive or non-consecutive PDF pages and multiple sources. Slides may supply visual structure, notes detailed explanation, transcripts lecturer explanation, and other sources supplementary material. Prefer precise point references, but never force a mapping or invent a page. Preserve an empty inner array when no point-specific location is confidently supported. Keep teachingPoints as strings and keep the outer arrays index-aligned.`;
 }
 
 export async function POST(request: Request) {

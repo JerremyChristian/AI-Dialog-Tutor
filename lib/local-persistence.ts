@@ -1,4 +1,5 @@
 import type { LearningSource, LessonSource, PreparedLearningSource } from "./learning-source";
+import { normalizeLessonTree } from "./lesson-outline";
 import {
   normalizeTeachingContractProgress,
   type CoverageStatus,
@@ -350,6 +351,17 @@ export function parseSavedLesson(value: unknown): SavedLesson | null {
   if (value.cloudSync !== undefined && !cloudSync) return null;
   if (!source || !sources || !lessonState || !recentTeachingContext || !teachingPreferences) return null;
   normalizeLegacySourceReferences(source.prepared, sources[0].id);
+  source.prepared.lessonTree = normalizeLessonTree(
+    source.prepared.lessonTree,
+    new Set(sources.map((item) => item.id)),
+  );
+  for (const node of source.prepared.lessonTree) {
+    const stateNode = lessonState.nodes[node.id];
+    if (stateNode) {
+      stateNode.sourceReferences = node.sourceReferences;
+      stateNode.teaching = node.teaching;
+    }
+  }
   const sourceNodeIds = new Set(source.prepared.lessonTree.map((node) => node.id));
   const stateNodeIds = Object.keys(lessonState.nodes);
   if (sourceNodeIds.size !== stateNodeIds.length ||

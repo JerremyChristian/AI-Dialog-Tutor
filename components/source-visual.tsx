@@ -4,25 +4,34 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
 import type { AtomicTeachingContract, LessonSource } from "../lib/learning-source";
 import { downloadCloudLessonSource } from "../lib/cloud-sync";
-import { selectPrimaryVisualReference } from "../lib/source-visual";
+import { selectVisualReferences } from "../lib/source-visual";
 
 type Props = {
   conceptId: string | null;
   conceptTitle?: string;
   contract?: AtomicTeachingContract;
+  teachingPointIndex: number;
   sources: LessonSource[];
   cloudOwnerId: string | null;
   onDebug: (message: string) => void;
 };
 type VisualStatus = "idle" | "loading" | "ready" | "error" | "unavailable";
 
-export function SourceVisual({ conceptId, conceptTitle, contract, sources, cloudOwnerId, onDebug }: Props) {
-  const selection = useMemo(() => selectPrimaryVisualReference(contract, sources), [contract, sources]);
-  const invalidPdfReference = useMemo(() => (contract?.sourceReferences ?? []).find((reference) => {
+export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointIndex, sources, cloudOwnerId, onDebug }: Props) {
+  const visualSelection = useMemo(
+    () => selectVisualReferences(contract, sources, teachingPointIndex),
+    [contract, sources, teachingPointIndex],
+  );
+  const [referenceIndex, setReferenceIndex] = useState(0);
+  const selection = visualSelection.candidates[referenceIndex] ?? visualSelection.primary;
+  const activeReferences = contract?.teachingPointSourceReferences?.[teachingPointIndex]?.length
+    ? contract.teachingPointSourceReferences[teachingPointIndex]
+    : contract?.sourceReferences ?? [];
+  const invalidPdfReference = useMemo(() => activeReferences.find((reference) => {
     const source = sources.find((candidate) => candidate.id === reference.sourceId);
     return source?.mimeType === "application/pdf" && reference.page !== undefined &&
       (!Number.isInteger(reference.page) || reference.page < 1);
-  }), [contract, sources]);
+  }), [activeReferences, sources]);
   const cacheRef = useRef(new Map<string, Promise<PDFDocumentProxy>>());
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
@@ -38,7 +47,9 @@ export function SourceVisual({ conceptId, conceptTitle, contract, sources, cloud
   const [retryNonce, setRetryNonce] = useState(0);
   debugRef.current = onDebug;
   const automaticPage = selection?.reference.page ?? null;
-  const selectionKey = `${conceptId ?? "none"}:${selection?.source.id ?? "none"}:${automaticPage ?? "none"}`;
+  const lessonSelectionKey = `${conceptId ?? "none"}:${teachingPointIndex}:${visualSelection.candidates
+    .map((candidate) => `${candidate.source.id}:${candidate.reference.page ?? "document"}`).join("|")}`;
+  const selectionKey = `${selection?.source.id ?? "none"}:${automaticPage ?? "none"}`;
 
   useEffect(() => {
     const cache = cacheRef.current;
@@ -52,7 +63,12 @@ export function SourceVisual({ conceptId, conceptTitle, contract, sources, cloud
   useEffect(() => setExpanded(window.matchMedia("(min-width: 900px)").matches), []);
 
   useEffect(() => {
+    setReferenceIndex(0);
     setAutoFollow(true);
+    setViewedPage(visualSelection.primary?.reference.page ?? null);
+  }, [lessonSelectionKey, visualSelection.primary?.reference.page]);
+
+  useEffect(() => {
     setViewedPage(automaticPage);
     setPdf(null);
     setPageCount(0);
@@ -72,7 +88,11 @@ export function SourceVisual({ conceptId, conceptTitle, contract, sources, cloud
       debugRef.current(`Source visual unavailable: reason=${invalidPdfReference ? "invalid-page-reference" : "no-pdf-reference"}`);
       return;
     }
-    debugRef.current(`Visual source selected: source=${selection.source.id}, page=${automaticPage ?? "none"}, reason=${selection.reason}`);
+    debugRef.current(
+      `Visual source selected: source=${selection.source.id}, page=${automaticPage ?? "none"}, ` +
+      `reason=${selection.reason}, point=${teachingPointIndex}, references=${visualSelection.candidates.length}, ` +
+      `fallback=${visualSelection.fallbackUsed ? "yes" : "no"}`,
+    );
     if (!automaticPage) {
       setStatus("unavailable");
       return;
@@ -114,7 +134,7 @@ export function SourceVisual({ conceptId, conceptTitle, contract, sources, cloud
       if (active) { setStatus("error"); debugRef.current(`Source visual unavailable: reason=download-failed, source=${selection.source.id}`); }
     });
     return () => { active = false; };
-  }, [selectionKey, selection, automaticPage, cloudOwnerId, retryNonce, expanded, invalidPdfReference]);
+  }, [selectionKey, selection, automaticPage, cloudOwnerId, retryNonce, expanded, invalidPdfReference, teachingPointIndex, visualSelection.candidates.length, visualSelection.fallbackUsed]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -145,13 +165,21 @@ export function SourceVisual({ conceptId, conceptTitle, contract, sources, cloud
 
   const selectManualPage = (page: number) => {
     if (page < 1 || page > pageCount) return;
-    setViewedPage(page); setAutoFollow(page === automaticPage);
+    setViewedPage(page);
+    setAutoFollow(referenceIndex === 0 && page === visualSelection.primary?.reference.page);
     debugRef.current(`Manual visual page selected: source=${selection?.source.id}, page=${page}`);
   };
   const followLesson = () => {
-    if (!automaticPage) return;
-    setViewedPage(automaticPage); setAutoFollow(true);
-    debugRef.current(`Visual auto-follow restored: page=${automaticPage}`);
+    const primaryPage = visualSelection.primary?.reference.page;
+    if (!primaryPage) return;
+    setReferenceIndex(0); setViewedPage(primaryPage); setAutoFollow(true);
+    debugRef.current(`Visual auto-follow restored: page=${primaryPage}`);
+  };
+  const selectManualReference = (index: number) => {
+    if (index < 0 || index >= visualSelection.candidates.length) return;
+    setReferenceIndex(index); setAutoFollow(false);
+    const candidate = visualSelection.candidates[index];
+    debugRef.current(`Manual visual reference selected: source=${candidate.source.id}, page=${candidate.reference.page ?? "none"}, reference=${index + 1}/${visualSelection.candidates.length}`);
   };
   const retry = () => { setPdf(null); setStatus("idle"); if (selection) cacheRef.current.delete(`${selection.source.id}:${selection.source.storagePath}`); setViewedPage(automaticPage); setRetryNonce((value) => value + 1); };
 
@@ -166,7 +194,8 @@ export function SourceVisual({ conceptId, conceptTitle, contract, sources, cloud
       {status === "loading" && <p className="source-visual-message" role="status">Loading source page…</p>}
       {status === "error" && <div className="source-visual-message" role="alert"><p>The source visual could not be loaded. Tutoring can continue.</p><button type="button" onClick={retry}>Retry visual</button></div>}
       {selection && status === "ready" && <><div className="source-visual-frame" ref={frameRef}><canvas ref={canvasRef} aria-label={`${selection.source.name}, page ${viewedPage}`} /></div>
-        <div className="source-visual-controls"><button type="button" onClick={() => selectManualPage((viewedPage ?? 1) - 1)} disabled={!viewedPage || viewedPage <= 1} aria-label="Previous PDF page">Previous</button><span>{autoFollow ? `Lesson page ${automaticPage}` : `Viewing page ${viewedPage} manually`}</span><button type="button" onClick={() => selectManualPage((viewedPage ?? 0) + 1)} disabled={!viewedPage || viewedPage >= pageCount} aria-label="Next PDF page">Next</button>{!autoFollow && <button type="button" onClick={followLesson}>Return to lesson page {automaticPage}</button>}</div></>}
+        {visualSelection.candidates.length > 1 && <div className="source-visual-controls"><button type="button" onClick={() => selectManualReference(referenceIndex - 1)} disabled={referenceIndex <= 0} aria-label="Previous source reference">Previous source</button><span>Reference {referenceIndex + 1} / {visualSelection.candidates.length}</span><button type="button" onClick={() => selectManualReference(referenceIndex + 1)} disabled={referenceIndex >= visualSelection.candidates.length - 1} aria-label="Next source reference">Next source</button></div>}
+        <div className="source-visual-controls"><button type="button" onClick={() => selectManualPage((viewedPage ?? 1) - 1)} disabled={!viewedPage || viewedPage <= 1} aria-label="Previous PDF page">Previous page</button><span>{autoFollow ? `Lesson page ${visualSelection.primary?.reference.page}` : `Viewing page ${viewedPage} manually`}</span><button type="button" onClick={() => selectManualPage((viewedPage ?? 0) + 1)} disabled={!viewedPage || viewedPage >= pageCount} aria-label="Next PDF page">Next page</button>{!autoFollow && <button type="button" onClick={followLesson}>Follow lesson</button>}</div></>}
     </div>}
   </section>;
 }

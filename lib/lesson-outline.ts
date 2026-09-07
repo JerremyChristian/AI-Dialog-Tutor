@@ -116,6 +116,11 @@ function normalizeTeachingContract(value: unknown, allowedSourceIds?: ReadonlySe
   return {
     objective,
     teachingPoints,
+    teachingPointSourceReferences: normalizeTeachingPointSourceReferences(
+      record.teachingPointSourceReferences,
+      teachingPoints.length,
+      allowedSourceIds,
+    ),
     completionCriteria,
     type,
     importance,
@@ -127,6 +132,18 @@ function normalizeTeachingContract(value: unknown, allowedSourceIds?: ReadonlySe
   };
 }
 
+function normalizeTeachingPointSourceReferences(
+  value: unknown,
+  teachingPointCount: number,
+  allowedSourceIds?: ReadonlySet<string>,
+): SourceReference[][] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const references = Array.from({ length: Math.min(value.length, teachingPointCount) }, (_, index) =>
+    normalizeSourceReferences(value[index], allowedSourceIds) ?? []
+  );
+  return references.some((items) => items.length) ? references : undefined;
+}
+
 function normalizeSourceReferences(value: unknown, allowedSourceIds?: ReadonlySet<string>): SourceReference[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const references = value.flatMap((item): SourceReference[] => {
@@ -134,13 +151,17 @@ function normalizeSourceReferences(value: unknown, allowedSourceIds?: ReadonlySe
     const record = item as Record<string, unknown>;
     const sourceId = cleanString(record.sourceId, 64);
     if (!sourceId || (allowedSourceIds && !allowedSourceIds.has(sourceId))) return [];
-    const page = typeof record.page === "number" && Number.isInteger(record.page) && record.page > 0
-      ? record.page
-      : undefined;
+    const hasPage = Object.prototype.hasOwnProperty.call(record, "page");
+    if (hasPage && (typeof record.page !== "number" || !Number.isInteger(record.page) || record.page < 1)) return [];
+    const page = hasPage ? record.page as number : undefined;
     const section = cleanString(record.section, 200) || undefined;
     return [{ sourceId, ...(page ? { page } : {}), ...(section ? { section } : {}) }];
-  }).slice(0, 8);
-  return references.length ? references : undefined;
+  });
+  const unique = references.filter((reference, index) => references.findIndex((candidate) =>
+    candidate.sourceId === reference.sourceId && candidate.page === reference.page &&
+    candidate.section === reference.section
+  ) === index).slice(0, 8);
+  return unique.length ? unique : undefined;
 }
 
 function optionalList(value: unknown, limit: number) {

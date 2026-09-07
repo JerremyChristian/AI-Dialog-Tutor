@@ -2001,6 +2001,9 @@ export default function Home() {
   const requestingPermission = microphoneStatus === "Requesting permission";
   const currentTeachingContract = getCurrentConcept(lessonState)?.teaching;
   const currentConcept = getCurrentConcept(lessonState);
+  const currentTeachingPointIndex = currentConcept
+    ? lessonState.teachingContractProgress[currentConcept.id]?.nextTeachingPointIndex ?? 0
+    : 0;
   const lessonActive = microphoneActive || requestingPermission || aiConnected;
 
   const requestInstall = async () => {
@@ -2102,6 +2105,7 @@ export default function Home() {
             conceptId={currentConcept?.id ?? null}
             conceptTitle={currentConcept?.title}
             contract={currentTeachingContract}
+            teachingPointIndex={currentTeachingPointIndex}
             sources={lessonSources}
             cloudOwnerId={cloudUserId}
             onDebug={addDebugMessage}

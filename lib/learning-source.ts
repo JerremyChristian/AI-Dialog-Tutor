@@ -48,6 +48,8 @@ export type TeachingImportance = "core" | "supporting" | "optional";
 export type AtomicTeachingContract = {
   objective: string;
   teachingPoints: string[];
+  /** Outer indexes align exactly with teachingPoints; each point may cite 0..N sources. */
+  teachingPointSourceReferences?: SourceReference[][];
   completionCriteria: string[];
   type: TeachingNodeType;
   importance: TeachingImportance;
