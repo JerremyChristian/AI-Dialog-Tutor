@@ -30,7 +30,7 @@ export function RecentLessons({
       <div className="recent-lessons-heading">
         <div>
           <h2 id="recent-lessons-title">Recent Lessons</h2>
-          <p>Saved on this device</p>
+          <p>Your latest lessons</p>
         </div>
         <button type="button" className="new-lesson-button" onClick={onNewLesson}>
           + New Lesson
@@ -90,7 +90,7 @@ export function RecentLessons({
                     disabled={busyLessonId !== null}
                     onClick={() => onContinue(lesson.id)}
                   >
-                    {busy ? "Opening…" : "Continue"}
+                    {busy ? "Opening…" : lesson.hasStarted ? "Continue" : "Start"}
                   </button>
                   <button
                     type="button"

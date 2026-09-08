@@ -11,6 +11,7 @@ import {
 type Props = {
   lessonState: LessonState;
   lessonActive: boolean;
+  readOnly?: boolean;
   navigationPending: boolean;
   onNavigate: (node: LessonNode) => void;
 };
@@ -18,14 +19,15 @@ type Props = {
 const STATUS_PRESENTATION: Record<CoverageStatus, { icon: string; label: string }> = {
   "not-started": { icon: "○", label: "Not started" },
   teaching: { icon: "▶", label: "Current" },
-  partial: { icon: "◐", label: "Partially covered" },
-  taught: { icon: "✓", label: "Covered" },
+  partial: { icon: "◐", label: "In progress" },
+  taught: { icon: "✓", label: "Completed" },
   skipped: { icon: "↷", label: "Skipped" },
 };
 
 export function LessonRoadmap({
   lessonState,
   lessonActive,
+  readOnly = false,
   navigationPending,
   onNavigate,
 }: Props) {
@@ -36,14 +38,14 @@ export function LessonRoadmap({
   const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(new Set());
   const activePathNodeIds = useMemo(() => {
     const activePath = new Set<string>();
-    if (!lessonActive || !lessonState.currentNodeId) return activePath;
+    if ((!lessonActive && !readOnly) || !lessonState.currentNodeId) return activePath;
     let nodeId: string | null = lessonState.currentNodeId;
     while (nodeId) {
       activePath.add(nodeId);
       nodeId = lessonState.nodes[nodeId]?.parentId ?? null;
     }
     return activePath;
-  }, [lessonActive, lessonState.currentNodeId, lessonState.nodes]);
+  }, [lessonActive, readOnly, lessonState.currentNodeId, lessonState.nodes]);
 
   useEffect(() => {
     const initiallyExpanded = new Set<string>();
@@ -93,13 +95,15 @@ export function LessonRoadmap({
     const structural = node.childrenIds.length > 0;
     const teachable = isTeachableLessonNode(node);
     const expanded = expandedNodeIds.has(node.id);
-    const current = lessonActive && node.id === lessonState.currentNodeId;
+    const current = (lessonActive || readOnly) && node.id === lessonState.currentNodeId;
     const activeBranch = structural && activePathNodeIds.has(node.id);
-    const displayStatus = !lessonActive && node.status === "teaching"
+    const displayStatus = !lessonActive && !readOnly && node.status === "teaching"
       ? "not-started"
       : node.status;
     const status = STATUS_PRESENTATION[displayStatus];
-    const statusLabel = activeBranch
+    const statusLabel = current
+      ? "You are here"
+      : activeBranch
       ? node.status === "teaching"
         ? "Current branch"
         : `${status.label} · Active branch`
@@ -109,7 +113,7 @@ export function LessonRoadmap({
       : structural
         ? `${expanded ? "Collapse" : "Expand"} ${node.title}`
         : teachable
-          ? `Go to ${node.title}. ${statusLabel}`
+          ? `${node.title}. ${statusLabel}`
           : `Topic: ${node.title}. ${statusLabel}`;
 
     return (
@@ -129,7 +133,7 @@ export function LessonRoadmap({
             aria-disabled={!structural && (!teachable || !lessonActive || current) ? true : undefined}
             onClick={() => {
               if (structural) toggleExpanded(node.id);
-              else if (teachable && lessonActive && !current) onNavigate(node);
+              else if (teachable && lessonActive && !readOnly && !current) onNavigate(node);
             }}
           >
             <span className="roadmap-node-title">{node.title}</span>

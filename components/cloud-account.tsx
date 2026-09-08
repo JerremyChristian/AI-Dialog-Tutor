@@ -167,7 +167,7 @@ export default function CloudAccount({
   return (
     <section className="cloud-account setup-only" aria-labelledby="cloud-account-title">
       <div className="cloud-account-heading">
-        <div><p className="cloud-kicker">Account</p><h2 id="cloud-account-title">Cloud</h2></div>
+        <div><p className="cloud-kicker">Account</p><h2 id="cloud-account-title">Sign-in and sync</h2></div>
         <span className={`cloud-status ${user && status?.connected ? "connected" : ""}`}>{statusText}</span>
       </div>
       {!supabase && <p className="cloud-note">Local learning is available. Cloud setup is optional.</p>}
@@ -199,7 +199,7 @@ export default function CloudAccount({
       )}
       {supabase && !checking && !user && (
         <>
-          <p className="cloud-note">Sign in to synchronize account-owned lessons. Signed-out lessons remain local.</p>
+          <p className="cloud-note">Sign in to sync lessons across devices, upload larger source bundles, and keep in-progress uploads available for recovery. You can still create local lessons without an account.</p>
           {!mode ? (
             <div className="cloud-actions">
               <button type="button" onClick={() => setMode("signin")}>Sign in</button>

@@ -20,16 +20,16 @@ export function ProcessingQueue({ jobs, lessonActive, onOpen, onRetry, onReselec
   return <section className="processing-queue" aria-labelledby="processing-queue-title">
     <div className="processing-queue-heading">
       <div>
-        <h2 id="processing-queue-title">Processing</h2>
-        <p>Lessons process one at a time while the next sources upload.</p>
+        <h2 id="processing-queue-title">Preparing lessons</h2>
+        <p>You can keep using the app while your materials are prepared.</p>
       </div>
       <span>{jobs.filter((job) => !["ready", "error", "needs-source"].includes(job.status)).length} active</span>
     </div>
     <ol>{jobs.map((job) => <li key={job.id} className={`processing-job processing-job-${job.status}`}>
       <div>
         <strong>{job.title}</strong>
-        <span>{job.phase}</span>
-        {job.error && <small>{job.error.message}</small>}
+        <span>{friendlyStatus(job.status)}</span>
+        {job.error && <small>We couldn't prepare this lesson.</small>}
       </div>
       <div className="processing-job-actions">
         {job.status === "ready" && <button
@@ -42,7 +42,7 @@ export function ProcessingQueue({ jobs, lessonActive, onOpen, onRetry, onReselec
         {job.status === "needs-source" && <button type="button" onClick={() => {
           reselectJobRef.current = job;
           inputRef.current?.click();
-        }}>Reselect</button>}
+        }}>Reselect Sources</button>}
         <button
           type="button"
           disabled={job.status === "saving"}
@@ -65,4 +65,8 @@ export function ProcessingQueue({ jobs, lessonActive, onOpen, onRetry, onReselec
       }}
     />
   </section>;
+}
+
+function friendlyStatus(status: LessonProcessingJob["status"]) {
+  return { queued: "Queued", uploading: "Uploading", processing: "Preparing lesson", saving: "Saving", ready: "Ready", error: "Couldn't prepare lesson", "needs-source": "Needs files" }[status];
 }

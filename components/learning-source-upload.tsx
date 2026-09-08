@@ -37,6 +37,7 @@ function aggregateName(sources: LessonSource[]) {
 
 export function LearningSourceUpload({ disabled, cloudUserId, onQueueBundle, onDebug }: Props) {
   const [selected, setSelected] = useState<SelectedSource[]>([]);
+  const [lessonName, setLessonName] = useState("");
   const [failure, setFailure] = useState<string | null>(null);
   const selectFiles = (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? []); event.target.value = "";
@@ -60,8 +61,8 @@ export function LearningSourceUpload({ disabled, cloudUserId, onQueueBundle, onD
   const processBundle = async () => {
     const sources = selected.map((item) => item.metadata); if (!sources.length) return;
     try {
-      await onQueueBundle(sources, new Map(selected.map((item) => [item.metadata.id, item.file])), aggregateName(sources));
-      setSelected([]); setFailure(null);
+      await onQueueBundle(sources, new Map(selected.map((item) => [item.metadata.id, item.file])), lessonName.trim() || aggregateName(sources));
+      setSelected([]); setLessonName(""); setFailure(null);
     } catch (error) {
       setFailure(error instanceof Error ? error.message : "The lesson could not be queued.");
     }
@@ -69,11 +70,14 @@ export function LearningSourceUpload({ disabled, cloudUserId, onQueueBundle, onD
   const totalBytes = selected.reduce((sum, item) => sum + item.file.size, 0);
   const bundleLimit = cloudUserId ? MAX_CLOUD_SOURCE_BUNDLE_BYTES : MAX_SOURCE_BUNDLE_BYTES;
   return <section className="source-upload" aria-labelledby="source-upload-title">
-    <div className="source-upload-heading"><div><h2 id="source-upload-title">New lesson sources</h2><p>Choose up to {MAX_LESSON_SOURCES} PDFs or TXT files. 20 MB per file; {formatBytes(bundleLimit)} total. {!cloudUserId && "Sign in for larger durable jobs."}</p></div><span className={`source-status source-status-${selected.length ? "preparing" : "none"}`}>{selected.length ? "Preparing" : "No material"}</span></div>
+    <div className="source-upload-heading"><div><p className="step-label">1 · Name your lesson</p><h2 id="source-upload-title">Create a new lesson</h2><p>Add a name now, or we will suggest one from your learning materials.</p></div></div>
+    <label className="lesson-name-field"><span>Lesson name</span><input type="text" maxLength={120} value={lessonName} onChange={(event) => setLessonName(event.target.value)} placeholder="e.g. Week 3: Photosynthesis" disabled={disabled} /></label>
+    <div className="upload-step-heading"><p className="step-label">2 · Add learning materials</p><p>Choose up to {MAX_LESSON_SOURCES} PDF or TXT files. 20 MB each, {formatBytes(bundleLimit)} total. {!cloudUserId && "Sign in for a larger upload limit."}</p></div>
+    {selected.length > 0 && <p className="step-label role-step">3 · Confirm source roles</p>}
     {selected.map(({ metadata }) => <div className="source-details" key={metadata.id}><div><strong>{metadata.name}</strong><small>{metadata.mimeType === "application/pdf" ? "PDF" : "TXT"} · {formatBytes(metadata.sizeBytes)}</small><small>Ready to queue</small></div><div className="source-actions"><select aria-label={`Role for ${metadata.name}`} value={metadata.role} onChange={(event) => updateRole(metadata.id, event.target.value as LessonSourceRole)} disabled={disabled}><option value="slides">Slides</option><option value="transcript">Transcript</option><option value="notes">Notes</option><option value="other">Other</option></select><button type="button" className="source-remove" onClick={() => setSelected((current) => current.filter((item) => item.metadata.id !== metadata.id))} disabled={disabled}>Remove</button></div></div>)}
     <input className="source-file-input" type="file" multiple accept="application/pdf,text/plain,.pdf,.txt" onChange={selectFiles} disabled={disabled || selected.length >= MAX_LESSON_SOURCES} />
     {selected.length > 0 && <p className="source-bundle-total">{selected.length} source{selected.length === 1 ? "" : "s"} · {formatBytes(totalBytes)} total</p>}
     {failure && <p className="source-error" role="alert">{failure}</p>}
-    {selected.length > 0 && <button type="button" className="source-retry" onClick={() => void processBundle()} disabled={disabled || totalBytes > bundleLimit}>Add lesson to queue</button>}
+    {selected.length > 0 && <div className="create-lesson-action"><span className="step-label">4 · Create lesson</span><button type="button" className="source-retry" onClick={() => void processBundle()} disabled={disabled || totalBytes > bundleLimit}>Create Lesson</button></div>}
   </section>;
 }

@@ -2,8 +2,10 @@
 
 import type { FunctionCall, LiveServerMessage } from "@google/genai";
 import type { User } from "@supabase/supabase-js";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { LearningSourceUpload } from "../components/learning-source-upload";
+import { AppNavigation, type AppView } from "../components/app-navigation";
+import { LessonLibrary, lessonProgress } from "../components/lesson-library";
 import { LessonRoadmap } from "../components/lesson-roadmap";
 import { RecentLessons } from "../components/recent-lessons";
 import { SourceVisual } from "../components/source-visual";
@@ -113,6 +115,8 @@ type InstallPromptEvent = Event & {
 
 type QuickResponse = "Yes" | "Repeat" | "Continue";
 type TeachingPreferenceUpdate = Partial<TeachingPreferences>;
+type LibraryView = "index" | "lesson" | "new";
+type AppearancePreference = "system" | "light" | "dark";
 
 type ActiveTeachingBeat = ResolvedTeachingBeat & {
   conceptId: string;
@@ -252,6 +256,8 @@ function createRecentTeachingExcerpt(transcript: string) {
 }
 
 export default function Home() {
+  const [appView, setAppView] = useState<AppView>("home");
+  const [libraryView, setLibraryView] = useState<LibraryView>("index");
   const [microphoneStatus, setMicrophoneStatus] =
     useState<MicrophoneStatus>("Not active");
   const [aiConnectionStatus, setAiConnectionStatus] =
@@ -263,6 +269,9 @@ export default function Home() {
   const [transportState, setTransportState] = useState<LiveTransportState>("closed");
   const [microphoneMuted, setMicrophoneMuted] = useState(false);
   const [quickResponseFeedback, setQuickResponseFeedback] = useState("");
+  const [typedReply, setTypedReply] = useState("");
+  const [appearance, setAppearance] = useState<AppearancePreference>("system");
+  const [appearanceReady, setAppearanceReady] = useState(false);
   const [teachingPreferences, setTeachingPreferences] = useState<TeachingPreferences>(
     DEFAULT_TEACHING_PREFERENCES,
   );
@@ -313,6 +322,7 @@ export default function Home() {
   const isMountedRef = useRef(true);
   const conversationRunRef = useRef(0);
   const assistantSpeakingRef = useRef(false);
+  const typedInterruptionHandledRef = useRef(false);
   const assistantTurnActiveRef = useRef(false);
   const userTranscriptRef = useRef("");
   const lastMeaningfulLearnerTranscriptRef = useRef("");
@@ -342,6 +352,7 @@ export default function Home() {
   const microphoneMutedRef = useRef(false);
   const microphoneMuteTransitionRef = useRef(false);
   const quickResponseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const typedReplyInputRef = useRef<HTMLInputElement | null>(null);
   const preferenceUpdateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const roadmapNavigationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const persistenceSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -365,6 +376,36 @@ export default function Home() {
       },
     ]);
   }, []);
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem("ai-tutor-appearance");
+      setAppearance(saved === "light" || saved === "dark" ? saved : "system");
+    } catch {
+      setAppearance("system");
+    }
+    setAppearanceReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!appearanceReady) return;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const applyAppearance = () => {
+      const resolved = appearance === "system"
+        ? media.matches ? "dark" : "light"
+        : appearance;
+      document.documentElement.dataset.theme = resolved;
+    };
+    try {
+      window.localStorage.setItem("ai-tutor-appearance", appearance);
+    } catch {
+      // Appearance still applies for this session when browser storage is unavailable.
+    }
+    applyAppearance();
+    if (appearance !== "system") return;
+    media.addEventListener("change", applyAppearance);
+    return () => media.removeEventListener("change", applyAppearance);
+  }, [appearance, appearanceReady]);
 
   const updateLessonState = (
     update: (current: LessonState) => LessonState,
@@ -522,6 +563,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     playerRef.current = null;
     await player?.close();
     assistantSpeakingRef.current = false;
+    typedInterruptionHandledRef.current = false;
     assistantTurnActiveRef.current = false;
     lastAssistantTurnCompleteRef.current = true;
     resumptionPendingRef.current = false;
@@ -552,6 +594,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     microphoneMutedRef.current = false;
     setMicrophoneMuted(false);
     setQuickResponseFeedback("");
+    setTypedReply("");
     setPreferenceUpdatePending(false);
     setRoadmapNavigationPending(false);
     roadmapNavigationPendingRef.current = false;
@@ -794,6 +837,8 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     const outgoingSnapshot = createCurrentLessonSnapshot();
     if (outgoingSnapshot) void persistLessonSnapshot(outgoingSnapshot);
     resetIdleLessonWorkspace();
+    setAppView("library");
+    setLibraryView("new");
     addDebugMessage("New lesson setup opened");
   };
 
@@ -848,7 +893,10 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
       }
       await deleteSavedLesson(saved.id);
       setSavedLessons((current) => current.filter((lesson) => lesson.id !== saved.id));
-      if (savedLessonIdRef.current === saved.id) resetIdleLessonWorkspace();
+      if (savedLessonIdRef.current === saved.id) {
+        resetIdleLessonWorkspace();
+        setLibraryView("index");
+      }
       addDebugMessage(`Saved lesson deleted: ${saved.id}`);
     } catch {
       setPersistenceNotice(saved.cloudOwnerId
@@ -1246,6 +1294,69 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     };
   }, []);
 
+  const handleLearnerInterruption = (discreteTextTurn = false) => {
+    // Gemini cuts playback immediately. Smoothing a mid-phoneme cutoff is a
+    // later UX refinement; yielding to the learner remains the priority.
+    invalidateActiveTeachingBeat("barge-in");
+    playerRef.current?.clear();
+    assistantSpeakingRef.current = false;
+    typedInterruptionHandledRef.current = false;
+    const interruption = transportRef.current?.registerInterruption(
+      discreteTextTurn || roadmapNavigationPendingRef.current,
+    );
+    transportRef.current?.setAssistantSpeaking(false);
+    assistantTurnActiveRef.current = false;
+    lastAssistantTurnCompleteRef.current = false;
+    if (!interruption?.duplicate) {
+      const current = lessonStateRef.current;
+      const interruptedTranscript =
+        assistantTranscriptRef.current || current.lastAssistantTranscript;
+      const currentConcept = getCurrentConcept(current)?.title || "current concept";
+      const resumePoint = deriveResumePoint(
+        interruptedTranscript,
+        currentConcept,
+      );
+      updateLessonState((state) => ({
+        ...state,
+        status: "interrupted",
+        resumePoint,
+        interruptionCount: state.interruptionCount + 1,
+        lastAssistantTranscript: interruptedTranscript,
+      }));
+      resumptionPendingRef.current = true;
+      addDebugMessage("Assistant interrupted");
+      addDebugMessage(`Resume point saved: ${resumePoint}`);
+    }
+  };
+
+  const submitTypedReply = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const text = typedReply.trim();
+    if (!text) return;
+    if (!transportRef.current?.sendLearnerText(text)) {
+      setUserError("Your reply could not be sent while reconnecting. Try again.");
+      addDebugMessage("Typed learner reply send failed: connection unavailable");
+      return;
+    }
+    if (assistantSpeakingRef.current) {
+      handleLearnerInterruption(true);
+      typedInterruptionHandledRef.current = true;
+    }
+    userTranscriptRef.current = text;
+    lastMeaningfulLearnerTranscriptRef.current = text;
+    setCurrentUtterance(text);
+    updateLessonState((current) => ({
+      ...current,
+      status: current.status === "interrupted" ? "resolving-interruption" : current.status,
+      lastUserTranscript: text,
+    }));
+    markMeaningfulActivity();
+    setUserError("");
+    setTypedReply("");
+    addDebugMessage("Typed learner reply sent");
+    window.requestAnimationFrame(() => typedReplyInputRef.current?.focus());
+  };
+
   const handleLiveMessage = (message: LiveServerMessage) => {
     if (message.toolCallCancellation?.ids) {
       for (const id of message.toolCallCancellation.ids) {
@@ -1329,36 +1440,11 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     }
 
     if (serverContent?.interrupted) {
-      // Gemini cuts playback immediately. Smoothing a mid-phoneme cutoff is a
-      // later UX refinement; yielding to the learner remains the priority.
-      invalidateActiveTeachingBeat("barge-in");
-      playerRef.current?.clear();
-      assistantSpeakingRef.current = false;
-      const interruption = transportRef.current?.registerInterruption(
-        roadmapNavigationPendingRef.current,
-      );
-      transportRef.current?.setAssistantSpeaking(false);
-      assistantTurnActiveRef.current = false;
-      lastAssistantTurnCompleteRef.current = false;
-      if (!interruption?.duplicate) {
-        const current = lessonStateRef.current;
-        const interruptedTranscript =
-          assistantTranscriptRef.current || current.lastAssistantTranscript;
-        const currentConcept = getCurrentConcept(current)?.title || "current concept";
-        const resumePoint = deriveResumePoint(
-          interruptedTranscript,
-          currentConcept,
-        );
-        updateLessonState((state) => ({
-          ...state,
-          status: "interrupted",
-          resumePoint,
-          interruptionCount: state.interruptionCount + 1,
-          lastAssistantTranscript: interruptedTranscript,
-        }));
-        resumptionPendingRef.current = true;
-        addDebugMessage("Assistant interrupted");
-        addDebugMessage(`Resume point saved: ${resumePoint}`);
+      if (typedInterruptionHandledRef.current) {
+        typedInterruptionHandledRef.current = false;
+        addDebugMessage("Provider confirmed typed interruption");
+      } else {
+        handleLearnerInterruption();
       }
     }
 
@@ -1385,6 +1471,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
       if (!audio?.data || !audio.mimeType?.startsWith("audio/")) continue;
 
       if (!assistantSpeakingRef.current) {
+        typedInterruptionHandledRef.current = false;
         assistantSpeakingRef.current = true;
         transportRef.current?.setAssistantSpeaking(true);
         sourceGroundingPendingRef.current = false;
@@ -2106,6 +2193,40 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     ? `${presentationBeat.conceptId}:${presentationBeat.deliveryUnitIndex}:${presentationBeat.beatIndex}`
     : `${currentConcept?.id ?? "none"}:pending`;
   const lessonActive = microphoneActive || requestingPermission || aiConnected;
+  const resumableLesson = savedLessons.find((lesson) => lesson.hasStarted);
+  const hasRecentLessons = savedLessons.some((lesson) => lesson.id !== resumableLesson?.id);
+  const selectedSavedLesson = savedLessonId
+    ? savedLessons.find((lesson) => lesson.id === savedLessonId)
+    : undefined;
+
+  const acknowledgeReadyLessonNotifications = (lessonId: string) => {
+    const matchingJobs = processingQueue.jobs.filter(
+      (job) => job.lessonId === lessonId && job.status === "ready",
+    );
+    if (matchingJobs.length === 0) return;
+    void Promise.allSettled(
+      matchingJobs.map((job) => processingQueue.discard(job)),
+    ).then((results) => {
+      const failures = results.filter((result) => result.status === "rejected").length;
+      if (failures > 0) {
+        addDebugMessage(
+          `Ready notification acknowledgement failed: lesson=${lessonId}, failures=${failures}`,
+        );
+      }
+    });
+  };
+
+  const openLesson = async (id: string) => {
+    acknowledgeReadyLessonNotifications(id);
+    await selectSavedLesson(id);
+    setAppView("library");
+    setLibraryView("lesson");
+  };
+
+  const navigateProduct = (view: AppView) => {
+    setAppView(view);
+    if (view === "library") setLibraryView("index");
+  };
 
   const requestInstall = async () => {
     if (!installPrompt) return;
@@ -2115,17 +2236,28 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
   };
 
   return (
-    <main className="page-shell">
-      <section className={`tutor-card${lessonActive ? " lesson-active" : ""}`} aria-labelledby="page-title">
-        <header className="hero">
-          <p className="eyebrow">Learning workspace</p>
-          <h1 id="page-title">Conversational AI Tutor</h1>
-          <p className="intro setup-only">
-            A simple workspace for realtime, voice-guided conversation.
-          </p>
-        </header>
+    <main className={`page-shell${lessonActive ? " teaching-shell" : ""}`}>
+      {!lessonActive && <AppNavigation activeView={appView} onNavigate={navigateProduct} />}
+      <section className={`tutor-card${lessonActive ? " lesson-active" : ""}`}>
+        {lessonActive ? <header className="teaching-header"><div><p className="eyebrow">Teaching room</p><h1 id="page-title">{learningSource?.name || "Your lesson"}</h1></div><button className="button-danger end-lesson-top" type="button" onClick={() => void stopConversation()}>End Lesson</button></header> : null}
 
-        {!lessonActive && (
+        {!lessonActive && !persistenceHydrated && <div className="loading-state" role="status"><span className="loading-spinner" aria-hidden="true" /> Restoring your learning workspace…</div>}
+
+        {!lessonActive && persistenceHydrated && appView === "home" && <section className="product-view home-view" aria-labelledby="page-title">
+          <div className="home-heading"><p className="eyebrow">Home</p><h1 id="page-title">Continue learning</h1><p>Pick up where you left off or revisit a recent lesson.</p></div>
+          {resumableLesson ? <section className="continue-card" aria-labelledby="continue-title"><div><p className="eyebrow">Up next</p><h2 id="continue-title">{resumableLesson.title}</h2><p>{lessonProgress(resumableLesson)}% complete{resumableLesson.lessonState.currentNodeId && resumableLesson.lessonState.nodes[resumableLesson.lessonState.currentNodeId]?.title ? ` · ${resumableLesson.lessonState.nodes[resumableLesson.lessonState.currentNodeId].title}` : ""}</p></div><button className="button-primary" type="button" disabled={lessonLibraryBusyId !== null} onClick={() => void openLesson(resumableLesson.id)}>Continue</button></section> : <section className="continue-empty" aria-label="Continue learning"><h2>Ready for your next lesson?</h2><p>Your most recent learning will appear here once you begin.</p></section>}
+          {hasRecentLessons && <RecentLessons lessons={savedLessons.slice(0, 5)} activeLessonId={resumableLesson?.id ?? null} busyLessonId={lessonLibraryBusyId} onContinue={(id) => void openLesson(id)} onDelete={(saved) => void requestDeleteSavedLesson(saved)} onNewLesson={startNewLessonFlow} />}
+          <ProcessingQueue jobs={processingQueue.jobs} lessonActive={lessonActive} onOpen={(id) => void openLesson(id)} onRetry={(job) => void processingQueue.retry(job)} onReselect={(job, files) => void processingQueue.reselect(job, files).catch((error) => setPersistenceNotice(error instanceof Error ? error.message : "Those files did not match this lesson."))} onDiscard={(job) => void processingQueue.discard(job).catch(() => setPersistenceNotice("The lesson could not be discarded safely."))} />
+          <div className="home-create-footer"><button className="button-secondary" type="button" onClick={startNewLessonFlow}>+ Add New Lesson</button></div>
+        </section>}
+
+        <div hidden={lessonActive || !persistenceHydrated || appView !== "library" || libraryView !== "index"}>
+          <LessonLibrary lessons={savedLessons} busyLessonId={lessonLibraryBusyId} onOpen={(lesson) => void openLesson(lesson.id)} onDelete={(lesson) => void requestDeleteSavedLesson(lesson)} onNewLesson={startNewLessonFlow} />
+          {persistenceNotice && <p className="session-notice" role="status">{persistenceNotice}</p>}
+        </div>
+
+        <div className="product-view profile-view" hidden={lessonActive || !persistenceHydrated || appView !== "profile"}>
+          <div className="view-heading"><div><p className="eyebrow">Your account</p><h1>Profile</h1><p>Manage account access and how your tutor teaches.</p></div></div>
           <CloudAccount
             onDebug={addDebugMessage}
             onAuthResolved={(user: User | null) => {
@@ -2147,66 +2279,46 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
             onSyncNow={() => void syncCurrentAccount()}
             onImportLocalLessons={() => void importLocalLessons()}
           />
-        )}
-
-        {!lessonActive && savedLessons.length > 0 && (
-          <RecentLessons
-            lessons={savedLessons}
-            activeLessonId={savedLessonId}
-            busyLessonId={lessonLibraryBusyId}
-            onContinue={(id) => void selectSavedLesson(id)}
-            onDelete={(saved) => void requestDeleteSavedLesson(saved)}
-            onNewLesson={startNewLessonFlow}
-          />
-        )}
-
-        <ProcessingQueue
-          jobs={processingQueue.jobs}
-          lessonActive={lessonActive}
-          onOpen={(lessonId) => void selectSavedLesson(lessonId)}
-          onRetry={(job) => void processingQueue.retry(job)}
-          onReselect={(job, files) => void processingQueue.reselect(job, files).catch((error) => {
-            setPersistenceNotice(error instanceof Error ? error.message : "Those sources did not match the queued lesson.");
-          })}
-          onDiscard={(job) => void processingQueue.discard(job).catch(() => {
-            setPersistenceNotice("The queued lesson could not be discarded safely.");
-          })}
-        />
-
-        <LearningSourceUpload
-          disabled={!persistenceHydrated}
-          cloudUserId={cloudUserId}
-          onQueueBundle={processingQueue.enqueue}
-          onDebug={addDebugMessage}
-        />
-
-        <label className="topic-field setup-only">
-          <span>Lesson topic or focus (optional)</span>
-          <input
-            type="text"
-            value={topicInput}
-            onChange={(event) => setTopicInput(event.target.value)}
-            placeholder="Leave blank to teach the source's main topics"
-            maxLength={160}
-            disabled={microphoneActive || requestingPermission}
-          />
-        </label>
-
-        {!lessonActive && (
-          <section className="teaching-style setup-only" aria-labelledby="teaching-style-title">
-            <h2 id="teaching-style-title">Teaching style</h2>
-            <TeachingStyleControls
-              preferences={teachingPreferences}
-              disabled={requestingPermission}
-              onChange={(update) => {
-                applyAuthoritativeTeachingPreferences({
-                  ...teachingPreferencesRef.current,
-                  ...update,
-                });
-              }}
-            />
+          <section className="appearance-settings" aria-labelledby="appearance-title">
+            <p className="eyebrow">Appearance</p><h2 id="appearance-title">Choose your theme</h2>
+            <div className="appearance-options">
+              {(["system", "light", "dark"] as AppearancePreference[]).map((option) => <button key={option} type="button" className={appearance === option ? "selected" : undefined} aria-pressed={appearance === option} onClick={() => setAppearance(option)}><strong>{capitalize(option)}</strong><small>{option === "system" ? "Use your device appearance" : option === "light" ? "Always use light appearance" : "Always use dark appearance"}</small></button>)}
+            </div>
           </section>
-        )}
+          <section className="teaching-style" aria-labelledby="profile-preferences-title"><p className="eyebrow">Teaching preferences</p><h2 id="profile-preferences-title">Make lessons feel right for you</h2><TeachingStyleControls preferences={teachingPreferences} onChange={(update) => applyAuthoritativeTeachingPreferences({ ...teachingPreferencesRef.current, ...update })} /></section>
+        </div>
+
+        {!lessonActive && persistenceHydrated && appView === "library" && libraryView === "new" && <section className="product-view new-lesson-view" aria-labelledby="new-lesson-title">
+          <button className="back-button" type="button" onClick={() => setLibraryView("index")}>← Back to Library</button>
+          <div className="focused-view-heading"><p className="eyebrow">New lesson</p><h1 id="new-lesson-title">Create New Lesson</h1><p>Turn your learning materials into a focused voice lesson.</p></div>
+          <LearningSourceUpload
+            disabled={!persistenceHydrated}
+            cloudUserId={cloudUserId}
+            onQueueBundle={async (sources, files, title) => {
+              await processingQueue.enqueue(sources, files, title);
+              setLibraryView("index");
+              setPersistenceNotice("Lesson is being prepared. Follow its progress on Home.");
+            }}
+            onDebug={addDebugMessage}
+          />
+          {userError && <p className="session-error" role="alert">{userError}</p>}
+        </section>}
+
+        {!lessonActive && persistenceHydrated && appView === "library" && libraryView === "lesson" && <section className="product-view lesson-detail-view" aria-labelledby="lesson-detail-title">
+          <button className="back-button" type="button" onClick={() => setLibraryView("index")}>← Back to Library</button>
+          {selectedSavedLesson ? <>
+            <div className="focused-view-heading"><p className="eyebrow">Lesson</p><h1 id="lesson-detail-title">{selectedSavedLesson.title}</h1></div>
+            <section className="lesson-detail-card" aria-label="Lesson details"><dl>
+              <div><dt>Progress</dt><dd>{lessonProgress(selectedSavedLesson)}%</dd></div>
+              <div><dt>Current topic</dt><dd>{selectedSavedLesson.lessonState.currentNodeId ? selectedSavedLesson.lessonState.nodes[selectedSavedLesson.lessonState.currentNodeId]?.title || "Ready to begin" : "Ready to begin"}</dd></div>
+              <div><dt>Sources</dt><dd>{selectedSavedLesson.sources.length}</dd></div>
+            </dl></section>
+            <label className="topic-field setup-only"><span>Lesson topic or focus (optional)</span><input type="text" value={topicInput} onChange={(event) => setTopicInput(event.target.value)} placeholder="Teach the source's main topics" maxLength={160} disabled={requestingPermission} /></label>
+            <div className="lesson-detail-actions"><button className="button-primary" type="button" onClick={startConversation} disabled={requestingPermission || learningSource?.status !== "ready"}>{requestingPermission ? "Connecting…" : resumeExistingLesson ? "Continue Lesson" : "Start Lesson"}</button><button className="button-danger" type="button" disabled={lessonLibraryBusyId !== null} onClick={() => void requestDeleteSavedLesson(selectedSavedLesson)}>Delete Lesson</button></div>
+            <div className="lesson-detail-progress"><LessonRoadmap lessonState={selectedSavedLesson.lessonState} lessonActive={false} readOnly navigationPending={false} onNavigate={() => undefined} /></div>
+            {userError && <p className="session-error" role="alert">{userError}</p>}
+          </> : <div className="empty-state compact"><h1 id="lesson-detail-title">Lesson unavailable</h1><p>This lesson could not be loaded.</p></div>}
+        </section>}
 
         {lessonActive && <div className="active-learning-grid">
           <SourceVisual
@@ -2234,6 +2346,11 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
             </p>
           </section>}
 
+          <details className="conversation-transcript">
+            <summary>Transcript</summary>
+            <div><p><strong>You</strong>{lessonState.lastUserTranscript || "No learner transcript yet."}</p><p><strong>Tutor</strong>{lessonState.lastAssistantTranscript || "The tutor has not spoken yet."}</p></div>
+          </details>
+
           <details className="active-teaching-preferences">
             <summary>Teaching style</summary>
             <TeachingStyleControls
@@ -2254,28 +2371,20 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
           </div>
         </div>}
 
-        {!lessonActive && lessonState.rootNodeIds.length > 0 && (
-          <LessonRoadmap
-            lessonState={lessonState}
-            lessonActive={lessonActive}
-            navigationPending={roadmapNavigationPending}
-            onNavigate={navigateFromRoadmap}
-          />
-        )}
+        {lessonActive && userError && <p className="session-error" role="alert">{userError}</p>}
+        {lessonActive && persistenceNotice && <p className="session-notice" role="status">{persistenceNotice}</p>}
 
-        {userError && <p className="session-error" role="alert">{userError}</p>}
-        {persistenceNotice && <p className="session-error" role="status">{persistenceNotice}</p>}
-
-        <div className="status-row" aria-label="Conversation status">
+        {lessonActive && <div className="status-row" aria-label="Conversation status">
           <div className="status-item" aria-live="polite">
             <span
               className={`status-dot${microphoneActive ? " status-dot-active" : ""}`}
               aria-hidden="true"
             />
-            <span>
-              <strong>Microphone</strong>
-              <small>{microphoneStatus}</small>
+            <span className="status-copy">
+              <strong>{microphoneMuted ? "Muted" : "Listening"}</strong>
+              <small>{microphoneMuted ? "Microphone is off" : "You can speak at any time"}</small>
             </span>
+            <button className={`mute-button${microphoneMuted ? " mute-button-active" : ""}`} type="button" onClick={toggleMicrophoneMute} aria-label={microphoneMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={microphoneMuted}>{microphoneMuted ? "Unmute" : "Mute"}</button>
           </div>
           <div className="status-item" aria-live="polite">
             <span
@@ -2283,29 +2392,16 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
               aria-hidden="true"
             />
             <span>
-              <strong>Connection</strong>
-              <small>{aiConnectionStatus}</small>
+              <strong>{transportState === "recovering" || transportState === "handoff" || transportState === "synchronizing" ? "Reconnecting…" : aiConnected ? "Tutor ready" : "Connecting…"}</strong>
+              <small>{aiConnected ? "Voice conversation is active" : "Starting your lesson"}</small>
             </span>
           </div>
-        </div>
+        </div>}
 
         {lessonActive && (
           <section className="lesson-controls" aria-label="Lesson response controls">
-            <button
-              className={`mute-button${microphoneMuted ? " mute-button-active" : ""}`}
-              type="button"
-              onClick={toggleMicrophoneMute}
-              aria-label={microphoneMuted ? "Unmute microphone" : "Mute microphone"}
-              aria-pressed={microphoneMuted}
-            >
-              {microphoneMuted ? "Unmute" : "Mute"}
-            </button>
-            {microphoneMuted && (
-              <p className="mute-notice" role="status">
-                Microphone muted — tutor cannot hear you
-              </p>
-            )}
-            <div className="quick-responses" aria-label="Quick responses">
+            <h3 className="quick-replies-heading" id="quick-replies-title">Quick Replies</h3>
+            <div className="quick-responses" aria-labelledby="quick-replies-title">
               <button type="button" onClick={() => sendQuickResponse("Yes")} aria-label="Yes">
                 Yes
               </button>
@@ -2319,10 +2415,15 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
             <p className="quick-response-feedback" role="status" aria-live="polite">
               {quickResponseFeedback}
             </p>
+            <form className="typed-reply-form" onSubmit={submitTypedReply}>
+              <label className="visually-hidden" htmlFor="typed-reply">Type a reply</label>
+              <input ref={typedReplyInputRef} id="typed-reply" type="text" value={typedReply} onChange={(event) => setTypedReply(event.target.value)} placeholder="Type a reply…" autoComplete="off" />
+              <button type="submit" disabled={!typedReply.trim()}>Send</button>
+            </form>
           </section>
         )}
 
-        <button
+        {lessonActive && <button
           className="start-button"
           type="button"
           onClick={microphoneActive ? () => void stopConversation() : startConversation}
@@ -2338,9 +2439,9 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
               : resumeExistingLesson
                 ? "Continue Lesson"
                 : "Start Conversation"}
-        </button>
+        </button>}
 
-        <section className="lesson-state" aria-labelledby="lesson-state-title">
+        {process.env.NODE_ENV === "development" && <details className="developer-debug"><summary>Developer Debug</summary><section className="lesson-state" aria-labelledby="lesson-state-title">
           <div className="panel-heading">
             <h2 id="lesson-state-title">Lesson State</h2>
             <span>Development</span>
@@ -2498,9 +2599,9 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
               </ol>
             )}
           </div>
-        </details>
+        </details></details>}
 
-        {!lessonActive && (installPrompt || showIosInstallHint) && (
+        {!lessonActive && appView === "home" && (installPrompt || showIosInstallHint) && (
           <aside className="install-hint">
             {installPrompt ? (
               <button type="button" onClick={requestInstall}>Install AI Tutor</button>
