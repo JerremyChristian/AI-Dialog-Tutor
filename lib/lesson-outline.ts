@@ -5,6 +5,7 @@ import type {
   TeachingNodeType,
   SourceReference,
 } from "./learning-source";
+import { createLegacyDeliveryUnits, normalizeDeliveryUnits } from "./teaching-delivery";
 
 type Candidate = {
   originalId: string;
@@ -113,7 +114,7 @@ function normalizeTeachingContract(value: unknown, allowedSourceIds?: ReadonlySe
   const uncertaintyNote = sourceConfidence === "uncertain"
     ? cleanString(record.uncertaintyNote, 300)
     : undefined;
-  return {
+  const contract: AtomicTeachingContract = {
     objective,
     teachingPoints,
     teachingPointSourceReferences: normalizeTeachingPointSourceReferences(
@@ -130,6 +131,12 @@ function normalizeTeachingContract(value: unknown, allowedSourceIds?: ReadonlySe
     sourceConfidence,
     uncertaintyNote,
   };
+  contract.deliveryUnits = normalizeDeliveryUnits(
+    record.deliveryUnits,
+    teachingPoints.length,
+    completionCriteria.length,
+  ) ?? createLegacyDeliveryUnits(contract);
+  return contract;
 }
 
 function normalizeTeachingPointSourceReferences(

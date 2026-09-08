@@ -50,24 +50,23 @@ function buildLiveSetup(config: SetupConfig) {
           {
             name: "lesson_state",
             description:
-              "Synchronize authoritative hierarchical lesson coverage and teaching-contract progress. After fully delivering one ordered teaching point, call progress for that point. Use navigate only for explicit learner-directed movement, skip for explicit subtree skipping, complete only after all teaching points are reported and the current atomic concept is meaningfully finished, and query for authoritative state. A successful complete automatically advances to the next eligible atomic concept.",
+              "Query authoritative lesson state or honor explicit learner-directed navigation and skipping. Teaching delivery progress and concept completion are owned by the application; never attempt to report them with this tool.",
             parametersJsonSchema: {
               type: "object",
               properties: {
                 action: {
                   type: "string",
-                  enum: ["navigate", "progress", "complete", "skip", "query"],
+                  enum: ["navigate", "skip", "query"],
                 },
                 conceptId: {
                   type: "string",
                   description:
-                    "Stable node ID from LESSON_TREE. Required for navigate, progress, complete, and skip.",
+                    "Stable node ID from LESSON_TREE. Required for navigate and skip.",
                 },
-                teachingPointIndex: {
-                  type: "integer",
-                  minimum: 0,
-                  description:
-                    "Zero-based teachingPoints array index just fully delivered. Required only for progress.",
+                purpose: {
+                  type: "string",
+                  enum: ["inspect", "continue"],
+                  description: "For query only: use continue when the learner explicitly asks to resume structured teaching; otherwise inspect.",
                 },
               },
               required: ["action"],

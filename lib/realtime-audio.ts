@@ -93,6 +93,33 @@ export class PcmAudioPlayer {
   private context: AudioContext | null = null;
   private nextStartTime = 0;
   private sources = new Set<AudioBufferSourceNode>();
+  private batch: {
+    epoch: number;
+    sources: Set<AudioBufferSourceNode>;
+    providerComplete: boolean;
+    cancelled: boolean;
+    hadAudio: boolean;
+    drained: boolean;
+    onNaturalDrain: (epoch: number) => void;
+  } | null = null;
+
+  beginBatch(epoch: number, onNaturalDrain: (epoch: number) => void) {
+    this.cancelBatch();
+    this.batch = { epoch, sources: new Set(), providerComplete: false, cancelled: false,
+      hadAudio: false, drained: false, onNaturalDrain };
+  }
+
+  completeBatch(epoch: number) {
+    if (!this.batch || this.batch.epoch !== epoch || this.batch.cancelled) return;
+    this.batch.providerComplete = true;
+    this.maybeReportNaturalDrain();
+  }
+
+  cancelBatch(epoch?: number) {
+    if (!this.batch || (epoch !== undefined && this.batch.epoch !== epoch)) return;
+    this.batch.cancelled = true;
+    this.batch = null;
+  }
 
   async prepare() {
     if (!this.context || this.context.state === "closed") {
@@ -124,7 +151,18 @@ export class PcmAudioPlayer {
     const source = context.createBufferSource();
     source.buffer = audioBuffer;
     source.connect(context.destination);
-    source.onended = () => this.sources.delete(source);
+    const batch = this.batch;
+    if (batch && !batch.cancelled) {
+      batch.hadAudio = true;
+      batch.sources.add(source);
+    }
+    source.onended = () => {
+      this.sources.delete(source);
+      if (batch && this.batch === batch) {
+        batch.sources.delete(source);
+        this.maybeReportNaturalDrain();
+      }
+    };
 
     const startTime = Math.max(context.currentTime + 0.02, this.nextStartTime);
     source.start(startTime);
@@ -133,6 +171,7 @@ export class PcmAudioPlayer {
   }
 
   clear() {
+    this.cancelBatch();
     for (const source of this.sources) {
       try {
         source.stop();
@@ -155,6 +194,14 @@ export class PcmAudioPlayer {
     if (context && context.state !== "closed") {
       await context.close();
     }
+  }
+
+  private maybeReportNaturalDrain() {
+    const batch = this.batch;
+    if (!batch || batch.cancelled || batch.drained || !batch.providerComplete ||
+        !batch.hadAudio || batch.sources.size > 0) return;
+    batch.drained = true;
+    batch.onNaturalDrain(batch.epoch);
   }
 }
 

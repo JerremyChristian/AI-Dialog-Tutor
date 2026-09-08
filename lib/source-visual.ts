@@ -1,4 +1,5 @@
 import type { AtomicTeachingContract, LessonSource, SourceReference } from "./learning-source";
+import { deriveBeatSourceReferences } from "./teaching-delivery";
 
 export type VisualReferenceCandidate = {
   source: LessonSource;
@@ -23,6 +24,23 @@ export function selectVisualReferences(
     ? []
     : contract?.teachingPointSourceReferences?.[teachingPointIndex] ?? [];
   const pointCandidates = visualCandidates(pointReferences, sources, "point");
+  const fallbackUsed = pointCandidates.length === 0;
+  const candidates = fallbackUsed
+    ? visualCandidates(contract?.sourceReferences ?? [], sources, "contract")
+    : pointCandidates;
+  return { candidates, primary: candidates[0] ?? null, fallbackUsed };
+}
+
+export function selectBeatVisualReferences(
+  contract: AtomicTeachingContract | undefined,
+  sources: LessonSource[],
+  teachingPointIndexes: number[],
+): VisualReferenceSelection {
+  const pointCandidates = visualCandidates(
+    contract ? deriveBeatSourceReferences(contract, teachingPointIndexes) : [],
+    sources,
+    "point",
+  );
   const fallbackUsed = pointCandidates.length === 0;
   const candidates = fallbackUsed
     ? visualCandidates(contract?.sourceReferences ?? [], sources, "contract")

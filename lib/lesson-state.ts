@@ -195,6 +195,24 @@ export function progressLessonTeachingPoint(
   };
 }
 
+/** Internal app-owned delivery commit. Never expose this as a model tool. */
+export function commitDeliveredTeachingBeat(
+  state: LessonState,
+  conceptId: string,
+  teachingPointIndexes: number[],
+) {
+  const lastIndex = teachingPointIndexes.at(-1);
+  if (lastIndex === undefined) return transitionError(state, "progress", "Teaching beat is empty");
+  const progressed = progressLessonTeachingPoint(state, conceptId, lastIndex);
+  const node = progressed.state.nodes[conceptId];
+  const nextIndex = progressed.state.teachingContractProgress[conceptId]?.nextTeachingPointIndex ?? 0;
+  if (!progressed.result.ok || !node?.teaching || nextIndex < node.teaching.teachingPoints.length) {
+    return progressed;
+  }
+  const completed = completeLessonConcept(progressed.state, conceptId);
+  return { ...completed, events: [...progressed.events, ...completed.events] };
+}
+
 export function pauseLessonState(
   state: LessonState,
   progress?: { conceptId: string; resumePoint: string },
@@ -587,8 +605,8 @@ When and only when you receive ${PERSISTED_LESSON_RESUME_CONTROL}, the FIRST lea
 - Use persistedResumeContext only as optional wording support. Its recentTeachingContext contains at most three bounded excerpts of recent explanation. Never use excerpts or resumePoint as teaching-completion evidence.
 - RECAP: name the current concept and briefly recap one or two confirmedTeachingPoints. If none are confirmed, say the concept was just beginning; do not invent a specific recap.
 - RESUME LOCATION: identify nextTeachingPoint as the authoritative continuation point. resumePoint may add fine-grained wording only when it is consistent with that point.
-- CONTINUE TEACHING: immediately teach nextTeachingPoint in this same response. Do not stop after orientation and do not hand progression back to the learner. If every teaching point is confirmed but coverage is not taught, perform the legitimate concept-completion/transition step instead of restarting point zero.
-- For a partial current concept, continue its unfinished portion without restarting it.
+- CONTINUE TEACHING: immediately teach the full application-assigned presentation beat in this same response. It begins at nextTeachingPoint and may contain multiple closely related points. Do not stop after orientation and do not hand progression back to the learner.
+- For a partial current concept, restart the full unconfirmed assigned beat cleanly; a brief bridge is fine, but do not infer partial delivery from transcripts.
 - If the current concept has not yet been meaningfully taught after a completed predecessor, briefly connect the last covered concept to the new current concept without claiming the new one was covered.
 - If the current concept is already taught, describe it as a review location, not unfinished work.
 - If resumePoint is absent or weak, use a safe generic current-topic orientation and never invent prior dialogue or details.
@@ -605,20 +623,20 @@ ${persistedResumeGuidance}
 
 Lesson coverage is application-owned. LESSON_TREE is hierarchical. Parent topics aggregate atomic descendants; teaching one child never means siblings or the parent were fully taught. Use the most specific atomic ID whenever possible.
 
-Use the one lesson_state function:
+Use the one lesson_state function only for learner-directed control and state lookup:
 - navigate: explicit movement to a leaf or parent. Parent navigation resolves to an incomplete descendant.
 - skip: explicit skipping of a concept or subtree. Never use it for clarification. If teaching should continue elsewhere afterward, call navigate before teaching that atomic concept.
-- progress: immediately AFTER fully delivering one ordered teachingPoints entry, report its zero-based teachingPointIndex and conceptId. Never report before delivery or merely because you intend to teach it. Report each completed point before moving to the next. Duplicate reports are safe. After interruption, resume the same unconfirmed nextTeachingPoint; a little repetition is safer than skipping it.
-- complete: only the current atomic concept after all teaching points have been reported through progress and the completionCriteria are meaningfully satisfied. Never silently treat unreported points as delivered. Never complete a parent or infer completion from a response ending, elapsed time, a concept mention, one covered point, or a clarification. A successful complete automatically selects and starts the next eligible atomic concept; continue from the returned currentNodeId and its returned currentTeachingProgress without calling navigate for ordinary sequential progression.
-- query: questions about what was taught, skipped, or remains. Answer from the returned tree snapshot.
+- query: use purpose inspect for questions about what was taught, skipped, or remains. Use purpose continue and call silently when the learner explicitly asks to continue structured teaching; wait for the application to assign the next presentation beat.
+
+Never call progress or complete. The application assigns presentation beats and confirms delivery only after their audio plays naturally. Clarifications, requested examples, recaps, and other conversational responses never advance coverage.
 
 For normal active teaching, currentTeachingProgress is authoritative too. Continue and interruption recovery resume its nextTeachingPoint. Navigation, skip, review, and resumePoint changes never reset contract progress. Coverage and contract progress are separate; neither implies mastery.
 
 Teaching contracts describe tutor coverage, not learner understanding. A taught status never implies mastery. Preserve contract keyTerms and notation. If sourceConfidence is uncertain, state uncertainty rather than inventing unreadable material.
 
-Never claim a parent is fully covered unless its returned status is taught. Never describe tool mechanics aloud. Teach depth-first in source order with concise explanations and occasional checks. On a clarification interruption, yield, answer, and resume the same atomic concept and contract without changing coverage.
+Never claim a parent is fully covered unless its returned status is taught. Never describe tool mechanics aloud. Teach depth-first in source order with concise explanations and occasional checks. On a clarification interruption, yield and answer without changing coverage. Wait afterward; when the learner asks to continue, query state silently so the application can restart the unconfirmed presentation beat.
 
-Never speak or quote text wrapped in [[APP_CONTROL:...]]. ${PERSISTED_LESSON_RESUME_CONTROL} is the one-time saved-lesson start signal governed above; it is not learner speech. [[APP_CONTROL:IDLE_CONFIRMATION]] is an internal application signal, not learner speech. When received, naturally ask whether the learner is still there and wants to continue. Then use session_control exactly once when their response clearly means continue, end, or is unclear. During this confirmation, unrelated speech, television, ambient conversation, and nonsense are not confirmation; choose unclear unless intent is clearly directed to this lesson. After continue, resume the current concept naturally. After end, briefly acknowledge without continuing the lesson.
+Never speak or quote text wrapped in [[APP_CONTROL:...]]. ${PERSISTED_LESSON_RESUME_CONTROL} is the one-time saved-lesson start signal governed above; it is not learner speech. [[APP_CONTROL:TEACH_PRESENTATION_BEAT]] assigns the only structured content for that response; follow its beat position and boundary instructions. [[APP_CONTROL:IDLE_CONFIRMATION]] is an internal application signal, not learner speech. When received, naturally ask whether the learner is still there and wants to continue. Then use session_control exactly once when their response clearly means continue, end, or is unclear. During this confirmation, unrelated speech, television, ambient conversation, and nonsense are not confirmation; choose unclear unless intent is clearly directed to this lesson. After continue, query lesson_state with purpose continue so the application assigns the next beat. After end, briefly acknowledge without continuing the lesson.
 
 [[APP_CONTROL:POST_RESUME_SYNC]] is an internal memory-alignment turn. Call lesson_state with action query exactly once, silently accept the returned application state and continuity snapshot as your own existing memory, then end this internal turn with no spoken or written learner-facing response. Do not greet, recap, teach, or continue output during this turn.
 [[APP_CONTROL:CONTINUE_INTERRUPTED_TUTOR_TURN]] means the transport changed while your immediately preceding explanation was unfinished. Continue directly from the interruptedAssistantTranscript/resumePoint in the continuity snapshot. Complete the unfinished thought naturally and concisely without greeting, announcing continuation, recapping the topic, or restarting the explanation.

@@ -4,39 +4,44 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
 import type { AtomicTeachingContract, LessonSource } from "../lib/learning-source";
 import { downloadCloudLessonSource } from "../lib/cloud-sync";
-import { selectVisualReferences } from "../lib/source-visual";
+import { selectBeatVisualReferences } from "../lib/source-visual";
+import { deriveBeatSourceReferences } from "../lib/teaching-delivery";
 
 type Props = {
   conceptId: string | null;
   conceptTitle?: string;
   contract?: AtomicTeachingContract;
-  teachingPointIndex: number;
+  teachingPointIndexes: number[];
+  presentationKey: string;
   sources: LessonSource[];
   cloudOwnerId: string | null;
   onDebug: (message: string) => void;
 };
 type VisualStatus = "idle" | "loading" | "ready" | "error" | "unavailable";
 
-export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointIndex, sources, cloudOwnerId, onDebug }: Props) {
+export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointIndexes, presentationKey, sources, cloudOwnerId, onDebug }: Props) {
+  const teachingPointIndexesKey = teachingPointIndexes.join(",");
   const visualSelection = useMemo(
-    () => selectVisualReferences(contract, sources, teachingPointIndex),
-    [contract, sources, teachingPointIndex],
+    () => selectBeatVisualReferences(contract, sources, teachingPointIndexes),
+    [contract, sources, teachingPointIndexesKey],
   );
   const [referenceIndex, setReferenceIndex] = useState(0);
   const selection = visualSelection.candidates[referenceIndex] ?? visualSelection.primary;
-  const activeReferences = contract?.teachingPointSourceReferences?.[teachingPointIndex]?.length
-    ? contract.teachingPointSourceReferences[teachingPointIndex]
-    : contract?.sourceReferences ?? [];
-  const invalidPdfReference = useMemo(() => activeReferences.find((reference) => {
+  const activeReferences = useMemo(
+    () => contract ? deriveBeatSourceReferences(contract, teachingPointIndexes) : [],
+    [contract, teachingPointIndexesKey],
+  );
+  const invalidPdfReference = useMemo(() => Boolean(activeReferences.find((reference) => {
     const source = sources.find((candidate) => candidate.id === reference.sourceId);
     return source?.mimeType === "application/pdf" && reference.page !== undefined &&
       (!Number.isInteger(reference.page) || reference.page < 1);
-  }), [activeReferences, sources]);
+  })), [activeReferences, sources]);
   const cacheRef = useRef(new Map<string, Promise<PDFDocumentProxy>>());
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
   const renderTaskRef = useRef<RenderTask | null>(null);
   const debugRef = useRef(onDebug);
+  const lastVisualDebugKeyRef = useRef("");
   const [expanded, setExpanded] = useState(false);
   const [status, setStatus] = useState<VisualStatus>("idle");
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
@@ -47,9 +52,12 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
   const [retryNonce, setRetryNonce] = useState(0);
   debugRef.current = onDebug;
   const automaticPage = selection?.reference.page ?? null;
-  const lessonSelectionKey = `${conceptId ?? "none"}:${teachingPointIndex}:${visualSelection.candidates
+  const lessonSelectionKey = `${conceptId ?? "none"}:${presentationKey}:${visualSelection.candidates
     .map((candidate) => `${candidate.source.id}:${candidate.reference.page ?? "document"}`).join("|")}`;
   const selectionKey = `${selection?.source.id ?? "none"}:${automaticPage ?? "none"}`;
+  const visualDebugKey = `${presentationKey}:${selectionKey}:${referenceIndex}:` +
+    `${autoFollow ? "auto" : "manual"}:${expanded ? "expanded" : "collapsed"}:` +
+    `${invalidPdfReference ? "invalid" : "valid"}:${retryNonce}`;
 
   useEffect(() => {
     const cache = cacheRef.current;
@@ -83,16 +91,26 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
   }, [expanded, status]);
 
   useEffect(() => {
+    if (lastVisualDebugKeyRef.current === visualDebugKey) return;
+    lastVisualDebugKeyRef.current = visualDebugKey;
     if (!selection) {
-      setStatus(invalidPdfReference ? "unavailable" : "idle");
       debugRef.current(`Source visual unavailable: reason=${invalidPdfReference ? "invalid-page-reference" : "no-pdf-reference"}`);
       return;
     }
     debugRef.current(
       `Visual source selected: source=${selection.source.id}, page=${automaticPage ?? "none"}, ` +
-      `reason=${selection.reason}, point=${teachingPointIndex}, references=${visualSelection.candidates.length}, ` +
-      `fallback=${visualSelection.fallbackUsed ? "yes" : "no"}`,
+      `reason=${selection.reason}, points=${teachingPointIndexesKey.replaceAll(",", "-")}, references=${visualSelection.candidates.length}, ` +
+      `fallback=${visualSelection.fallbackUsed ? "yes" : "no"}, mode=${autoFollow ? "automatic" : "manual"}`,
     );
+  }, [visualDebugKey, selection?.source.id, selection?.reason, automaticPage,
+    invalidPdfReference, teachingPointIndexesKey, visualSelection.candidates.length,
+    visualSelection.fallbackUsed, autoFollow]);
+
+  useEffect(() => {
+    if (!selection) {
+      setStatus(invalidPdfReference ? "unavailable" : "idle");
+      return;
+    }
     if (!automaticPage) {
       setStatus("unavailable");
       return;
@@ -134,7 +152,10 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
       if (active) { setStatus("error"); debugRef.current(`Source visual unavailable: reason=download-failed, source=${selection.source.id}`); }
     });
     return () => { active = false; };
-  }, [selectionKey, selection, automaticPage, cloudOwnerId, retryNonce, expanded, invalidPdfReference, teachingPointIndex, visualSelection.candidates.length, visualSelection.fallbackUsed]);
+  }, [selectionKey, automaticPage, cloudOwnerId, retryNonce, expanded, invalidPdfReference,
+    teachingPointIndexesKey, visualSelection.candidates.length, visualSelection.fallbackUsed,
+    selection?.source.id, selection?.source.storagePath,
+    selection?.source.storageStatus, selection?.reason]);
 
   useEffect(() => {
     const canvas = canvasRef.current;

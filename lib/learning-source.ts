@@ -27,6 +27,17 @@ export type SourceReference = {
   section?: string;
 };
 
+export type TeachingPresentationBeat = {
+  teachingPointIndexes: number[];
+};
+
+export type TeachingDeliveryUnit = {
+  objective: string;
+  teachingPointIndexes: number[];
+  completionCriteriaIndexes: number[];
+  presentationBeats: TeachingPresentationBeat[];
+};
+
 export type LearningSource = {
   name: string;
   mimeType: SupportedSourceType | string;
@@ -52,6 +63,7 @@ export type AtomicTeachingContract = {
   /** Outer indexes align exactly with teachingPoints; each point may cite 0..N sources. */
   teachingPointSourceReferences?: SourceReference[][];
   completionCriteria: string[];
+  deliveryUnits?: TeachingDeliveryUnit[];
   type: TeachingNodeType;
   importance: TeachingImportance;
   sourceReferences?: SourceReference[];

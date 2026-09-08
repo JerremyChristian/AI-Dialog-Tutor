@@ -93,11 +93,22 @@ const lessonTreeSchema = {
             items: { type: "array", items: sourceReferenceSchema },
           },
           completionCriteria: { type: "array", items: { type: "string" } },
+          deliveryUnits: {
+            type: "array", items: { type: "object", properties: {
+              objective: { type: "string" },
+              teachingPointIndexes: { type: "array", items: { type: "integer" } },
+              completionCriteriaIndexes: { type: "array", items: { type: "integer" } },
+              presentationBeats: { type: "array", items: { type: "object", properties: {
+                teachingPointIndexes: { type: "array", items: { type: "integer" } },
+              }, required: ["teachingPointIndexes"], additionalProperties: false } },
+            }, required: ["objective", "teachingPointIndexes", "completionCriteriaIndexes", "presentationBeats"],
+            additionalProperties: false },
+          },
           sourceReferences: { type: "array", items: sourceReferenceSchema },
           keyTerms: { type: "array", items: { type: "string" } }, notation: { type: "array", items: { type: "string" } },
           sourceConfidence: { type: "string", enum: ["clear", "uncertain"] }, uncertaintyNote: { type: "string" },
         },
-        required: ["type", "importance", "objective", "teachingPoints", "completionCriteria"],
+        required: ["type", "importance", "objective", "teachingPoints", "completionCriteria", "deliveryUnits"],
         additionalProperties: false,
       },
     },
@@ -120,7 +131,11 @@ Return JSON with lessonTitle, structuredSource, and lessonTree. The tree is a fl
 
 Use structured sourceReferences with an exact sourceId from the catalog. PDF page is the 1-based physical PDF page index; omit page for TXT and never invent one. Include node and contract references when useful.
 
-For every teachingPoints entry, return the index-aligned teachingPointSourceReferences entry containing every source location materially useful for teaching that specific point. A point may cite zero, one, or multiple locations, including consecutive or non-consecutive PDF pages and multiple sources. Slides may supply visual structure, notes detailed explanation, transcripts lecturer explanation, and other sources supplementary material. Prefer precise point references, but never force a mapping or invent a page. Preserve an empty inner array when no point-specific location is confidently supported. Keep teachingPoints as strings and keep the outer arrays index-aligned.`;
+For every teachingPoints entry, return the index-aligned teachingPointSourceReferences entry containing every source location materially useful for teaching that specific point. A point may cite zero, one, or multiple locations, including consecutive or non-consecutive PDF pages and multiple sources. Slides may supply visual structure, notes detailed explanation, transcripts lecturer explanation, and other sources supplementary material. Prefer precise point references, but never force a mapping or invent a page. Preserve an empty inner array when no point-specific location is confidently supported. Keep teachingPoints as strings and keep the outer arrays index-aligned.
+
+For each atomic contract also return deliveryUnits. Units must partition every teaching-point index exactly once, in order, into contiguous moderate spoken teaching segments organized around coherent objectives and preferably one or more completion criteria. Do not blindly create one unit per criterion; a unit may have no criterion and a criterion may relate to multiple units. Avoid making an entire large section one unit merely because it shares a heading.
+
+Each unit's presentationBeats must partition that unit's indexes exactly once, in order and contiguously. A beat is one natural Gemini explanation and one visual context. Prefer grouping multiple closely related points. Split for a clearly meaningful slide/source context change, or when a group becomes too large or awkward, but treat source changes as evidence rather than a hard rule: do not make one beat per point or page. Automatic visuals change only between beats.`;
 }
 
 function safeFilename(value: string) {
