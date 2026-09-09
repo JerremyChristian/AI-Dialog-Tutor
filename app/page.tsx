@@ -117,6 +117,7 @@ type InstallPromptEvent = Event & {
 
 type QuickResponse = "Yes" | "Repeat" | "Continue";
 type TeachingPreferenceUpdate = Partial<TeachingPreferences>;
+type PendingTeachingPreferences = Partial<TeachingPreferences>;
 type LibraryView = "index" | "lesson" | "new";
 type AppearancePreference = "system" | "light" | "dark";
 
@@ -285,6 +286,8 @@ export default function Home() {
   const [teachingPreferences, setTeachingPreferences] = useState<TeachingPreferences>(
     DEFAULT_TEACHING_PREFERENCES,
   );
+  const [pendingTeachingPreferences, setPendingTeachingPreferences] =
+    useState<PendingTeachingPreferences>({});
   const [preferenceUpdatePending, setPreferenceUpdatePending] = useState(false);
   const [roadmapNavigationPending, setRoadmapNavigationPending] = useState(false);
   const [persistenceHydrated, setPersistenceHydrated] = useState(false);
@@ -645,6 +648,25 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     setTeachingPreferences(next);
   };
 
+  useEffect(() => {
+    setPendingTeachingPreferences((pending) => {
+      const depthCaughtUp = pending.explanationDepth !== undefined &&
+        pending.explanationDepth === teachingPreferences.explanationDepth;
+      const speedCaughtUp = pending.speakingSpeed !== undefined &&
+        pending.speakingSpeed === teachingPreferences.speakingSpeed;
+      if (!depthCaughtUp && !speedCaughtUp) return pending;
+      const next = { ...pending };
+      if (depthCaughtUp) delete next.explanationDepth;
+      if (speedCaughtUp) delete next.speakingSpeed;
+      return next;
+    });
+  }, [
+    pendingTeachingPreferences.explanationDepth,
+    pendingTeachingPreferences.speakingSpeed,
+    teachingPreferences.explanationDepth,
+    teachingPreferences.speakingSpeed,
+  ]);
+
   const applySyncedLessonMetadata = (synced: SavedLesson) => {
     setSavedLessons((current) => current.map((lesson) =>
       lesson.id === synced.id ? synced : lesson
@@ -924,11 +946,13 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
   };
 
   const changeActiveTeachingPreference = (update: TeachingPreferenceUpdate) => {
-    if (preferenceUpdatePending) return;
     const current = teachingPreferencesRef.current;
-    const next = { ...current, ...update };
-    if (next.explanationDepth === current.explanationDepth &&
-        next.speakingSpeed === current.speakingSpeed) return;
+    const displayed = { ...current, ...pendingTeachingPreferences };
+    if ((update.explanationDepth === undefined ||
+         update.explanationDepth === displayed.explanationDepth) &&
+        (update.speakingSpeed === undefined ||
+         update.speakingSpeed === displayed.speakingSpeed)) return;
+    setPendingTeachingPreferences((pending) => ({ ...pending, ...update }));
     const requested = update.explanationDepth
       ? `depth=${update.explanationDepth}`
       : `speakingSpeed=${update.speakingSpeed}`;
@@ -936,6 +960,18 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
       ? `Please use ${update.explanationDepth} explanations from now on.`
       : `Please use a ${update.speakingSpeed} speaking speed from now on.`;
     if (!transportRef.current?.sendLearnerText(text)) {
+      setPendingTeachingPreferences((pending) => {
+        const next = { ...pending };
+        if (update.explanationDepth !== undefined &&
+            pending.explanationDepth === update.explanationDepth) {
+          delete next.explanationDepth;
+        }
+        if (update.speakingSpeed !== undefined &&
+            pending.speakingSpeed === update.speakingSpeed) {
+          delete next.speakingSpeed;
+        }
+        return next;
+      });
       setUserError("The teaching style could not be updated while reconnecting. Try again.");
       return;
     }
@@ -2407,8 +2443,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
             </header>
             <div id="active-teaching-style-content" className={mobileTeachingStyleExpanded ? "mobile-disclosure-content mobile-expanded" : "mobile-disclosure-content"}>
             <TeachingStyleControls
-              preferences={teachingPreferences}
-              disabled={preferenceUpdatePending}
+              preferences={{ ...teachingPreferences, ...pendingTeachingPreferences }}
               onChange={changeActiveTeachingPreference}
             />
             {preferenceUpdatePending && (
