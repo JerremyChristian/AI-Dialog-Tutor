@@ -521,6 +521,14 @@ h1 {
   gap: 4px;
 }
 
+.source-actions label {
+  display: grid;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
 .source-actions select {
   min-height: 44px;
   border: 1px solid var(--border);
@@ -605,7 +613,7 @@ h1 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
-  margin-bottom: 24px;
+  margin: 0;
 }
 
 .status-item {
@@ -646,8 +654,10 @@ h1 {
 }
 
 .lesson-controls {
-  display: block;
-  margin-bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--teaching-room-section-gap);
+  margin: 0;
 }
 
 .status-copy { min-width: 0; flex: 1; }
@@ -684,10 +694,14 @@ h1 {
 }
 
 .quick-replies-heading {
-  margin: 18px 0 9px;
+  margin: 0 0 9px;
   color: var(--muted);
   font-size: 0.75rem;
   letter-spacing: 0.04em;
+}
+
+.quick-replies-group {
+  position: relative;
 }
 
 .quick-responses {
@@ -708,8 +722,10 @@ h1 {
 }
 
 .quick-response-feedback {
-  min-height: 1em;
-  margin: 7px 0 0;
+  position: absolute;
+  top: 100%;
+  width: 100%;
+  margin: 4px 0 0;
   color: var(--active);
   font-size: 0.75rem;
   text-align: center;
@@ -719,7 +735,7 @@ h1 {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
-  margin-top: 12px;
+  margin: 0;
 }
 
 .typed-reply-form input {
@@ -861,13 +877,16 @@ h1 {
   background: #f8fafb;
 }
 
-.active-teaching-preferences summary {
+.mobile-disclosure-header > h2 {
+  margin: 0;
   min-height: 44px;
   padding: 12px 14px;
-  cursor: pointer;
   font-size: 0.85rem;
   font-weight: 700;
-  touch-action: manipulation;
+}
+
+.mobile-disclosure-header > button {
+  display: none;
 }
 
 .active-teaching-preferences .teaching-style-controls {
@@ -1197,6 +1216,7 @@ h1 {
 
 .active-learning-grid {
   min-width: 0;
+  margin-bottom: var(--teaching-room-section-gap);
 }
 
 .active-learning-sidebar {
@@ -1313,12 +1333,87 @@ h1 {
     display: grid;
     grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.75fr);
     gap: 20px;
-    align-items: start;
+    align-items: stretch;
   }
 
   .source-visual {
     position: sticky;
     top: max(20px, env(safe-area-inset-top));
+    margin-bottom: 0;
+  }
+
+  .active-learning-sidebar {
+    display: flex;
+    min-height: 0;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .active-learning-sidebar .conversation-transcript {
+    min-height: 0;
+    flex: 1 1 0;
+    margin-bottom: 0;
+  }
+}
+
+@media (max-width: 899px) {
+  .active-learning-grid {
+    display: flex;
+    flex-direction: column;
+    gap: var(--teaching-room-section-gap);
+  }
+
+  .active-learning-sidebar {
+    display: contents;
+  }
+
+  .active-summary { order: 1; margin: 0; }
+  .source-visual { order: 2; margin: 0; }
+  .conversation-transcript { order: 3; margin: 0; }
+  .active-teaching-preferences { order: 4; margin: 0; }
+
+  .mobile-disclosure-header {
+    display: flex;
+    min-height: 48px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 0 14px;
+  }
+
+  .mobile-disclosure-header > h2 {
+    display: none;
+  }
+
+  .mobile-disclosure-header > button {
+    display: block;
+    width: 100%;
+    min-height: 44px;
+    padding: 8px 0;
+    border: 0;
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-align: left;
+  }
+
+  .mobile-disclosure-header > button::before { content: "▶"; display: inline-block; width: 1.25rem; }
+  .mobile-disclosure-header > button[aria-expanded="true"]::before { content: "▼"; }
+
+  .mobile-disclosure-header > button:focus-visible {
+    outline: 3px solid rgb(37 87 214 / 22%);
+    outline-offset: 2px;
+  }
+
+  .mobile-disclosure-content {
+    display: none;
+  }
+
+  .mobile-disclosure-content.mobile-expanded {
+    display: block;
   }
 }
 
@@ -1345,17 +1440,6 @@ h1 {
   margin-bottom: 14px;
   overflow-wrap: anywhere;
   font-size: 1.25rem;
-}
-
-.current-utterance {
-  display: -webkit-box;
-  margin: 0;
-  overflow: hidden;
-  color: var(--muted);
-  font-size: 0.9rem;
-  line-height: 1.5;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
 }
 
 .session-error {
@@ -1626,7 +1710,9 @@ summary:focus-visible {
 .button-secondary { min-height: 44px; padding: 10px 16px; border: 1px solid var(--border); border-radius: 10px; background: #fff; color: var(--accent); cursor: pointer; font-weight: 750; }
 
 .library-search, .lesson-name-field { display: grid; gap: 7px; margin-bottom: 24px; font-size: .82rem; font-weight: 700; }
-.library-search input, .lesson-name-field input { width: 100%; min-height: 48px; padding: 11px 14px; border: 1px solid var(--border); border-radius: 10px; background: #fff; color: var(--text); font: inherit; }
+.library-search input, .lesson-name-field input { width: 100%; min-height: 48px; padding: 11px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--text); caret-color: var(--accent); font: inherit; }
+.library-search input::placeholder, .lesson-name-field input::placeholder { color: var(--muted); opacity: .82; }
+.library-search input:focus, .lesson-name-field input:focus { border-color: var(--accent); }
 .library-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 0; padding: 0; list-style: none; }
 .lesson-card { display: flex; min-width: 0; min-height: 240px; flex-direction: column; padding: 22px; border: 1px solid var(--border); border-radius: 14px; background: #fff; }
 .lesson-card h2 { margin: 8px 0; overflow-wrap: anywhere; font-size: 1.15rem; }
@@ -1669,8 +1755,7 @@ summary:focus-visible {
 .step-label { margin-bottom: 7px !important; color: var(--accent) !important; font-size: .7rem !important; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .upload-step-heading { margin: 24px 0 14px; }
 .upload-step-heading p:last-child { color: var(--muted); font-size: .8rem; line-height: 1.5; }
-.create-lesson-action { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--border); }
-.create-lesson-action .step-label { margin: 0 !important; }
+.create-lesson-action { display: flex; align-items: center; justify-content: flex-end; gap: 16px; margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--border); }
 .session-notice { margin-bottom: 18px; padding: 12px 14px; border-radius: 10px; background: #eef4ff; color: #244b91; font-size: .85rem; }
 .loading-state { display: flex; min-height: 320px; align-items: center; justify-content: center; gap: 12px; color: var(--muted); }
 .loading-spinner { width: 20px; height: 20px; border: 2px solid #d7dfeb; border-top-color: var(--accent); border-radius: 50%; animation: loading-spin .8s linear infinite; }
@@ -1678,6 +1763,8 @@ summary:focus-visible {
 
 .teaching-shell { padding-top: max(18px, env(safe-area-inset-top)); }
 .teaching-shell .tutor-card { width: min(100%, 1280px); }
+.lesson-active { --teaching-room-section-gap: 24px; }
+.teaching-controls-stack { display: flex; flex-direction: column; gap: var(--teaching-room-section-gap); }
 .teaching-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 24px; }
 .teaching-header h1 { margin: 0; font-size: clamp(1.35rem, 3vw, 2rem); }
 .end-lesson-top { flex: 0 0 auto; }
@@ -1688,11 +1775,13 @@ summary:focus-visible {
 .developer-debug { margin-top: 24px; color: var(--muted); }
 .developer-debug > summary { min-height: 44px; padding: 12px 0; cursor: pointer; font-size: .78rem; font-weight: 700; }
 .developer-debug .lesson-state { margin-top: 8px; padding: 16px; }
-.conversation-transcript { margin: -6px 0 18px; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; }
-.conversation-transcript summary { min-height: 46px; padding: 13px 14px; cursor: pointer; font-size: .85rem; font-weight: 700; }
-.conversation-transcript div { max-height: 240px; overflow: auto; padding: 0 14px 14px; }
+.conversation-transcript { display: flex; min-height: 0; flex-direction: column; margin: -6px 0 18px; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; }
+.conversation-transcript .mobile-disclosure-header > h2 { min-height: 46px; margin: 0; padding: 13px 14px; font-size: .85rem; font-weight: 700; }
+.conversation-transcript-body { min-height: 0; overflow: auto; padding: 0 14px 14px; }
 .conversation-transcript p { margin: 10px 0 0; color: var(--muted); font-size: .82rem; line-height: 1.5; overflow-wrap: anywhere; }
 .conversation-transcript strong { display: block; margin-bottom: 3px; color: var(--text); }
+.lesson-progress-area { margin: 0; }
+.lesson-progress-area .lesson-roadmap { margin: 0; }
 
 @media (max-width: 720px) {
   .page-shell { padding: 0 12px calc(86px + env(safe-area-inset-bottom)); }
@@ -1710,7 +1799,11 @@ summary:focus-visible {
   .continue-card, .lesson-ready { align-items: stretch; flex-direction: column; padding: 20px; }
   .continue-card .button-primary, .lesson-ready .button-primary { width: 100%; }
   .create-lesson-action { align-items: stretch; flex-direction: column; }
-  .create-lesson-action .source-retry { width: 100%; }
+  .create-lesson-action .button-primary { width: 100%; }
+  .source-details { align-items: stretch; flex-direction: column; }
+  .source-actions { justify-content: space-between; }
+  .source-actions label { min-width: 0; flex: 1; }
+  .source-actions select { width: 100%; }
   .lesson-detail-card dl { grid-template-columns: 1fr; }
   .lesson-detail-actions { align-items: stretch; flex-direction: column; }
   .lesson-detail-actions button { width: 100%; }
@@ -1718,15 +1811,37 @@ summary:focus-visible {
   .home-create-footer .button-secondary { width: 100%; }
   .teaching-shell { padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); }
   .teaching-shell .tutor-card { padding: 14px; }
+  .lesson-active {
+    --teaching-mobile-section-gap: 18px;
+    --teaching-room-section-gap: var(--teaching-mobile-section-gap);
+  }
+  .active-learning-grid,
+  .teaching-controls-stack,
+  .lesson-controls { gap: var(--teaching-mobile-section-gap); }
+  .active-learning-grid { margin-bottom: var(--teaching-mobile-section-gap); }
+  .active-summary,
+  .source-visual,
+  .conversation-transcript,
+  .active-teaching-preferences,
+  .status-row,
+  .lesson-controls,
+  .typed-reply-form,
+  .lesson-progress-area,
+  .lesson-progress-area .lesson-roadmap { margin-block: 0; }
   .teaching-header { margin-bottom: 14px; }
   .teaching-header .eyebrow { margin-bottom: 3px; }
   .teaching-header h1 { max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .end-lesson-top { min-height: 46px; }
   .lesson-active .source-visual-frame { max-height: 48dvh; }
   .lesson-active .status-row { grid-template-columns: 1fr; }
+  .status-item { min-height: 92px; }
   .lesson-controls { position: sticky; z-index: 8; bottom: max(8px, env(safe-area-inset-bottom)); padding: 10px; border: 1px solid var(--border); border-radius: 14px; background: rgb(255 255 255 / 96%); box-shadow: 0 8px 30px rgb(23 33 43 / 14%); }
-  .mute-button { min-height: 54px; min-width: 120px; }
+  .mute-button { min-height: 44px; min-width: 0; padding-inline: 14px; }
   .quick-responses button { min-height: 48px; }
+  .source-visual-controls { display: grid; grid-template-columns: minmax(88px, 1fr) minmax(68px, .8fr) minmax(88px, 1fr); }
+  .source-visual-controls button { width: 100%; min-width: 0; min-height: 56px; font-size: .85rem; line-height: 1.25; text-align: center; white-space: normal; }
+  .source-visual-controls span { min-width: 0; }
+  .source-visual-controls > button:nth-child(4) { grid-column: 1 / -1; min-height: 44px; }
 }
 
 @media (prefers-reduced-motion: reduce) { .loading-spinner { animation: none; } }

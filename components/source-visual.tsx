@@ -42,7 +42,6 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
   const renderTaskRef = useRef<RenderTask | null>(null);
   const debugRef = useRef(onDebug);
   const lastVisualDebugKeyRef = useRef("");
-  const [expanded, setExpanded] = useState(false);
   const [status, setStatus] = useState<VisualStatus>("idle");
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [pageCount, setPageCount] = useState(0);
@@ -56,7 +55,7 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
     .map((candidate) => `${candidate.source.id}:${candidate.reference.page ?? "document"}`).join("|")}`;
   const selectionKey = `${selection?.source.id ?? "none"}:${automaticPage ?? "none"}`;
   const visualDebugKey = `${presentationKey}:${selectionKey}:${referenceIndex}:` +
-    `${autoFollow ? "auto" : "manual"}:${expanded ? "expanded" : "collapsed"}:` +
+    `${autoFollow ? "auto" : "manual"}:expanded:` +
     `${invalidPdfReference ? "invalid" : "valid"}:${retryNonce}`;
 
   useEffect(() => {
@@ -67,8 +66,6 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
       cache.clear();
     };
   }, []);
-
-  useEffect(() => setExpanded(window.matchMedia("(min-width: 900px)").matches), []);
 
   useEffect(() => {
     setReferenceIndex(0);
@@ -88,7 +85,7 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
     const observer = new ResizeObserver(([entry]) => setRenderWidth(Math.floor(entry.contentRect.width)));
     observer.observe(frame);
     return () => observer.disconnect();
-  }, [expanded, status]);
+  }, [status]);
 
   useEffect(() => {
     if (lastVisualDebugKeyRef.current === visualDebugKey) return;
@@ -113,10 +110,6 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
     }
     if (!automaticPage) {
       setStatus("unavailable");
-      return;
-    }
-    if (!expanded) {
-      setStatus("idle");
       return;
     }
     if (!selection.source.storagePath || selection.source.storageStatus !== "stored" || !cloudOwnerId) {
@@ -152,7 +145,7 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
       if (active) { setStatus("error"); debugRef.current(`Source visual unavailable: reason=download-failed, source=${selection.source.id}`); }
     });
     return () => { active = false; };
-  }, [selectionKey, automaticPage, cloudOwnerId, retryNonce, expanded, invalidPdfReference,
+  }, [selectionKey, automaticPage, cloudOwnerId, retryNonce, invalidPdfReference,
     teachingPointIndexesKey, visualSelection.candidates.length, visualSelection.fallbackUsed,
     selection?.source.id, selection?.source.storagePath,
     selection?.source.storageStatus, selection?.reason]);
@@ -206,9 +199,8 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
 
   const label = selection ? `${selection.source.name}${automaticPage ? ` · Page ${automaticPage}` : " · Page not specified"}` : "No source visual for this topic";
   return <section className="source-visual" aria-label="Current lesson source visual">
-    <header className="source-visual-header"><div><small>{conceptTitle || "Current concept"}</small><strong>{label}</strong></div>
-      <button type="button" onClick={() => setExpanded((value) => !value)} aria-expanded={expanded} aria-label={`${expanded ? "Hide" : "Show"} source visual`}>{expanded ? "Hide" : "Show"}</button></header>
-    {expanded && <div className="source-visual-body">
+    <header className="source-visual-header"><div><small>{conceptTitle || "Current concept"}</small><strong>{label}</strong></div></header>
+    <div className="source-visual-body">
       {!selection && <p className="source-visual-message">{invalidPdfReference ? "The referenced PDF page is invalid." : "No source visual for this topic."}</p>}
       {selection && !automaticPage && <p className="source-visual-message">This PDF is relevant, but the source does not specify a page.</p>}
       {selection && automaticPage && status === "unavailable" && <p className="source-visual-message">{selection.source.storagePath ? automaticPage > pageCount && pageCount ? `Referenced page ${automaticPage} is outside this ${pageCount}-page PDF.` : "Original source not available on this device." : "Original source not available on this device."}</p>}
@@ -217,6 +209,6 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
       {selection && status === "ready" && <><div className="source-visual-frame" ref={frameRef}><canvas ref={canvasRef} aria-label={`${selection.source.name}, page ${viewedPage}`} /></div>
         {visualSelection.candidates.length > 1 && <div className="source-visual-controls"><button type="button" onClick={() => selectManualReference(referenceIndex - 1)} disabled={referenceIndex <= 0} aria-label="Previous source reference">Previous source</button><span>Reference {referenceIndex + 1} / {visualSelection.candidates.length}</span><button type="button" onClick={() => selectManualReference(referenceIndex + 1)} disabled={referenceIndex >= visualSelection.candidates.length - 1} aria-label="Next source reference">Next source</button></div>}
         <div className="source-visual-controls"><button type="button" onClick={() => selectManualPage((viewedPage ?? 1) - 1)} disabled={!viewedPage || viewedPage <= 1} aria-label="Previous PDF page">Previous page</button><span>{autoFollow ? `Lesson page ${visualSelection.primary?.reference.page}` : `Viewing page ${viewedPage} manually`}</span><button type="button" onClick={() => selectManualPage((viewedPage ?? 0) + 1)} disabled={!viewedPage || viewedPage >= pageCount} aria-label="Next PDF page">Next page</button>{!autoFollow && <button type="button" onClick={followLesson}>Follow lesson</button>}</div></>}
-    </div>}
+    </div>
   </section>;
 }

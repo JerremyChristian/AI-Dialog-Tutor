@@ -91,6 +91,8 @@ import {
   type CloudSyncState,
 } from "../lib/cloud-sync";
 import { isSupabaseConfigured } from "../lib/supabase/config";
+import { sanitizeLearnerVisibleTutorTranscript } from "../lib/transcript-visibility";
+import { mergeLearnerTranscript } from "../lib/learner-transcript";
 import { useLessonProcessingQueue } from "../lib/use-lesson-processing-queue";
 
 type MicrophoneStatus =
@@ -219,6 +221,11 @@ function capitalize(value: string) {
   return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
 }
 
+function isRedundantPreparationNotice(value: string) {
+  return /lesson is being prepared/i.test(value) &&
+    (/visible in your library/i.test(value) || /follow its progress on home/i.test(value));
+}
+
 function getPersistedResumeContext(
   state: LessonState,
   recentTeachingContext: RecentTeachingContextEntry[],
@@ -263,12 +270,15 @@ export default function Home() {
   const [aiConnectionStatus, setAiConnectionStatus] =
     useState<AiConnectionStatus>("Not connected");
   const [debugMessages, setDebugMessages] = useState<DebugMessage[]>([]);
-  const [currentUtterance, setCurrentUtterance] = useState("");
+  const [latestLearnerReply, setLatestLearnerReply] = useState("");
+  const [visibleTutorTranscript, setVisibleTutorTranscript] = useState("");
   const [userError, setUserError] = useState("");
   const [engagementState, setEngagementState] = useState<EngagementState>("ended");
   const [transportState, setTransportState] = useState<LiveTransportState>("closed");
   const [microphoneMuted, setMicrophoneMuted] = useState(false);
   const [quickResponseFeedback, setQuickResponseFeedback] = useState("");
+  const [mobileTranscriptExpanded, setMobileTranscriptExpanded] = useState(false);
+  const [mobileTeachingStyleExpanded, setMobileTeachingStyleExpanded] = useState(false);
   const [typedReply, setTypedReply] = useState("");
   const [appearance, setAppearance] = useState<AppearancePreference>("system");
   const [appearanceReady, setAppearanceReady] = useState(false);
@@ -325,8 +335,11 @@ export default function Home() {
   const typedInterruptionHandledRef = useRef(false);
   const assistantTurnActiveRef = useRef(false);
   const userTranscriptRef = useRef("");
+  const voiceDraftRef = useRef("");
+  const voiceDraftOpenRef = useRef(false);
   const lastMeaningfulLearnerTranscriptRef = useRef("");
   const assistantTranscriptRef = useRef("");
+  const visibleTutorTranscriptRawRef = useRef("");
   const lastAssistantTurnCompleteRef = useRef(true);
   const lessonStateRef = useRef(lessonState);
   const resumptionPendingRef = useRef(false);
@@ -793,7 +806,6 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     setTopicInput(saved.lessonFocus);
     setSavedLessonId(saved.id);
     setResumeExistingLesson(saved.hasStarted);
-    setCurrentUtterance("");
     presentationBeatRef.current = null;
     setPresentationBeat(null);
     setUserError("");
@@ -824,7 +836,6 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     setTopicInput("");
     setSavedLessonId(null);
     setResumeExistingLesson(false);
-    setCurrentUtterance("");
     presentationBeatRef.current = null;
     setPresentationBeat(null);
     setUserError("");
@@ -832,6 +843,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
 
   const startNewLessonFlow = () => {
     if (lessonActiveRef.current) return;
+    setPersistenceNotice("");
     if (persistenceSaveTimerRef.current) clearTimeout(persistenceSaveTimerRef.current);
     persistenceSaveTimerRef.current = null;
     const outgoingSnapshot = createCurrentLessonSnapshot();
@@ -844,6 +856,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
 
   const selectSavedLesson = async (id: string) => {
     if (lessonActiveRef.current || lessonLibraryBusyId) return;
+    setPersistenceNotice("");
     setLessonLibraryBusyId(id);
     const hydrationGeneration = ++lessonHydrationGenerationRef.current;
     try {
@@ -1048,6 +1061,9 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     }
 
     lastMeaningfulLearnerTranscriptRef.current = text;
+    voiceDraftRef.current = "";
+    voiceDraftOpenRef.current = false;
+    setLatestLearnerReply(response);
     markMeaningfulActivity();
     addDebugMessage(`Quick response sent: ${response}`);
     if (confirming && (response === "Yes" || response === "Continue")) {
@@ -1343,8 +1359,10 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
       typedInterruptionHandledRef.current = true;
     }
     userTranscriptRef.current = text;
+    voiceDraftRef.current = "";
+    voiceDraftOpenRef.current = false;
     lastMeaningfulLearnerTranscriptRef.current = text;
-    setCurrentUtterance(text);
+    setLatestLearnerReply(text);
     updateLessonState((current) => ({
       ...current,
       status: current.status === "interrupted" ? "resolving-interruption" : current.status,
@@ -1376,11 +1394,22 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     // pending graceful rollover from retiring the socket between those events.
     if (voiceActivity === "ACTIVITY_START") {
       transportRef.current?.setLearnerSpeaking(true);
+      userTranscriptRef.current = "";
+      voiceDraftRef.current = "";
+      voiceDraftOpenRef.current = true;
+      lastMeaningfulLearnerTranscriptRef.current = "";
+      setLatestLearnerReply("");
+      lastCandidateLearnerActivityAtRef.current = Date.now();
+      addDebugMessage("User speech started");
     } else if (voiceActivity === "ACTIVITY_END") {
       transportRef.current?.setLearnerSpeaking(false);
     }
     if (serverContent?.inputTranscription?.text) {
       const transcriptFragment = serverContent.inputTranscription.text;
+      if (!voiceDraftOpenRef.current) {
+        voiceDraftRef.current = "";
+        voiceDraftOpenRef.current = true;
+      }
       if (isMeaningfulLearnerTranscript(transcriptFragment)) {
         lastMeaningfulLearnerTranscriptRef.current = mergeTranscript(
           lastMeaningfulLearnerTranscriptRef.current,
@@ -1398,7 +1427,11 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
         userTranscriptRef.current,
         serverContent.inputTranscription.text,
       );
-      setCurrentUtterance(userTranscriptRef.current);
+      voiceDraftRef.current = mergeLearnerTranscript(
+        voiceDraftRef.current,
+        transcriptFragment,
+      );
+      setLatestLearnerReply(voiceDraftRef.current);
       updateLessonState((current) => ({
         ...current,
         status:
@@ -1411,6 +1444,21 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
       if (wasInterrupted) {
         addDebugMessage("Resolving learner interruption");
       }
+    } else if (serverContent?.interimInputTranscription?.text) {
+      if (!voiceDraftOpenRef.current) {
+        voiceDraftRef.current = "";
+        voiceDraftOpenRef.current = true;
+      }
+      voiceDraftRef.current = mergeLearnerTranscript(
+        voiceDraftRef.current,
+        serverContent.interimInputTranscription.text,
+      );
+      setLatestLearnerReply(voiceDraftRef.current);
+    }
+    if (serverContent?.inputTranscription?.finished ||
+        voiceActivity === "ACTIVITY_END" || serverContent?.turnComplete) {
+      voiceDraftRef.current = "";
+      voiceDraftOpenRef.current = false;
     }
 
     if (serverContent?.outputTranscription?.text) {
@@ -1418,6 +1466,8 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
       if (!assistantTurnActiveRef.current) {
         assistantTurnActiveRef.current = true;
         assistantTranscriptRef.current = "";
+        visibleTutorTranscriptRawRef.current = "";
+        setVisibleTutorTranscript("");
         assistantCheckpointConceptIdRef.current = lessonStateRef.current.currentNodeId;
       }
       if (persistedResumeBriefingPendingRef.current &&
@@ -1432,7 +1482,13 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
         assistantTranscriptRef.current,
         serverContent.outputTranscription.text,
       );
-      setCurrentUtterance(assistantTranscriptRef.current);
+      visibleTutorTranscriptRawRef.current = mergeTranscript(
+        visibleTutorTranscriptRawRef.current,
+        serverContent.outputTranscription.text,
+      );
+      setVisibleTutorTranscript(sanitizeLearnerVisibleTutorTranscript(
+        visibleTutorTranscriptRawRef.current,
+      ));
       updateLessonState((current) => ({
         ...current,
         lastAssistantTranscript: assistantTranscriptRef.current,
@@ -1449,10 +1505,6 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     }
 
     if (voiceActivity === "ACTIVITY_START") {
-      userTranscriptRef.current = "";
-      lastMeaningfulLearnerTranscriptRef.current = "";
-      lastCandidateLearnerActivityAtRef.current = Date.now();
-      addDebugMessage("User speech started");
       if (lessonStateRef.current.status === "interrupted") {
         updateLessonState((current) => ({
           ...current,
@@ -1478,6 +1530,8 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
         if (!assistantTurnActiveRef.current) {
           assistantTurnActiveRef.current = true;
           assistantTranscriptRef.current = "";
+          visibleTutorTranscriptRawRef.current = "";
+          setVisibleTutorTranscript("");
           assistantCheckpointConceptIdRef.current = lessonStateRef.current.currentNodeId;
         }
         if (persistedResumeBriefingPendingRef.current &&
@@ -1777,6 +1831,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
 
   const startConversation = async () => {
     setUserError("");
+    setPersistenceNotice("");
     if (
       learningSource?.status !== "ready" ||
       !preparedSourceRef.current
@@ -1853,10 +1908,14 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     }
     setTopicInput(lessonFocus);
     userTranscriptRef.current = "";
+    voiceDraftRef.current = "";
+    voiceDraftOpenRef.current = false;
     lastMeaningfulLearnerTranscriptRef.current = "";
     assistantTranscriptRef.current = "";
+    visibleTutorTranscriptRawRef.current = "";
     lastAssistantTurnCompleteRef.current = true;
-    setCurrentUtterance("");
+    setLatestLearnerReply("");
+    setVisibleTutorTranscript("");
     resumptionPendingRef.current = false;
     addDebugMessage(
       continuingSavedLesson
@@ -2252,8 +2311,8 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
         </section>}
 
         <div hidden={lessonActive || !persistenceHydrated || appView !== "library" || libraryView !== "index"}>
-          <LessonLibrary lessons={savedLessons} busyLessonId={lessonLibraryBusyId} onOpen={(lesson) => void openLesson(lesson.id)} onDelete={(lesson) => void requestDeleteSavedLesson(lesson)} onNewLesson={startNewLessonFlow} />
-          {persistenceNotice && <p className="session-notice" role="status">{persistenceNotice}</p>}
+          <LessonLibrary lessons={savedLessons} processingJobs={processingQueue.jobs} busyLessonId={lessonLibraryBusyId} onOpen={(lesson) => void openLesson(lesson.id)} onDelete={(lesson) => void requestDeleteSavedLesson(lesson)} onNewLesson={startNewLessonFlow} />
+          {persistenceNotice && !isRedundantPreparationNotice(persistenceNotice) && <p className="session-notice" role="status">{persistenceNotice}</p>}
         </div>
 
         <div className="product-view profile-view" hidden={lessonActive || !persistenceHydrated || appView !== "profile"}>
@@ -2297,7 +2356,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
             onQueueBundle={async (sources, files, title) => {
               await processingQueue.enqueue(sources, files, title);
               setLibraryView("index");
-              setPersistenceNotice("Lesson is being prepared. Follow its progress on Home.");
+              setPersistenceNotice("");
             }}
             onDebug={addDebugMessage}
           />
@@ -2339,20 +2398,14 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
             <p className="active-teaching-style">
               Teaching: {capitalize(teachingPreferences.explanationDepth)} · Speech: {capitalize(teachingPreferences.speakingSpeed)}
             </p>
-            <p className="current-utterance">
-              {currentUtterance
-                ? `“${currentUtterance}”`
-                : "Listening for the lesson to begin…"}
-            </p>
           </section>}
 
-          <details className="conversation-transcript">
-            <summary>Transcript</summary>
-            <div><p><strong>You</strong>{lessonState.lastUserTranscript || "No learner transcript yet."}</p><p><strong>Tutor</strong>{lessonState.lastAssistantTranscript || "The tutor has not spoken yet."}</p></div>
-          </details>
-
-          <details className="active-teaching-preferences">
-            <summary>Teaching style</summary>
+          <section className="active-teaching-preferences" aria-labelledby="active-teaching-style-title">
+            <header className="mobile-disclosure-header">
+              <h2 id="active-teaching-style-title">Teaching style</h2>
+              <button type="button" aria-expanded={mobileTeachingStyleExpanded} aria-controls="active-teaching-style-content" onClick={() => setMobileTeachingStyleExpanded((expanded) => !expanded)}>Teaching style</button>
+            </header>
+            <div id="active-teaching-style-content" className={mobileTeachingStyleExpanded ? "mobile-disclosure-content mobile-expanded" : "mobile-disclosure-content"}>
             <TeachingStyleControls
               preferences={teachingPreferences}
               disabled={preferenceUpdatePending}
@@ -2361,19 +2414,23 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
             {preferenceUpdatePending && (
               <p className="preference-pending" role="status">Updating teaching style…</p>
             )}
-          </details>
-          {lessonState.rootNodeIds.length > 0 && <LessonRoadmap
-            lessonState={lessonState}
-            lessonActive={lessonActive}
-            navigationPending={roadmapNavigationPending}
-            onNavigate={navigateFromRoadmap}
-          />}
+            </div>
+          </section>
+
+          <section className="conversation-transcript" aria-labelledby="conversation-transcript-title">
+            <header className="mobile-disclosure-header">
+              <h2 id="conversation-transcript-title">Transcript</h2>
+              <button type="button" aria-expanded={mobileTranscriptExpanded} aria-controls="conversation-transcript-content" onClick={() => setMobileTranscriptExpanded((expanded) => !expanded)}>Transcript</button>
+            </header>
+            <div id="conversation-transcript-content" className={mobileTranscriptExpanded ? "conversation-transcript-body mobile-disclosure-content mobile-expanded" : "conversation-transcript-body mobile-disclosure-content"}><p><strong>You</strong>{latestLearnerReply || "No learner transcript yet."}</p><p><strong>Tutor</strong>{visibleTutorTranscript || "The tutor has not spoken yet."}</p></div>
+          </section>
           </div>
         </div>}
 
         {lessonActive && userError && <p className="session-error" role="alert">{userError}</p>}
-        {lessonActive && persistenceNotice && <p className="session-notice" role="status">{persistenceNotice}</p>}
+        {lessonActive && persistenceNotice && !isRedundantPreparationNotice(persistenceNotice) && <p className="session-notice" role="status">{persistenceNotice}</p>}
 
+        {lessonActive && <div className="teaching-controls-stack">
         {lessonActive && <div className="status-row" aria-label="Conversation status">
           <div className="status-item" aria-live="polite">
             <span
@@ -2400,21 +2457,23 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
 
         {lessonActive && (
           <section className="lesson-controls" aria-label="Lesson response controls">
-            <h3 className="quick-replies-heading" id="quick-replies-title">Quick Replies</h3>
-            <div className="quick-responses" aria-labelledby="quick-replies-title">
-              <button type="button" onClick={() => sendQuickResponse("Yes")} aria-label="Yes">
-                Yes
-              </button>
-              <button type="button" onClick={() => sendQuickResponse("Repeat")} aria-label="Repeat explanation">
-                Repeat
-              </button>
-              <button type="button" onClick={() => sendQuickResponse("Continue")} aria-label="Continue lesson">
-                Continue
-              </button>
+            <div className="quick-replies-group">
+              <h3 className="quick-replies-heading" id="quick-replies-title">Quick Replies</h3>
+              <div className="quick-responses" aria-labelledby="quick-replies-title">
+                <button type="button" onClick={() => sendQuickResponse("Yes")} aria-label="Yes">
+                  Yes
+                </button>
+                <button type="button" onClick={() => sendQuickResponse("Repeat")} aria-label="Repeat explanation">
+                  Repeat
+                </button>
+                <button type="button" onClick={() => sendQuickResponse("Continue")} aria-label="Continue lesson">
+                  Continue
+                </button>
+              </div>
+              <p className="quick-response-feedback" role="status" aria-live="polite">
+                {quickResponseFeedback}
+              </p>
             </div>
-            <p className="quick-response-feedback" role="status" aria-live="polite">
-              {quickResponseFeedback}
-            </p>
             <form className="typed-reply-form" onSubmit={submitTypedReply}>
               <label className="visually-hidden" htmlFor="typed-reply">Type a reply</label>
               <input ref={typedReplyInputRef} id="typed-reply" type="text" value={typedReply} onChange={(event) => setTypedReply(event.target.value)} placeholder="Type a reply…" autoComplete="off" />
@@ -2422,6 +2481,14 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
             </form>
           </section>
         )}
+
+        {lessonActive && lessonState.rootNodeIds.length > 0 && <div className="lesson-progress-area"><LessonRoadmap
+          lessonState={lessonState}
+          lessonActive={lessonActive}
+          navigationPending={roadmapNavigationPending}
+          onNavigate={navigateFromRoadmap}
+        /></div>}
+        </div>}
 
         {lessonActive && <button
           className="start-button"
