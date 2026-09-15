@@ -9,7 +9,13 @@ import {
   type LessonSource,
 } from "../../../lib/learning-source";
 import { createSupabaseServerClient } from "../../../lib/supabase/server";
-import { normalizeLessonTree } from "../../../lib/lesson-outline";
+import { createLessonTreeNormalizationDiagnostics, normalizeLessonTree } from "../../../lib/lesson-outline";
+import {
+  formatDepthDistribution,
+  formatNormalizationLoss,
+  measureNormalizedLessonTree,
+  measureRawLessonTree,
+} from "../../../lib/preprocessing-diagnostics";
 import type { SourceProcessingErrorCode, SourceProcessingErrorResponse } from "../../../lib/source-processing-error";
 
 export const runtime = "nodejs";
@@ -39,6 +45,20 @@ function classify(error: unknown) {
   if (/503|UNAVAILABLE|high demand|overload/i.test(detail)) return { code: "TEMPORARY_UNAVAILABLE" as const, retryable: true, status: 503 };
   if (/499|CANCELLED|aborted|timeout|deadline/i.test(detail)) return { code: "PROCESSING_TIMEOUT" as const, retryable: true, status: 504 };
   return { code: "UNKNOWN" as const, retryable: false, status: 500 };
+}
+
+function safeProviderErrorDetails(error: unknown) {
+  const record = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const nested = record.error && typeof record.error === "object" ? record.error as Record<string, unknown> : {};
+  const status = [record.status, record.statusCode, nested.status, nested.statusCode]
+    .find((value) => typeof value === "number");
+  const code = [record.code, nested.code].find((value) => typeof value === "string" || typeof value === "number");
+  const name = error instanceof Error ? error.name : typeof record.name === "string" ? record.name : undefined;
+  return {
+    httpStatus: status ?? "unavailable",
+    providerCode: code === undefined ? "unavailable" : String(code).slice(0, 80),
+    providerErrorClass: name?.slice(0, 80) || "unavailable",
+  };
 }
 
 function isUuid(value: string) {
@@ -223,6 +243,7 @@ export async function POST(request: Request) {
     try {
       for (const [index, model] of MODELS.entries()) {
         console.info(`Preprocessing model attempt: model=${model}, attempt=${index + 1}/${MODELS.length}`);
+        const attemptStartedAt = Date.now();
         try {
           const response = await client.models.generateContent({ model, contents, config: {
             abortSignal: controller.signal, maxOutputTokens: 32_768, thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
@@ -231,16 +252,54 @@ export async function POST(request: Request) {
             }, required: ["lessonTitle", "structuredSource", "lessonTree"], additionalProperties: false },
           } });
           const parsed = JSON.parse(response.text || "{}") as Record<string, unknown>;
+          const rawMetrics = measureRawLessonTree(parsed.lessonTree);
+          console.info(
+            `PREPROCESSING RAW RESULT: model=${model}, rootCount=${rawMetrics.rootCount}, nodeCount=${rawMetrics.nodeCount}, ` +
+            `leafCount=${rawMetrics.leafCount}, nodesWithChildren=${rawMetrics.nodesWithChildren}, maxDepth=${rawMetrics.maxDepth}, ` +
+            `nodesWithTeachingContract=${rawMetrics.nodesWithTeachingContract}, totalTeachingPoints=${rawMetrics.totalTeachingPoints}, ` +
+            `totalCompletionCriteria=${rawMetrics.totalCompletionCriteria}, nodesWithSourceReferences=${rawMetrics.nodesWithSourceReferences}, ` +
+            `nodesWithPointSourceReferences=${rawMetrics.nodesWithPointSourceReferences}, deliveryUnitsPresent=${rawMetrics.deliveryUnitsPresent}, ` +
+            `depthDistribution={${formatDepthDistribution(rawMetrics.depthDistribution)}}`,
+          );
           const structuredText = typeof parsed.structuredSource === "string" ? parsed.structuredSource.trim() : "";
           const lessonTitle = typeof parsed.lessonTitle === "string" ? parsed.lessonTitle.trim().slice(0, 160) : "";
-          const lessonTree = normalizeLessonTree(parsed.lessonTree, new Set(descriptors.map((source) => source.id)));
+          const normalizationDiagnostics = createLessonTreeNormalizationDiagnostics();
+          const lessonTree = normalizeLessonTree(
+            parsed.lessonTree,
+            new Set(descriptors.map((source) => source.id)),
+            normalizationDiagnostics,
+          );
+          const normalizedMetrics = measureNormalizedLessonTree(lessonTree);
+          console.info(
+            `PREPROCESSING NORMALIZED RESULT: model=${model}, rootCount=${normalizedMetrics.rootCount}, nodeCount=${normalizedMetrics.nodeCount}, ` +
+            `leafCount=${normalizedMetrics.leafCount}, canonicalTeachableNodeCount=${normalizedMetrics.canonicalTeachableNodeCount}, ` +
+            `structuralNodeCount=${normalizedMetrics.structuralNodeCount}, maxDepth=${normalizedMetrics.maxDepth}, ` +
+            `nodesWithTeachingContract=${normalizedMetrics.nodesWithTeachingContract}, totalTeachingPoints=${normalizedMetrics.totalTeachingPoints}, ` +
+            `totalCompletionCriteria=${normalizedMetrics.totalCompletionCriteria}, nodesWithSourceReferences=${normalizedMetrics.nodesWithSourceReferences}, ` +
+            `nodesWithPointSourceReferences=${normalizedMetrics.nodesWithPointSourceReferences}, validDeliveryUnitCount=${normalizationDiagnostics.validDeliveryUnitCount}, ` +
+            `fallbackDeliveryUnitCount=${normalizationDiagnostics.fallbackDeliveryUnitCount}, ` +
+            `depthDistribution={${formatDepthDistribution(normalizedMetrics.depthDistribution)}}, ` +
+            `canonicalIneligible={hasChildrenOnly:${normalizedMetrics.canonicalIneligibility.hasChildrenOnly},` +
+            `noTeachingContract:${normalizedMetrics.canonicalIneligibility.noTeachingContract},emptyTeachingPoints:${normalizedMetrics.canonicalIneligibility.emptyTeachingPoints},` +
+            `invalidContract:${normalizationDiagnostics.contractsDropped}}, suspiciouslyShallow=${normalizedMetrics.suspiciouslyShallow}`,
+          );
+          if (rawMetrics.nodeCount !== normalizedMetrics.nodeCount || normalizationDiagnostics.contractsDropped ||
+              normalizationDiagnostics.contractsRemovedFromStructuralNodes || normalizationDiagnostics.invalidSourceRefsRemoved ||
+              normalizationDiagnostics.invalidDeliveryUnitsFellBack || normalizationDiagnostics.malformedNodesRejected) {
+            console.info(`PREPROCESSING NORMALIZATION LOSS: model=${model}, ${formatNormalizationLoss(rawMetrics.nodeCount, normalizedMetrics.nodeCount, normalizationDiagnostics)}`);
+          }
           if (!structuredText || !lessonTree.length) throw new Error("No structured content returned");
-          console.info(`Bundle preprocessing completed: model=${model}, sources=${typedFiles.length}`);
+          console.info(`Bundle preprocessing completed: model=${model}, sources=${typedFiles.length}, elapsedMs=${Date.now() - attemptStartedAt}`);
           return NextResponse.json({ lessonTitle, structuredText, lessonTree, model }, { headers: { "Cache-Control": "no-store" } });
         } catch (error) {
           lastFailure = classify(error);
           const fallback = lastFailure.retryable && index < MODELS.length - 1 && !controller.signal.aborted;
-          console.warn(`Bundle preprocessing failed: model=${model}, category=${lastFailure.code.toLowerCase()}, fallback=${fallback ? "yes" : "no"}`);
+          const provider = safeProviderErrorDetails(error);
+          console.warn(
+            `Bundle preprocessing failed: model=${model}, category=${lastFailure.code.toLowerCase()}, ` +
+            `httpStatus=${provider.httpStatus}, providerCode=${provider.providerCode}, providerErrorClass=${provider.providerErrorClass}, ` +
+            `elapsedMs=${Date.now() - attemptStartedAt}, fallback=${fallback ? "yes" : "no"}`,
+          );
           if (!fallback) throw error;
         }
       }

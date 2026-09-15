@@ -16,6 +16,33 @@ type Candidate = {
   teaching?: AtomicTeachingContract;
 };
 
+export type LessonTreeNormalizationDiagnostics = {
+  rawNodeCount: number;
+  candidateNodeCount: number;
+  malformedNodesRejected: number;
+  missingTitle: number;
+  contractsDropped: number;
+  contractsRemovedFromStructuralNodes: number;
+  invalidSourceRefsRemoved: number;
+  invalidDeliveryUnitsFellBack: number;
+  validDeliveryUnitCount: number;
+  fallbackDeliveryUnitCount: number;
+  missingParentsReparented: number;
+  cyclesReparented: number;
+  duplicateRawIds: number;
+  invalidLeafCausedTreeRejection: number;
+};
+
+export function createLessonTreeNormalizationDiagnostics(): LessonTreeNormalizationDiagnostics {
+  return {
+    rawNodeCount: 0, candidateNodeCount: 0, malformedNodesRejected: 0, missingTitle: 0,
+    contractsDropped: 0, contractsRemovedFromStructuralNodes: 0, invalidSourceRefsRemoved: 0,
+    invalidDeliveryUnitsFellBack: 0, validDeliveryUnitCount: 0, fallbackDeliveryUnitCount: 0,
+    missingParentsReparented: 0, cyclesReparented: 0, duplicateRawIds: 0,
+    invalidLeafCausedTreeRejection: 0,
+  };
+}
+
 const NODE_TYPES = new Set<TeachingNodeType>([
   "overview", "concept", "definition", "procedure", "worked-example",
   "comparison", "summary",
@@ -24,13 +51,27 @@ const IMPORTANCE_LEVELS = new Set<TeachingImportance>([
   "core", "supporting", "optional",
 ]);
 
-export function normalizeLessonTree(value: unknown, allowedSourceIds?: ReadonlySet<string>): LessonTreeItem[] {
+export function normalizeLessonTree(
+  value: unknown,
+  allowedSourceIds?: ReadonlySet<string>,
+  diagnostics?: LessonTreeNormalizationDiagnostics,
+): LessonTreeItem[] {
   if (!Array.isArray(value)) return [];
+  if (diagnostics) diagnostics.rawNodeCount = value.length;
   const candidates = value.flatMap((item, index): Candidate[] => {
-    if (!item || typeof item !== "object") return [];
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      if (diagnostics) diagnostics.malformedNodesRejected += 1;
+      return [];
+    }
     const record = item as Record<string, unknown>;
     const title = typeof record.title === "string" ? record.title.trim() : "";
-    if (!title) return [];
+    if (!title) {
+      if (diagnostics) {
+        diagnostics.malformedNodesRejected += 1;
+        diagnostics.missingTitle += 1;
+      }
+      return [];
+    }
     return [{
       originalId:
         typeof record.id === "string" && record.id.trim()
@@ -45,10 +86,19 @@ export function normalizeLessonTree(value: unknown, allowedSourceIds?: ReadonlyS
         typeof record.order === "number" && Number.isFinite(record.order)
           ? record.order
           : index + 1,
-      sourceReferences: normalizeSourceReferences(record.sourceReferences, allowedSourceIds),
-      teaching: normalizeTeachingContract(record.teaching, allowedSourceIds),
+      sourceReferences: normalizeSourceReferences(record.sourceReferences, allowedSourceIds, diagnostics),
+      teaching: normalizeTeachingContract(record.teaching, allowedSourceIds, diagnostics),
     }];
   });
+
+  if (diagnostics) {
+    diagnostics.candidateNodeCount = candidates.length;
+    const seen = new Set<string>();
+    for (const candidate of candidates) {
+      if (seen.has(candidate.originalId)) diagnostics.duplicateRawIds += 1;
+      seen.add(candidate.originalId);
+    }
+  }
 
   const byOriginalId = new Map(candidates.map((item) => [item.originalId, item]));
   const usedIds = new Set<string>();
@@ -57,7 +107,10 @@ export function normalizeLessonTree(value: unknown, allowedSourceIds?: ReadonlyS
   function resolveId(candidate: Candidate, visiting = new Set<string>()): string {
     const cached = normalizedIds.get(candidate.originalId);
     if (cached) return cached;
-    if (visiting.has(candidate.originalId)) candidate.parentId = null;
+    if (visiting.has(candidate.originalId)) {
+      candidate.parentId = null;
+      if (diagnostics) diagnostics.cyclesReparented += 1;
+    }
     visiting.add(candidate.originalId);
     const parent = candidate.parentId ? byOriginalId.get(candidate.parentId) : undefined;
     const parentId = parent ? resolveId(parent, visiting) : null;
@@ -74,9 +127,20 @@ export function normalizeLessonTree(value: unknown, allowedSourceIds?: ReadonlyS
   const parentOriginalIds = new Set(
     candidates.flatMap((candidate) => candidate.parentId ? [candidate.parentId] : []),
   );
+  if (diagnostics) {
+    diagnostics.missingParentsReparented = candidates.filter(
+      (candidate) => candidate.parentId && !byOriginalId.has(candidate.parentId),
+    ).length;
+    diagnostics.contractsRemovedFromStructuralNodes = candidates.filter(
+      (candidate) => parentOriginalIds.has(candidate.originalId) && Boolean(candidate.teaching),
+    ).length;
+  }
   if (candidates.some(
     (candidate) => !parentOriginalIds.has(candidate.originalId) && !candidate.teaching,
-  )) return [];
+  )) {
+    if (diagnostics) diagnostics.invalidLeafCausedTreeRejection = 1;
+    return [];
+  }
 
   return candidates.map((candidate) => {
     const parent = candidate.parentId ? byOriginalId.get(candidate.parentId) : undefined;
@@ -93,7 +157,11 @@ export function normalizeLessonTree(value: unknown, allowedSourceIds?: ReadonlyS
   });
 }
 
-function normalizeTeachingContract(value: unknown, allowedSourceIds?: ReadonlySet<string>): AtomicTeachingContract | undefined {
+function normalizeTeachingContract(
+  value: unknown,
+  allowedSourceIds?: ReadonlySet<string>,
+  diagnostics?: LessonTreeNormalizationDiagnostics,
+): AtomicTeachingContract | undefined {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
   const objective = cleanString(record.objective, 300);
@@ -104,7 +172,10 @@ function normalizeTeachingContract(value: unknown, allowedSourceIds?: ReadonlySe
   if (
     !objective || !NODE_TYPES.has(type) || !IMPORTANCE_LEVELS.has(importance) ||
     teachingPoints.length === 0 || completionCriteria.length === 0
-  ) return undefined;
+  ) {
+    if (diagnostics) diagnostics.contractsDropped += 1;
+    return undefined;
+  }
 
   const sourceConfidence = record.sourceConfidence === "uncertain"
     ? "uncertain"
@@ -121,21 +192,32 @@ function normalizeTeachingContract(value: unknown, allowedSourceIds?: ReadonlySe
       record.teachingPointSourceReferences,
       teachingPoints.length,
       allowedSourceIds,
+      diagnostics,
     ),
     completionCriteria,
     type,
     importance,
-    sourceReferences: normalizeSourceReferences(record.sourceReferences, allowedSourceIds),
+    sourceReferences: normalizeSourceReferences(record.sourceReferences, allowedSourceIds, diagnostics),
     keyTerms: optionalList(record.keyTerms, 12),
     notation: optionalList(record.notation, 12),
     sourceConfidence,
     uncertaintyNote,
   };
-  contract.deliveryUnits = normalizeDeliveryUnits(
+  const normalizedDeliveryUnits = normalizeDeliveryUnits(
     record.deliveryUnits,
     teachingPoints.length,
     completionCriteria.length,
-  ) ?? createLegacyDeliveryUnits(contract);
+  );
+  if (normalizedDeliveryUnits) {
+    contract.deliveryUnits = normalizedDeliveryUnits;
+    if (diagnostics) diagnostics.validDeliveryUnitCount += normalizedDeliveryUnits.length;
+  } else {
+    contract.deliveryUnits = createLegacyDeliveryUnits(contract);
+    if (diagnostics) {
+      diagnostics.invalidDeliveryUnitsFellBack += 1;
+      diagnostics.fallbackDeliveryUnitCount += contract.deliveryUnits.length;
+    }
+  }
   return contract;
 }
 
@@ -143,23 +225,37 @@ function normalizeTeachingPointSourceReferences(
   value: unknown,
   teachingPointCount: number,
   allowedSourceIds?: ReadonlySet<string>,
+  diagnostics?: LessonTreeNormalizationDiagnostics,
 ): SourceReference[][] | undefined {
   if (!Array.isArray(value)) return undefined;
   const references = Array.from({ length: Math.min(value.length, teachingPointCount) }, (_, index) =>
-    normalizeSourceReferences(value[index], allowedSourceIds) ?? []
+    normalizeSourceReferences(value[index], allowedSourceIds, diagnostics) ?? []
   );
   return references.some((items) => items.length) ? references : undefined;
 }
 
-function normalizeSourceReferences(value: unknown, allowedSourceIds?: ReadonlySet<string>): SourceReference[] | undefined {
+function normalizeSourceReferences(
+  value: unknown,
+  allowedSourceIds?: ReadonlySet<string>,
+  diagnostics?: LessonTreeNormalizationDiagnostics,
+): SourceReference[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const references = value.flatMap((item): SourceReference[] => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      if (diagnostics) diagnostics.invalidSourceRefsRemoved += 1;
+      return [];
+    }
     const record = item as Record<string, unknown>;
     const sourceId = cleanString(record.sourceId, 64);
-    if (!sourceId || (allowedSourceIds && !allowedSourceIds.has(sourceId))) return [];
+    if (!sourceId || (allowedSourceIds && !allowedSourceIds.has(sourceId))) {
+      if (diagnostics) diagnostics.invalidSourceRefsRemoved += 1;
+      return [];
+    }
     const hasPage = Object.prototype.hasOwnProperty.call(record, "page");
-    if (hasPage && (typeof record.page !== "number" || !Number.isInteger(record.page) || record.page < 1)) return [];
+    if (hasPage && (typeof record.page !== "number" || !Number.isInteger(record.page) || record.page < 1)) {
+      if (diagnostics) diagnostics.invalidSourceRefsRemoved += 1;
+      return [];
+    }
     const page = hasPage ? record.page as number : undefined;
     const section = cleanString(record.section, 200) || undefined;
     return [{ sourceId, ...(page ? { page } : {}), ...(section ? { section } : {}) }];
@@ -168,6 +264,7 @@ function normalizeSourceReferences(value: unknown, allowedSourceIds?: ReadonlySe
     candidate.sourceId === reference.sourceId && candidate.page === reference.page &&
     candidate.section === reference.section
   ) === index).slice(0, 8);
+  if (diagnostics) diagnostics.invalidSourceRefsRemoved += references.length - unique.length;
   return unique.length ? unique : undefined;
 }
 
