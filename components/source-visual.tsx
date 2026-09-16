@@ -35,6 +35,7 @@ type AvailabilityReason =
   | "pdf-load-timeout"
   | "pdf-loading-task-rejected"
   | "pdf-modern-and-legacy-load-failed"
+  | "pdf-ios-legacy-load-failed"
   | "pdf-get-page-failed"
   | "pdf-render-failed"
   | "page-out-of-range"
@@ -86,6 +87,8 @@ type SourceVisualDiagnostics = {
   legacyLoadingTaskPromiseRejected: boolean;
   legacyDocumentLoaded: boolean;
   successfulLoader: "modern" | "legacy" | "none";
+  detectedPdfEnvironment: "ios" | "non-ios" | "unknown";
+  preferredPdfLoader: "modern" | "legacy" | "unknown";
   finalStatus: VisualStatus;
   reason: AvailabilityReason;
 };
@@ -136,9 +139,18 @@ const INITIAL_DIAGNOSTICS: SourceVisualDiagnostics = {
   legacyLoadingTaskPromiseRejected: false,
   legacyDocumentLoaded: false,
   successfulLoader: "none",
+  detectedPdfEnvironment: "unknown",
+  preferredPdfLoader: "unknown",
   finalStatus: "idle",
   reason: "none",
 };
+
+function isIOSWebKitEnvironment() {
+  if (typeof navigator === "undefined") return false;
+  const classicIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+  const iPadOSDesktopUA = navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
+  return classicIOS || iPadOSDesktopUA;
+}
 
 function safePdfError(error: unknown, category: string) {
   const name = error instanceof Error ? error.name.slice(0, 80) : "UnknownError";
@@ -446,6 +458,20 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
             }
           };
 
+          const iosEnvironment = isIOSWebKitEnvironment();
+          logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
+            pdfByteCount, pdfLoad: "started", pdfStages: {
+              detectedPdfEnvironment: iosEnvironment ? "ios" : "non-ios",
+              preferredPdfLoader: iosEnvironment ? "legacy" : "modern",
+              pdfLoaderAttempt: iosEnvironment ? "legacy" : "modern",
+            } });
+          if (iosEnvironment) {
+            try {
+              return await loadPdfAttempt("legacy");
+            } catch {
+              throw new Error("pdf-ios-legacy-load-failed");
+            }
+          }
           try {
             return await loadPdfAttempt("modern");
           } catch (modernError) {
@@ -490,6 +516,7 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
       if (retrievalStage === "download") download = "error";
       const reason: AvailabilityReason = error instanceof Error && error.message === "cloud-source-empty"
         ? "empty-pdf-bytes"
+        : error instanceof Error && error.message === "pdf-ios-legacy-load-failed" ? "pdf-ios-legacy-load-failed"
         : error instanceof Error && error.message === "pdf-modern-and-legacy-load-failed" ? "pdf-modern-and-legacy-load-failed"
         : error instanceof Error && error.message === "pdf-module-import-timeout" ? "pdf-module-import-timeout"
         : error instanceof Error && error.message === "pdf-load-timeout" ? "pdf-load-timeout"
@@ -629,6 +656,8 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
     `errorName: ${diagnostics.errorName}`,
     `errorCategory: ${diagnostics.errorCategory}`,
     `errorMessage: ${diagnostics.errorMessage}`,
+    `detectedPdfEnvironment: ${diagnostics.detectedPdfEnvironment}`,
+    `preferredPdfLoader: ${diagnostics.preferredPdfLoader}`,
     `pdfLoaderAttempt: ${diagnostics.pdfLoaderAttempt}`,
     `modernImportStarted: ${diagnostics.modernImportStarted}`,
     `modernImportResolved: ${diagnostics.modernImportResolved}`,
