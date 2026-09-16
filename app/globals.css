@@ -1351,9 +1351,35 @@ h1 {
   }
 
   .active-learning-sidebar .conversation-transcript {
-    min-height: 0;
+    min-height: 180px;
     flex: 1 1 0;
     margin-bottom: 0;
+  }
+
+  .active-teaching-preferences .mobile-disclosure-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .mobile-disclosure-header > .desktop-teaching-style-toggle {
+    display: grid;
+    width: 44px;
+    min-height: 44px;
+    place-items: center;
+    border: 0;
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+  }
+
+  .mobile-disclosure-header > .desktop-teaching-style-toggle:focus-visible {
+    outline: 3px solid rgb(37 87 214 / 22%);
+    outline-offset: -3px;
+  }
+
+  .active-teaching-preferences.desktop-collapsed .mobile-disclosure-content {
+    display: none;
   }
 }
 
@@ -1407,6 +1433,10 @@ h1 {
   .mobile-disclosure-header > button:focus-visible {
     outline: 3px solid rgb(37 87 214 / 22%);
     outline-offset: 2px;
+  }
+
+  .mobile-disclosure-header > .desktop-teaching-style-toggle {
+    display: none;
   }
 
   .mobile-disclosure-content {

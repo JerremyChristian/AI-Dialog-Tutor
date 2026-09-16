@@ -279,6 +279,7 @@ export default function Home() {
   const [microphoneMuted, setMicrophoneMuted] = useState(false);
   const [quickResponseFeedback, setQuickResponseFeedback] = useState("");
   const [mobileTranscriptExpanded, setMobileTranscriptExpanded] = useState(false);
+  const [desktopTeachingStyleExpanded, setDesktopTeachingStyleExpanded] = useState(true);
   const [mobileTeachingStyleExpanded, setMobileTeachingStyleExpanded] = useState(false);
   const [typedReply, setTypedReply] = useState("");
   const [appearance, setAppearance] = useState<AppearancePreference>("system");
@@ -2438,10 +2439,13 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
             </p>
           </section>}
 
-          <section className="active-teaching-preferences" aria-labelledby="active-teaching-style-title">
+          <section className={desktopTeachingStyleExpanded ? "active-teaching-preferences" : "active-teaching-preferences desktop-collapsed"} aria-labelledby="active-teaching-style-title">
             <header className="mobile-disclosure-header">
               <h2 id="active-teaching-style-title">Teaching style</h2>
               <button type="button" aria-expanded={mobileTeachingStyleExpanded} aria-controls="active-teaching-style-content" onClick={() => setMobileTeachingStyleExpanded((expanded) => !expanded)}>Teaching style</button>
+              <button className="desktop-teaching-style-toggle" type="button" aria-label={desktopTeachingStyleExpanded ? "Collapse teaching style" : "Expand teaching style"} aria-expanded={desktopTeachingStyleExpanded} aria-controls="active-teaching-style-content" onClick={() => setDesktopTeachingStyleExpanded((expanded) => !expanded)}>
+                <span aria-hidden="true">{desktopTeachingStyleExpanded ? "▼" : "▶"}</span>
+              </button>
             </header>
             <div id="active-teaching-style-content" className={mobileTeachingStyleExpanded ? "mobile-disclosure-content mobile-expanded" : "mobile-disclosure-content"}>
             <TeachingStyleControls
