@@ -76,13 +76,13 @@ function buildLiveSetup(config: SetupConfig) {
           {
             name: "session_control",
             description:
-              "Resolve an application-owned idle or final-question confirmation. During idle confirmation, continue only for speech clearly directed to the tutor or a clear lesson request, end for a clear stop/finish response, otherwise unclear. During lesson wrap-up, use end only when the learner clearly has no more questions.",
+              "Resolve application-owned idle, final-question, or completed-lesson restart confirmation. Restart is destructive to progress: first use restart_request, ask for explicit confirmation, then use restart_confirm only for a clear yes or restart_cancel for a decline. During idle confirmation, continue only for speech clearly directed to the tutor or a clear lesson request, end for a clear stop/finish response, otherwise unclear. During lesson wrap-up, use end only when the learner clearly has no more questions.",
             parametersJsonSchema: {
               type: "object",
               properties: {
                 action: {
                   type: "string",
-                  enum: ["continue", "end", "unclear"],
+                  enum: ["continue", "end", "unclear", "restart_request", "restart_confirm", "restart_cancel"],
                 },
               },
               required: ["action"],

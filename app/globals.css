@@ -1781,6 +1781,10 @@ summary:focus-visible {
 .lesson-detail-card dd { margin: 0; overflow-wrap: anywhere; font-size: .95rem; font-weight: 700; }
 .lesson-detail-actions { display: flex; gap: 10px; }
 .lesson-detail-actions .button-primary { flex: 1; }
+.restart-lesson-confirmation { margin-top: 14px; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.restart-lesson-confirmation h2 { margin: 0 0 6px; font-size: 1rem; }
+.restart-lesson-confirmation p { margin: 0; color: var(--muted); font-size: .85rem; line-height: 1.5; }
+.restart-lesson-confirmation > div { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
 .lesson-detail-progress { margin-top: 32px; padding-top: 24px; border-top: 1px solid var(--border); }
 .lesson-detail-progress .lesson-roadmap { margin: 0; }
 .step-label { margin-bottom: 7px !important; color: var(--accent) !important; font-size: .7rem !important; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }

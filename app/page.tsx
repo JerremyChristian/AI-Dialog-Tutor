@@ -314,6 +314,8 @@ export default function Home() {
   const [learningSource, setLearningSource] = useState<LearningSource | null>(null);
   const [lessonSources, setLessonSources] = useState<LessonSource[]>([]);
   const [presentationBeat, setPresentationBeat] = useState<PresentationBeat | null>(null);
+  const [restartConfirmationOpen, setRestartConfirmationOpen] = useState(false);
+  const [restartPending, setRestartPending] = useState(false);
   const preparedSourceRef = useRef<PreparedLearningSource | null>(null);
   const savedLessonIdRef = useRef<string | null>(null);
   const savedLessonCreatedAtRef = useRef<string | null>(null);
@@ -384,6 +386,9 @@ export default function Home() {
   const presentationBeatRef = useRef<PresentationBeat | null>(null);
   const generationEpochRef = useRef(0);
   const lessonWrapUpRef = useRef(false);
+  const conversationalRestartConfirmationRef = useRef(false);
+  const restartPendingRef = useRef(false);
+  const restartActiveLessonRef = useRef<() => Promise<void>>(async () => undefined);
 
   const addDebugMessage = useCallback((text: string) => {
     if (!isMountedRef.current) return;
@@ -836,6 +841,48 @@ ${completesPlannedLesson
     if (snapshot) await persistLessonSnapshot(snapshot);
   };
 
+  const resetCurrentLessonProgress = async () => {
+    const prepared = preparedSourceRef.current;
+    if (!prepared) return false;
+    const freshState = createLessonState(lessonStateRef.current.topic, prepared.lessonTree);
+    invalidateActiveTeachingBeat("lesson-restarted");
+    generationEpochRef.current += 1;
+    presentationBeatRef.current = null;
+    setPresentationBeat(null);
+    lessonWrapUpRef.current = false;
+    conversationalRestartConfirmationRef.current = false;
+    resumptionPendingRef.current = false;
+    persistedResumeBriefingPendingRef.current = false;
+    persistedResumeFirstResponseLoggedRef.current = false;
+    silentLessonRecoveryPendingRef.current = false;
+    roadmapNavigationPendingRef.current = false;
+    toolResultsRef.current.clear();
+    cancelledToolCallIdsRef.current.clear();
+    recentTeachingContextRef.current = [];
+    userTranscriptRef.current = "";
+    voiceDraftRef.current = "";
+    voiceDraftOpenRef.current = false;
+    lastMeaningfulLearnerTranscriptRef.current = "";
+    assistantTranscriptRef.current = "";
+    visibleTutorTranscriptRawRef.current = "";
+    assistantCheckpointConceptIdRef.current = null;
+    lastAssistantTurnCompleteRef.current = true;
+    lessonStateRef.current = freshState;
+    setLessonState(freshState);
+    setLatestLearnerReply("");
+    setVisibleTutorTranscript("");
+    setTypedReply("");
+    setRoadmapNavigationPending(false);
+    setPendingTeachingPreferences({});
+    setPreferenceUpdatePending(false);
+    setUserError("");
+    resumeExistingLessonRef.current = false;
+    setResumeExistingLesson(false);
+    await persistCurrentLesson(freshState);
+    addDebugMessage(`Completed lesson progress reset: lesson=${savedLessonIdRef.current || "unknown"}`);
+    return true;
+  };
+
   const hydrateSavedLesson = (saved: SavedLesson, requestedGeneration?: number) => {
     if (lessonActiveRef.current || lessonStartupPendingRef.current ||
         (requestedGeneration !== undefined && requestedGeneration !== lessonHydrationGenerationRef.current)) {
@@ -845,6 +892,8 @@ ${completesPlannedLesson
     preparedSourceRef.current = saved.source.prepared;
     lessonStateRef.current = saved.lessonState;
     lessonWrapUpRef.current = false;
+    conversationalRestartConfirmationRef.current = false;
+    setRestartConfirmationOpen(false);
     recentTeachingContextRef.current = saved.recentTeachingContext;
     teachingPreferencesRef.current = saved.teachingPreferences;
     savedLessonIdRef.current = saved.id;
@@ -877,6 +926,8 @@ ${completesPlannedLesson
     preparedSourceRef.current = null;
     lessonStateRef.current = emptyLesson;
     lessonWrapUpRef.current = false;
+    conversationalRestartConfirmationRef.current = false;
+    setRestartConfirmationOpen(false);
     recentTeachingContextRef.current = [];
     teachingPreferencesRef.current = DEFAULT_TEACHING_PREFERENCES;
     savedLessonIdRef.current = null;
@@ -1673,6 +1724,7 @@ ${completesPlannedLesson
     let postResumeQueryReceived = false;
     let recoveryQueryReceived = false;
     let requestSilentRecovery = false;
+    let restartAfterResponse = false;
 
     for (const call of calls) {
       const id = call.id;
@@ -1738,7 +1790,30 @@ ${completesPlannedLesson
           };
         }
       } else if (call.name === "session_control") {
-        if (lessonWrapUpRef.current && action === "end") {
+        if (action === "restart_request") {
+          if (!isLessonPlanComplete(lessonStateRef.current)) {
+            result = { ok: false, action, message: "Restart is available after lesson completion" };
+          } else {
+            conversationalRestartConfirmationRef.current = true;
+            addDebugMessage("Conversational lesson restart confirmation requested");
+            result = {
+              ok: true,
+              action,
+              message: "Ask the learner to confirm that teaching progress will be cleared while lesson materials and content are preserved",
+            };
+          }
+        } else if (action === "restart_confirm") {
+          if (!conversationalRestartConfirmationRef.current) {
+            result = { ok: false, action, message: "No lesson restart confirmation is pending" };
+          } else {
+            conversationalRestartConfirmationRef.current = false;
+            restartAfterResponse = true;
+            result = { ok: true, action, message: "Restart the completed lesson from the beginning" };
+          }
+        } else if (action === "restart_cancel") {
+          conversationalRestartConfirmationRef.current = false;
+          result = { ok: true, action, message: "Keep the completed lesson unchanged" };
+        } else if (lessonWrapUpRef.current && action === "end") {
           addDebugMessage("Final questions completed");
           result = { ok: true, action: "end", message: "End the completed lesson" };
           endAfterResponse = true;
@@ -1912,6 +1987,9 @@ ${completesPlannedLesson
       addDebugMessage("Realtime error: Live connection closed before lesson state response");
     }
     if (endAfterResponse) window.setTimeout(() => void stopConversation("confirmed"), 250);
+    if (restartAfterResponse) {
+      window.setTimeout(() => void restartActiveLessonRef.current(), 250);
+    }
   };
 
   const startConversation = async () => {
@@ -2322,6 +2400,21 @@ ${completesPlannedLesson
     if (hadSession) addDebugMessage("Live connection closed");
   };
 
+  const restartCompletedLesson = async () => {
+    if (restartPendingRef.current || !isLessonPlanComplete(lessonStateRef.current)) return;
+    restartPendingRef.current = true;
+    setRestartPending(true);
+    setRestartConfirmationOpen(false);
+    try {
+      if (lessonActiveRef.current) await stopConversation();
+      if (await resetCurrentLessonProgress()) await startConversation();
+    } finally {
+      restartPendingRef.current = false;
+      setRestartPending(false);
+    }
+  };
+  restartActiveLessonRef.current = restartCompletedLesson;
+
   const microphoneActive = microphoneStatus === "Active";
   const aiConnected = aiConnectionStatus === "Connected";
   const requestingPermission = microphoneStatus === "Requesting permission";
@@ -2346,6 +2439,9 @@ ${completesPlannedLesson
   const selectedSavedLesson = savedLessonId
     ? savedLessons.find((lesson) => lesson.id === savedLessonId)
     : undefined;
+  const selectedLessonComplete = selectedSavedLesson
+    ? isLessonPlanComplete(selectedSavedLesson.lessonState)
+    : false;
 
   const acknowledgeReadyLessonNotifications = (lessonId: string) => {
     const matchingJobs = processingQueue.jobs.filter(
@@ -2462,7 +2558,12 @@ ${completesPlannedLesson
               <div><dt>Sources</dt><dd>{selectedSavedLesson.sources.length}</dd></div>
             </dl></section>
             <label className="topic-field setup-only"><span>Lesson topic or focus (optional)</span><input type="text" value={topicInput} onChange={(event) => setTopicInput(event.target.value)} placeholder="Teach the source's main topics" maxLength={160} disabled={requestingPermission} /></label>
-            <div className="lesson-detail-actions"><button className="button-primary" type="button" onClick={startConversation} disabled={requestingPermission || learningSource?.status !== "ready"}>{requestingPermission ? "Connecting…" : resumeExistingLesson ? "Continue Lesson" : "Start Lesson"}</button><button className="button-danger" type="button" disabled={lessonLibraryBusyId !== null} onClick={() => void requestDeleteSavedLesson(selectedSavedLesson)}>Delete Lesson</button></div>
+            <div className="lesson-detail-actions"><button className="button-primary" type="button" onClick={startConversation} disabled={requestingPermission || learningSource?.status !== "ready" || restartPending}>{requestingPermission ? "Connecting…" : resumeExistingLesson ? "Continue Lesson" : "Start Lesson"}</button>{selectedLessonComplete && <button className="button-secondary" type="button" disabled={restartPending || lessonLibraryBusyId !== null} onClick={() => setRestartConfirmationOpen(true)}>Restart Lesson</button>}<button className="button-danger" type="button" disabled={restartPending || lessonLibraryBusyId !== null} onClick={() => void requestDeleteSavedLesson(selectedSavedLesson)}>Delete Lesson</button></div>
+            {selectedLessonComplete && restartConfirmationOpen && <section className="restart-lesson-confirmation" role="alertdialog" aria-labelledby="restart-lesson-title" aria-describedby="restart-lesson-description">
+              <h2 id="restart-lesson-title">Restart this lesson?</h2>
+              <p id="restart-lesson-description">This will clear your teaching progress for this lesson and start it again from the beginning. Your materials and lesson content will not be deleted.</p>
+              <div><button className="button-secondary" type="button" disabled={restartPending} onClick={() => setRestartConfirmationOpen(false)}>Cancel</button><button className="button-danger" type="button" disabled={restartPending} onClick={() => void restartCompletedLesson()}>{restartPending ? "Restarting…" : "Restart"}</button></div>
+            </section>}
             <div className="lesson-detail-progress"><LessonRoadmap lessonState={selectedSavedLesson.lessonState} lessonActive={false} readOnly navigationPending={false} onNavigate={() => undefined} /></div>
             {userError && <p className="session-error" role="alert">{userError}</p>}
           </> : <div className="empty-state compact"><h1 id="lesson-detail-title">Lesson unavailable</h1><p>This lesson could not be loaded.</p></div>}
