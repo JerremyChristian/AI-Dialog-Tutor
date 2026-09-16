@@ -353,6 +353,31 @@ export async function downloadCloudLessonSource(source: { storagePath?: string |
   return data;
 }
 
+export async function resolveCloudLessonSourcePath(
+  lessonId: string,
+  sourceId: string,
+  expectedUserId: string,
+): Promise<string | null> {
+  if (!isUuid(lessonId) || !isUuid(sourceId) || !isUuid(expectedUserId)) {
+    throw new Error("cloud-source-lookup-invalid");
+  }
+  const { client, user } = await authenticatedClient(expectedUserId);
+  const { data, error } = await client.from("lesson_sources")
+    .select("id,lesson_id,user_id,storage_path")
+    .eq("id", sourceId)
+    .eq("lesson_id", lessonId)
+    .eq("user_id", user.id)
+    .maybeSingle();
+  if (error) throw new Error("cloud-source-lookup-failed");
+  if (!data) return null;
+  if (data.id !== sourceId || data.lesson_id !== lessonId || data.user_id !== user.id ||
+      typeof data.storage_path !== "string") throw new Error("cloud-source-lookup-invalid");
+  const segments = data.storage_path.split("/");
+  if (segments.length !== 4 || segments[0] !== user.id || segments[1] !== lessonId ||
+      segments[2] !== sourceId || !segments[3]) throw new Error("cloud-source-path-invalid");
+  return data.storage_path;
+}
+
 function parseCloudRow(row: CloudLessonRow, ownerId: string): SavedLesson | null {
   if (row.user_id !== ownerId || row.snapshot_schema_version !== SAVED_LESSON_SCHEMA_VERSION) {
     return null;

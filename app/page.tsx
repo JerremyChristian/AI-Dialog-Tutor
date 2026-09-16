@@ -2334,7 +2334,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     <main className={`page-shell${lessonActive ? " teaching-shell" : ""}`}>
       {!lessonActive && <AppNavigation activeView={appView} onNavigate={navigateProduct} />}
       <section className={`tutor-card${lessonActive ? " lesson-active" : ""}`}>
-        {lessonActive ? <header className="teaching-header"><div><p className="eyebrow">Teaching room</p><h1 id="page-title">{learningSource?.name || "Your lesson"}</h1></div><button className="button-danger end-lesson-top" type="button" onClick={() => void stopConversation()}>End Lesson</button></header> : null}
+        {lessonActive ? <header className="teaching-header"><div><p className="eyebrow">Teaching room</p><h1 id="page-title">{learningSource?.name || "Your lesson"}</h1></div><button className="button-danger end-lesson-top" type="button" aria-label="End lesson" onClick={() => void stopConversation()}><span className="end-lesson-desktop">End Lesson</span><span className="end-lesson-mobile" aria-hidden="true">End</span></button></header> : null}
 
         {!lessonActive && !persistenceHydrated && <div className="loading-state" role="status"><span className="loading-spinner" aria-hidden="true" /> Restoring your learning workspace…</div>}
 
@@ -2423,7 +2423,9 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
             teachingPointIndexes={presentedTeachingPointIndexes}
             presentationKey={presentationKey}
             sources={lessonSources}
+            lessonId={savedLessonId}
             cloudOwnerId={cloudUserId}
+            authReady={cloudAuthReady}
             onDebug={addDebugMessage}
           />
           <div className="active-learning-sidebar">

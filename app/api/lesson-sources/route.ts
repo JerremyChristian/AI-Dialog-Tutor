@@ -22,7 +22,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-const MODELS = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"] as const;
+const MODELS = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash"] as const;
 const MODEL_TIMEOUT_MS = 180_000;
 const OPERATION_TIMEOUT_MS = 300_000;
 

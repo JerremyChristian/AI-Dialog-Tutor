@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
 import type { AtomicTeachingContract, LessonSource } from "../lib/learning-source";
-import { downloadCloudLessonSource } from "../lib/cloud-sync";
+import { downloadCloudLessonSource, resolveCloudLessonSourcePath } from "../lib/cloud-sync";
 import { selectBeatVisualReferences } from "../lib/source-visual";
 import { deriveBeatSourceReferences } from "../lib/teaching-delivery";
 
@@ -14,12 +14,14 @@ type Props = {
   teachingPointIndexes: number[];
   presentationKey: string;
   sources: LessonSource[];
+  lessonId: string | null;
   cloudOwnerId: string | null;
+  authReady: boolean;
   onDebug: (message: string) => void;
 };
-type VisualStatus = "idle" | "loading" | "ready" | "error" | "unavailable";
+type VisualStatus = "idle" | "resolving" | "downloading" | "rendering" | "ready" | "error" | "unavailable";
 
-export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointIndexes, presentationKey, sources, cloudOwnerId, onDebug }: Props) {
+export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointIndexes, presentationKey, sources, lessonId, cloudOwnerId, authReady, onDebug }: Props) {
   const teachingPointIndexesKey = teachingPointIndexes.join(",");
   const visualSelection = useMemo(
     () => selectBeatVisualReferences(contract, sources, teachingPointIndexes),
@@ -112,29 +114,53 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
       setStatus("unavailable");
       return;
     }
-    if (!selection.source.storagePath || selection.source.storageStatus !== "stored" || !cloudOwnerId) {
+    debugRef.current(`Source visual metadata: source=${selection.source.id}, snapshotStoragePath=${selection.source.storagePath ? "present" : "missing"}, auth=${authReady ? "ready" : "not-ready"}`);
+    if (!authReady) {
+      setStatus("resolving");
+      return;
+    }
+    if (!cloudOwnerId || !lessonId) {
       setStatus("unavailable");
-      debugRef.current("Source visual unavailable: reason=original-source-not-stored");
+      debugRef.current("Source visual unavailable: reason=no-cloud-source-context");
       return;
     }
     let active = true;
-    const key = `${selection.source.id}:${selection.source.storagePath}`;
-    let promise = cacheRef.current.get(key);
-    if (promise) debugRef.current(`Source visual cache hit: source=${selection.source.id}`);
-    else {
-      debugRef.current(`Source visual download started: source=${selection.source.id}`);
-      promise = downloadCloudLessonSource(selection.source, cloudOwnerId).then(async (blob) => {
-        const bytes = await blob.arrayBuffer();
-        debugRef.current(`Source visual download completed: source=${selection.source.id}, bytes=${bytes.byteLength}`);
-        const pdfjs = await import("pdfjs-dist");
-        pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
-        return pdfjs.getDocument({ data: bytes }).promise;
-      });
-      cacheRef.current.set(key, promise);
-      promise.catch(() => cacheRef.current.delete(key));
-    }
-    setStatus("loading");
-    void promise.then((document) => {
+    const load = async () => {
+      let storagePath = selection.source.storagePath;
+      if (!storagePath) {
+        setStatus("resolving");
+        debugRef.current(`Source visual metadata lookup started: lesson=${lessonId}, source=${selection.source.id}`);
+        storagePath = await resolveCloudLessonSourcePath(lessonId, selection.source.id, cloudOwnerId);
+        debugRef.current(`Source visual metadata lookup completed: source=${selection.source.id}, storagePath=${storagePath ? "present" : "missing"}`);
+        if (!storagePath) {
+          if (active) setStatus("unavailable");
+          return null;
+        }
+      }
+      if (!active) return null;
+      const key = `${selection.source.id}:${storagePath}`;
+      let promise = cacheRef.current.get(key);
+      if (promise) debugRef.current(`Source visual cache hit: source=${selection.source.id}`);
+      else {
+        setStatus("downloading");
+        debugRef.current(`Source visual private download started: source=${selection.source.id}`);
+        promise = downloadCloudLessonSource({ storagePath }, cloudOwnerId).then(async (blob) => {
+          const bytes = await blob.arrayBuffer();
+          debugRef.current(`Source visual private download completed: source=${selection.source.id}, byteCount=${bytes.byteLength}`);
+          if (!bytes.byteLength) throw new Error("cloud-source-empty");
+          debugRef.current(`Source visual PDF renderer started: source=${selection.source.id}`);
+          const pdfjs = await import("pdfjs-dist");
+          pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
+          return pdfjs.getDocument({ data: bytes }).promise;
+        });
+        cacheRef.current.set(key, promise);
+        promise.catch(() => cacheRef.current.delete(key));
+      }
+      setStatus("rendering");
+      return promise;
+    };
+    void load().then((document) => {
+      if (!document) return;
       if (!active) return;
       setPdf(document); setPageCount(document.numPages);
       if (automaticPage > document.numPages) {
@@ -142,13 +168,12 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
         debugRef.current(`Source visual unavailable: reason=page-out-of-range, source=${selection.source.id}, page=${automaticPage}, pages=${document.numPages}`);
       } else setStatus("ready");
     }).catch(() => {
-      if (active) { setStatus("error"); debugRef.current(`Source visual unavailable: reason=download-failed, source=${selection.source.id}`); }
+      if (active) { setStatus("error"); debugRef.current(`Source visual retrieval failed: source=${selection.source.id}`); }
     });
     return () => { active = false; };
-  }, [selectionKey, automaticPage, cloudOwnerId, retryNonce, invalidPdfReference,
+  }, [selectionKey, automaticPage, lessonId, cloudOwnerId, authReady, retryNonce, invalidPdfReference,
     teachingPointIndexesKey, visualSelection.candidates.length, visualSelection.fallbackUsed,
-    selection?.source.id, selection?.source.storagePath,
-    selection?.source.storageStatus, selection?.reason]);
+    selection?.source.id, selection?.source.storagePath, selection?.reason]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -204,8 +229,8 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
       {!selection && <p className="source-visual-message">{invalidPdfReference ? "The referenced PDF page is invalid." : "No source visual for this topic."}</p>}
       {selection && !automaticPage && <p className="source-visual-message">This PDF is relevant, but the source does not specify a page.</p>}
       {selection && automaticPage && status === "unavailable" && <p className="source-visual-message">{selection.source.storagePath ? automaticPage > pageCount && pageCount ? `Referenced page ${automaticPage} is outside this ${pageCount}-page PDF.` : "Original source not available on this device." : "Original source not available on this device."}</p>}
-      {status === "loading" && <p className="source-visual-message" role="status">Loading source page…</p>}
-      {status === "error" && <div className="source-visual-message" role="alert"><p>The source visual could not be loaded. Tutoring can continue.</p><button type="button" onClick={retry}>Retry visual</button></div>}
+      {(status === "resolving" || status === "downloading" || status === "rendering") && <p className="source-visual-message" role="status">Loading source...</p>}
+      {status === "error" && <div className="source-visual-message" role="alert"><p>Couldn't load the original source. Tutoring can continue.</p><button type="button" onClick={retry}>Retry visual</button></div>}
       {selection && status === "ready" && <><div className="source-visual-frame" ref={frameRef}><canvas ref={canvasRef} aria-label={`${selection.source.name}, page ${viewedPage}`} /></div>
         {visualSelection.candidates.length > 1 && <div className="source-visual-controls"><button type="button" onClick={() => selectManualReference(referenceIndex - 1)} disabled={referenceIndex <= 0} aria-label="Previous source reference">Previous source</button><span>Reference {referenceIndex + 1} / {visualSelection.candidates.length}</span><button type="button" onClick={() => selectManualReference(referenceIndex + 1)} disabled={referenceIndex >= visualSelection.candidates.length - 1} aria-label="Next source reference">Next source</button></div>}
         <div className="source-visual-controls"><button type="button" onClick={() => selectManualPage((viewedPage ?? 1) - 1)} disabled={!viewedPage || viewedPage <= 1} aria-label="Previous PDF page">Previous page</button><span>{autoFollow ? `Lesson page ${visualSelection.primary?.reference.page}` : `Viewing page ${viewedPage} manually`}</span><button type="button" onClick={() => selectManualPage((viewedPage ?? 0) + 1)} disabled={!viewedPage || viewedPage >= pageCount} aria-label="Next PDF page">Next page</button>{!autoFollow && <button type="button" onClick={followLesson}>Follow lesson</button>}</div></>}
