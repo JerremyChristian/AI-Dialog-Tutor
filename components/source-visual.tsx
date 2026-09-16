@@ -34,6 +34,7 @@ type AvailabilityReason =
   | "pdf-module-import-timeout"
   | "pdf-load-timeout"
   | "pdf-loading-task-rejected"
+  | "pdf-modern-and-legacy-load-failed"
   | "pdf-get-page-failed"
   | "pdf-render-failed"
   | "page-out-of-range"
@@ -67,6 +68,24 @@ type SourceVisualDiagnostics = {
   errorName: string;
   errorCategory: string;
   errorMessage: string;
+  pdfLoaderAttempt: "modern" | "legacy";
+  modernImportStarted: boolean;
+  modernImportResolved: boolean;
+  modernLoadingTaskStarted: boolean;
+  modernLoadingTaskResolved: boolean;
+  modernFailureReason: string;
+  legacyFallbackTriggered: boolean;
+  legacyImportStarted: boolean;
+  legacyImportResolved: boolean;
+  legacyWorkerConfigured: boolean;
+  legacyWorkerSrcKind: "local" | "unconfigured";
+  legacyGetDocumentCalled: boolean;
+  legacyLoadingTaskCreated: boolean;
+  legacyLoadingTaskPromiseStarted: boolean;
+  legacyLoadingTaskPromiseResolved: boolean;
+  legacyLoadingTaskPromiseRejected: boolean;
+  legacyDocumentLoaded: boolean;
+  successfulLoader: "modern" | "legacy" | "none";
   finalStatus: VisualStatus;
   reason: AvailabilityReason;
 };
@@ -99,6 +118,24 @@ const INITIAL_DIAGNOSTICS: SourceVisualDiagnostics = {
   errorName: "none",
   errorCategory: "none",
   errorMessage: "none",
+  pdfLoaderAttempt: "modern",
+  modernImportStarted: false,
+  modernImportResolved: false,
+  modernLoadingTaskStarted: false,
+  modernLoadingTaskResolved: false,
+  modernFailureReason: "none",
+  legacyFallbackTriggered: false,
+  legacyImportStarted: false,
+  legacyImportResolved: false,
+  legacyWorkerConfigured: false,
+  legacyWorkerSrcKind: "unconfigured",
+  legacyGetDocumentCalled: false,
+  legacyLoadingTaskCreated: false,
+  legacyLoadingTaskPromiseStarted: false,
+  legacyLoadingTaskPromiseResolved: false,
+  legacyLoadingTaskPromiseRejected: false,
+  legacyDocumentLoaded: false,
+  successfulLoader: "none",
   finalStatus: "idle",
   reason: "none",
 };
@@ -333,52 +370,98 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
             throw new Error("cloud-source-empty");
           }
           retrievalStage = "pdf";
-          const pdfData = new Uint8Array(bytes.slice(0));
-          logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
-            pdfByteCount, pdfLoad: "started", pdfStages: { pdfDataPrepared: true, pdfModuleImportStarted: true } });
           debugRef.current(`Source visual PDF renderer started: source=${selection.source.id}`);
-          let importTimeoutId: ReturnType<typeof setTimeout> | undefined;
-          const importTimeout = new Promise<never>((_, reject) => {
-            importTimeoutId = setTimeout(() => reject(new Error("pdf-module-import-timeout")), PDF_LOAD_TIMEOUT_MS);
-          });
-          const pdfjs = await Promise.race([import("pdfjs-dist"), importTimeout]).finally(() => {
-            if (importTimeoutId) clearTimeout(importTimeoutId);
-          });
-          logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
-            pdfByteCount, pdfLoad: "started", pdfStages: { pdfDataPrepared: true, pdfModuleImportStarted: true,
-              pdfModuleImportResolved: true } });
-          pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
-          pdfOperationStage = "get-document";
-          logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
-            pdfByteCount, pdfLoad: "started", pdfStages: { workerConfigured: true, workerSrcKind: "local",
-              pdfGetDocumentCalled: true } });
-          const loadingTask = pdfjs.getDocument({ data: pdfData });
-          pdfOperationStage = "loading-task";
-          loadingTasksRef.current.add(loadingTask);
-          logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
-            pdfByteCount, pdfLoad: "started", pdfStages: { pdfLoadingTaskCreated: true,
-              pdfLoadingTaskPromiseStarted: true } });
-          let timeoutId: ReturnType<typeof setTimeout> | undefined;
-          try {
-            const timeout = new Promise<never>((_, reject) => {
-              timeoutId = setTimeout(() => reject(new Error("pdf-load-timeout")), PDF_LOAD_TIMEOUT_MS);
+          const loadPdfAttempt = async (loader: "modern" | "legacy") => {
+            const pdfData = new Uint8Array(bytes.slice(0));
+            const legacy = loader === "legacy";
+            logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
+              pdfByteCount, pdfLoad: "started", pdfStages: {
+                pdfDataPrepared: true, pdfLoaderAttempt: loader,
+                ...(legacy ? { legacyImportStarted: true } : { pdfModuleImportStarted: true, modernImportStarted: true }),
+              } });
+            let importTimeoutId: ReturnType<typeof setTimeout> | undefined;
+            const importTimeout = new Promise<never>((_, reject) => {
+              importTimeoutId = setTimeout(() => reject(new Error("pdf-module-import-timeout")), PDF_LOAD_TIMEOUT_MS);
             });
-            const document = await Promise.race([loadingTask.promise, timeout]);
+            const modulePromise = legacy
+              ? import("pdfjs-dist/legacy/build/pdf.mjs")
+              : import("pdfjs-dist");
+            const pdfjs = await Promise.race([modulePromise, importTimeout]).finally(() => {
+              if (importTimeoutId) clearTimeout(importTimeoutId);
+            });
             logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
-              pdfByteCount, pdfLoad: "success", pdfPageCount: document.numPages,
-              pdfStages: { pdfLoadingTaskPromiseResolved: true, pdfDocumentLoaded: true } });
-            return document;
-          } catch (error) {
-            const timedOut = error instanceof Error && error.message === "pdf-load-timeout";
+              pdfByteCount, pdfLoad: "started", pdfStages: legacy
+                ? { legacyImportResolved: true }
+                : { pdfModuleImportResolved: true, modernImportResolved: true } });
+            pdfjs.GlobalWorkerOptions.workerSrc = legacy
+              ? new URL("pdfjs-dist/legacy/build/pdf.worker.min.mjs", import.meta.url).toString()
+              : new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
+            pdfOperationStage = "get-document";
             logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
-              pdfByteCount, pdfLoad: "error", pdfStages: { pdfLoadingTaskPromiseRejected: !timedOut, ...safePdfError(error, timedOut ? "loading-task-timeout" : "loading-task") } });
-            if (timedOut) {
-              void loadingTask.destroy().catch(() => undefined);
+              pdfByteCount, pdfLoad: "started", pdfStages: {
+                workerConfigured: true, workerSrcKind: "local", pdfGetDocumentCalled: true,
+                ...(legacy ? { legacyWorkerConfigured: true, legacyWorkerSrcKind: "local", legacyGetDocumentCalled: true } : {}),
+              } });
+            const loadingTask = pdfjs.getDocument({ data: pdfData });
+            pdfOperationStage = "loading-task";
+            loadingTasksRef.current.add(loadingTask);
+            logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
+              pdfByteCount, pdfLoad: "started", pdfStages: {
+                pdfLoadingTaskCreated: true, pdfLoadingTaskPromiseStarted: true,
+                ...(legacy
+                  ? { legacyLoadingTaskCreated: true, legacyLoadingTaskPromiseStarted: true }
+                  : { modernLoadingTaskStarted: true }),
+              } });
+            let timeoutId: ReturnType<typeof setTimeout> | undefined;
+            try {
+              const timeout = new Promise<never>((_, reject) => {
+                timeoutId = setTimeout(() => reject(new Error("pdf-load-timeout")), PDF_LOAD_TIMEOUT_MS);
+              });
+              const document = await Promise.race([loadingTask.promise, timeout]);
+              logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
+                pdfByteCount, pdfLoad: "success", pdfPageCount: document.numPages,
+                pdfStages: {
+                  pdfLoadingTaskPromiseResolved: true, pdfDocumentLoaded: true, successfulLoader: loader,
+                  ...(legacy
+                    ? { legacyLoadingTaskPromiseResolved: true, legacyDocumentLoaded: true }
+                    : { modernLoadingTaskResolved: true }),
+                } });
+              return document;
+            } catch (error) {
+              const timedOut = error instanceof Error && error.message === "pdf-load-timeout";
+              const failureReason = timedOut ? "pdf-load-timeout" : "pdf-loading-task-rejected";
+              logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
+                pdfByteCount, pdfLoad: "error", pdfStages: {
+                  pdfLoadingTaskPromiseRejected: !timedOut,
+                  ...(legacy
+                    ? { legacyLoadingTaskPromiseRejected: !timedOut }
+                    : { modernFailureReason: failureReason }),
+                  ...safePdfError(error, timedOut ? `${loader}-loading-task-timeout` : `${loader}-loading-task`),
+                } });
+              await loadingTask.destroy().catch(() => undefined);
+              throw error;
+            } finally {
+              if (timeoutId) clearTimeout(timeoutId);
+              loadingTasksRef.current.delete(loadingTask);
             }
-            throw error;
-          } finally {
-            if (timeoutId) clearTimeout(timeoutId);
-            loadingTasksRef.current.delete(loadingTask);
+          };
+
+          try {
+            return await loadPdfAttempt("modern");
+          } catch (modernError) {
+            if (!active) throw new Error("pdf-load-cancelled");
+            const modernFailureReason = modernError instanceof Error && modernError.message === "pdf-load-timeout"
+              ? "pdf-load-timeout"
+              : pdfOperationStage === "loading-task" ? "pdf-loading-task-rejected" : "pdf-load-failed";
+            logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
+              pdfByteCount, pdfLoad: "started", pdfStages: { modernFailureReason, legacyFallbackTriggered: true,
+                pdfLoaderAttempt: "legacy", pdfLoadingTaskCreated: false, pdfLoadingTaskPromiseStarted: false,
+                pdfLoadingTaskPromiseResolved: false, pdfLoadingTaskPromiseRejected: false } });
+            try {
+              return await loadPdfAttempt("legacy");
+            } catch {
+              throw new Error("pdf-modern-and-legacy-load-failed");
+            }
           }
         });
         cacheRef.current.set(key, promise);
@@ -407,6 +490,7 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
       if (retrievalStage === "download") download = "error";
       const reason: AvailabilityReason = error instanceof Error && error.message === "cloud-source-empty"
         ? "empty-pdf-bytes"
+        : error instanceof Error && error.message === "pdf-modern-and-legacy-load-failed" ? "pdf-modern-and-legacy-load-failed"
         : error instanceof Error && error.message === "pdf-module-import-timeout" ? "pdf-module-import-timeout"
         : error instanceof Error && error.message === "pdf-load-timeout" ? "pdf-load-timeout"
         : retrievalStage === "metadata" ? "metadata-lookup-failed"
@@ -419,7 +503,11 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
         pdfLoad: retrievalStage === "pdf" ? "error" : "not-run",
         pdfStages: retrievalStage === "pdf" ? safePdfError(error, reason) : undefined });
     });
-    return () => { active = false; };
+    return () => {
+      active = false;
+      for (const task of loadingTasksRef.current) void task.destroy().catch(() => undefined);
+      loadingTasksRef.current.clear();
+    };
   }, [selectionKey, automaticPage, lessonId, cloudOwnerId, authReady, retryNonce, invalidPdfReference,
     teachingPointIndexesKey, visualSelection.candidates.length, visualSelection.fallbackUsed,
     selection?.source.id, selection?.source.storagePath, selection?.reason]);
@@ -541,6 +629,24 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
     `errorName: ${diagnostics.errorName}`,
     `errorCategory: ${diagnostics.errorCategory}`,
     `errorMessage: ${diagnostics.errorMessage}`,
+    `pdfLoaderAttempt: ${diagnostics.pdfLoaderAttempt}`,
+    `modernImportStarted: ${diagnostics.modernImportStarted}`,
+    `modernImportResolved: ${diagnostics.modernImportResolved}`,
+    `modernLoadingTaskStarted: ${diagnostics.modernLoadingTaskStarted}`,
+    `modernLoadingTaskResolved: ${diagnostics.modernLoadingTaskResolved}`,
+    `modernFailureReason: ${diagnostics.modernFailureReason}`,
+    `legacyFallbackTriggered: ${diagnostics.legacyFallbackTriggered}`,
+    `legacyImportStarted: ${diagnostics.legacyImportStarted}`,
+    `legacyImportResolved: ${diagnostics.legacyImportResolved}`,
+    `legacyWorkerConfigured: ${diagnostics.legacyWorkerConfigured}`,
+    `legacyWorkerSrcKind: ${diagnostics.legacyWorkerSrcKind}`,
+    `legacyGetDocumentCalled: ${diagnostics.legacyGetDocumentCalled}`,
+    `legacyLoadingTaskCreated: ${diagnostics.legacyLoadingTaskCreated}`,
+    `legacyLoadingTaskPromiseStarted: ${diagnostics.legacyLoadingTaskPromiseStarted}`,
+    `legacyLoadingTaskPromiseResolved: ${diagnostics.legacyLoadingTaskPromiseResolved}`,
+    `legacyLoadingTaskPromiseRejected: ${diagnostics.legacyLoadingTaskPromiseRejected}`,
+    `legacyDocumentLoaded: ${diagnostics.legacyDocumentLoaded}`,
+    `successfulLoader: ${diagnostics.successfulLoader}`,
     `finalStatus: ${diagnostics.finalStatus}`,
     `reason: ${diagnostics.reason}`,
   ].join("\n");
