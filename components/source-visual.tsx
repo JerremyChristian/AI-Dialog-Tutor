@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
+import type { PDFDocumentLoadingTask, PDFDocumentProxy, RenderTask } from "pdfjs-dist";
 import type { AtomicTeachingContract, LessonSource } from "../lib/learning-source";
 import { downloadCloudLessonSource, resolveCloudLessonSourcePath } from "../lib/cloud-sync";
 import { selectBeatVisualReferences } from "../lib/source-visual";
@@ -31,6 +31,11 @@ type AvailabilityReason =
   | "download-failed"
   | "empty-pdf-bytes"
   | "pdf-load-failed"
+  | "pdf-module-import-timeout"
+  | "pdf-load-timeout"
+  | "pdf-loading-task-rejected"
+  | "pdf-get-page-failed"
+  | "pdf-render-failed"
   | "page-out-of-range"
   | "ready";
 type MetadataLookupResult = "not-run" | "started" | "success" | "not-found" | "error";
@@ -43,11 +48,31 @@ type SourceVisualDiagnostics = {
   pdfByteCount: number;
   pdfLoadResult: PdfLoadResult;
   pdfPageCount: number;
+  pdfDataPrepared: boolean;
+  pdfModuleImportStarted: boolean;
+  pdfModuleImportResolved: boolean;
+  workerConfigured: boolean;
+  workerSrcKind: "local" | "unconfigured";
+  pdfGetDocumentCalled: boolean;
+  pdfLoadingTaskCreated: boolean;
+  pdfLoadingTaskPromiseStarted: boolean;
+  pdfLoadingTaskPromiseResolved: boolean;
+  pdfLoadingTaskPromiseRejected: boolean;
+  pdfDocumentLoaded: boolean;
+  pdfGetPageStarted: boolean;
+  pdfGetPageResolved: boolean;
+  pdfRenderStarted: boolean;
+  pdfRenderResolved: boolean;
+  pdfRenderRejected: boolean;
+  errorName: string;
+  errorCategory: string;
+  errorMessage: string;
   finalStatus: VisualStatus;
   reason: AvailabilityReason;
 };
 
 const SOURCE_VISUAL_DEBUG_STORAGE_KEY = "ai-dialog-tutor:debug-source-visual";
+const PDF_LOAD_TIMEOUT_MS = 15_000;
 const INITIAL_DIAGNOSTICS: SourceVisualDiagnostics = {
   metadataLookupResult: "not-run",
   resolvedStoragePath: false,
@@ -55,9 +80,37 @@ const INITIAL_DIAGNOSTICS: SourceVisualDiagnostics = {
   pdfByteCount: 0,
   pdfLoadResult: "not-run",
   pdfPageCount: 0,
+  pdfDataPrepared: false,
+  pdfModuleImportStarted: false,
+  pdfModuleImportResolved: false,
+  workerConfigured: false,
+  workerSrcKind: "unconfigured",
+  pdfGetDocumentCalled: false,
+  pdfLoadingTaskCreated: false,
+  pdfLoadingTaskPromiseStarted: false,
+  pdfLoadingTaskPromiseResolved: false,
+  pdfLoadingTaskPromiseRejected: false,
+  pdfDocumentLoaded: false,
+  pdfGetPageStarted: false,
+  pdfGetPageResolved: false,
+  pdfRenderStarted: false,
+  pdfRenderResolved: false,
+  pdfRenderRejected: false,
+  errorName: "none",
+  errorCategory: "none",
+  errorMessage: "none",
   finalStatus: "idle",
   reason: "none",
 };
+
+function safePdfError(error: unknown, category: string) {
+  const name = error instanceof Error ? error.name.slice(0, 80) : "UnknownError";
+  const message = error instanceof Error
+    ? error.message.replace(/https?:\/\/\S+/gi, "[url]")
+      .replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, "[id]").replace(/\s+/g, " ").slice(0, 160)
+    : "Unknown PDF error";
+  return { errorName: name, errorCategory: category.slice(0, 80), errorMessage: message };
+}
 
 export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointIndexes, presentationKey, sources, lessonId, cloudOwnerId, authReady, onDebug }: Props) {
   const teachingPointIndexesKey = teachingPointIndexes.join(",");
@@ -77,6 +130,7 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
       (!Number.isInteger(reference.page) || reference.page < 1);
   })), [activeReferences, sources]);
   const cacheRef = useRef(new Map<string, Promise<PDFDocumentProxy>>());
+  const loadingTasksRef = useRef(new Set<PDFDocumentLoadingTask>());
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
   const renderTaskRef = useRef<RenderTask | null>(null);
@@ -117,6 +171,8 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
     const cache = cacheRef.current;
     return () => {
       renderTaskRef.current?.cancel();
+      for (const task of loadingTasksRef.current) void task.destroy().catch(() => undefined);
+      loadingTasksRef.current.clear();
       for (const document of cache.values()) void document.then((loaded) => loaded.destroy()).catch(() => undefined);
       cache.clear();
     };
@@ -168,18 +224,22 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
       pdfByteCount?: number;
       pdfLoad?: PdfLoadResult;
       pdfPageCount?: number;
+      pdfStages?: Partial<SourceVisualDiagnostics>;
+      resetPdfStages?: boolean;
     }) => {
       availabilityReasonRef.current = options.reason;
-      setDiagnostics({
+      setDiagnostics((current) => ({
+        ...(options.resetPdfStages ? INITIAL_DIAGNOSTICS : current),
         metadataLookupResult: options.metadataLookup,
         resolvedStoragePath: options.resolvedStoragePath ?? Boolean(selection?.source.storagePath),
         storageDownloadResult: options.download,
-        pdfByteCount: options.pdfByteCount ?? 0,
-        pdfLoadResult: options.pdfLoad ?? "not-run",
-        pdfPageCount: options.pdfPageCount ?? 0,
+        pdfByteCount: options.pdfByteCount ?? current.pdfByteCount,
+        pdfLoadResult: options.pdfLoad ?? current.pdfLoadResult,
+        pdfPageCount: options.pdfPageCount ?? current.pdfPageCount,
         finalStatus: options.finalState,
         reason: options.reason,
-      });
+        ...options.pdfStages,
+      }));
       if (process.env.NODE_ENV !== "development") return;
       debugRef.current(
         `SOURCE VISUAL AVAILABILITY: lessonId=${lessonId ? "present" : "missing"}, ` +
@@ -198,28 +258,29 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
     if (!selection) {
       const nextStatus = invalidPdfReference ? "unavailable" : "idle";
       setStatus(nextStatus);
-      logAvailability({ finalState: nextStatus, reason: "invalid-source-reference", metadataLookup: "not-run", download: "not-run" });
+      logAvailability({ finalState: nextStatus, reason: "invalid-source-reference", metadataLookup: "not-run", download: "not-run", resetPdfStages: true });
       return;
     }
     if (!automaticPage) {
       setStatus("unavailable");
-      logAvailability({ finalState: "unavailable", reason: "missing-page-reference", metadataLookup: "not-run", download: "not-run" });
+      logAvailability({ finalState: "unavailable", reason: "missing-page-reference", metadataLookup: "not-run", download: "not-run", resetPdfStages: true });
       return;
     }
     debugRef.current(`Source visual metadata: source=${selection.source.id}, snapshotStoragePath=${selection.source.storagePath ? "present" : "missing"}, auth=${authReady ? "ready" : "not-ready"}`);
     if (!authReady) {
       setStatus("resolving");
-      logAvailability({ finalState: "resolving", reason: "waiting-for-auth", metadataLookup: "not-run", download: "not-run" });
+      logAvailability({ finalState: "resolving", reason: "waiting-for-auth", metadataLookup: "not-run", download: "not-run", resetPdfStages: true });
       return;
     }
     if (!cloudOwnerId || !lessonId) {
       setStatus("unavailable");
       debugRef.current("Source visual unavailable: reason=no-cloud-source-context");
-      logAvailability({ finalState: "unavailable", reason: "missing-cloud-context", metadataLookup: "not-run", download: "not-run" });
+      logAvailability({ finalState: "unavailable", reason: "missing-cloud-context", metadataLookup: "not-run", download: "not-run", resetPdfStages: true });
       return;
     }
     let active = true;
     let retrievalStage: "metadata" | "download" | "pdf" = "metadata";
+    let pdfOperationStage: "module-import" | "get-document" | "loading-task" = "module-import";
     let metadataLookup: "not-run" | "started" | "success" | "not-found" | "error" = "not-run";
     let download: "not-run" | "started" | "success" | "error" = "not-run";
     let pdfByteCount = 0;
@@ -272,12 +333,53 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
             throw new Error("cloud-source-empty");
           }
           retrievalStage = "pdf";
+          const pdfData = new Uint8Array(bytes.slice(0));
           logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
-            pdfByteCount, pdfLoad: "started" });
+            pdfByteCount, pdfLoad: "started", pdfStages: { pdfDataPrepared: true, pdfModuleImportStarted: true } });
           debugRef.current(`Source visual PDF renderer started: source=${selection.source.id}`);
-          const pdfjs = await import("pdfjs-dist");
+          let importTimeoutId: ReturnType<typeof setTimeout> | undefined;
+          const importTimeout = new Promise<never>((_, reject) => {
+            importTimeoutId = setTimeout(() => reject(new Error("pdf-module-import-timeout")), PDF_LOAD_TIMEOUT_MS);
+          });
+          const pdfjs = await Promise.race([import("pdfjs-dist"), importTimeout]).finally(() => {
+            if (importTimeoutId) clearTimeout(importTimeoutId);
+          });
+          logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
+            pdfByteCount, pdfLoad: "started", pdfStages: { pdfDataPrepared: true, pdfModuleImportStarted: true,
+              pdfModuleImportResolved: true } });
           pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
-          return pdfjs.getDocument({ data: bytes }).promise;
+          pdfOperationStage = "get-document";
+          logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
+            pdfByteCount, pdfLoad: "started", pdfStages: { workerConfigured: true, workerSrcKind: "local",
+              pdfGetDocumentCalled: true } });
+          const loadingTask = pdfjs.getDocument({ data: pdfData });
+          pdfOperationStage = "loading-task";
+          loadingTasksRef.current.add(loadingTask);
+          logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
+            pdfByteCount, pdfLoad: "started", pdfStages: { pdfLoadingTaskCreated: true,
+              pdfLoadingTaskPromiseStarted: true } });
+          let timeoutId: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const timeout = new Promise<never>((_, reject) => {
+              timeoutId = setTimeout(() => reject(new Error("pdf-load-timeout")), PDF_LOAD_TIMEOUT_MS);
+            });
+            const document = await Promise.race([loadingTask.promise, timeout]);
+            logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
+              pdfByteCount, pdfLoad: "success", pdfPageCount: document.numPages,
+              pdfStages: { pdfLoadingTaskPromiseResolved: true, pdfDocumentLoaded: true } });
+            return document;
+          } catch (error) {
+            const timedOut = error instanceof Error && error.message === "pdf-load-timeout";
+            logAvailability({ finalState: "rendering", reason: "none", metadataLookup, download, resolvedStoragePath: true,
+              pdfByteCount, pdfLoad: "error", pdfStages: { pdfLoadingTaskPromiseRejected: !timedOut, ...safePdfError(error, timedOut ? "loading-task-timeout" : "loading-task") } });
+            if (timedOut) {
+              void loadingTask.destroy().catch(() => undefined);
+            }
+            throw error;
+          } finally {
+            if (timeoutId) clearTimeout(timeoutId);
+            loadingTasksRef.current.delete(loadingTask);
+          }
         });
         cacheRef.current.set(key, promise);
         promise.catch(() => cacheRef.current.delete(key));
@@ -305,13 +407,17 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
       if (retrievalStage === "download") download = "error";
       const reason: AvailabilityReason = error instanceof Error && error.message === "cloud-source-empty"
         ? "empty-pdf-bytes"
+        : error instanceof Error && error.message === "pdf-module-import-timeout" ? "pdf-module-import-timeout"
+        : error instanceof Error && error.message === "pdf-load-timeout" ? "pdf-load-timeout"
         : retrievalStage === "metadata" ? "metadata-lookup-failed"
-          : retrievalStage === "download" ? "download-failed" : "pdf-load-failed";
+          : retrievalStage === "download" ? "download-failed"
+            : pdfOperationStage === "loading-task" ? "pdf-loading-task-rejected" : "pdf-load-failed";
       setStatus("error");
       debugRef.current(`Source visual retrieval failed: source=${selection.source.id}`);
       logAvailability({ finalState: "error", reason, metadataLookup, download,
         resolvedStoragePath: metadataLookup === "success" || Boolean(selection.source.storagePath), pdfByteCount,
-        pdfLoad: retrievalStage === "pdf" ? "error" : "not-run" });
+        pdfLoad: retrievalStage === "pdf" ? "error" : "not-run",
+        pdfStages: retrievalStage === "pdf" ? safePdfError(error, reason) : undefined });
     });
     return () => { active = false; };
   }, [selectionKey, automaticPage, lessonId, cloudOwnerId, authReady, retryNonce, invalidPdfReference,
@@ -323,8 +429,13 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
     if (!pdf || !canvas || !viewedPage || viewedPage > pdf.numPages || renderWidth < 1 || status !== "ready") return;
     let active = true;
     renderTaskRef.current?.cancel();
+    renderTaskRef.current = null;
+    setDiagnostics((current) => ({ ...current, finalStatus: "rendering", reason: "none",
+      pdfGetPageStarted: true, pdfGetPageResolved: false, pdfRenderStarted: false,
+      pdfRenderResolved: false, pdfRenderRejected: false }));
     void pdf.getPage(viewedPage).then((page) => {
       if (!active) return;
+      setDiagnostics((current) => ({ ...current, pdfGetPageResolved: true }));
       const base = page.getViewport({ scale: 1 });
       const cssScale = Math.max(0.1, renderWidth / base.width);
       const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
@@ -336,11 +447,21 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
       if (!context) throw new Error("Canvas unavailable");
       const task = page.render({ canvas, canvasContext: context, viewport });
       renderTaskRef.current = task;
+      setDiagnostics((current) => ({ ...current, pdfRenderStarted: true }));
       return task.promise.then(() => {
-        if (active) debugRef.current(`Source visual page rendered: source=${selection?.source.id}, page=${viewedPage}`);
+        if (active) {
+          renderTaskRef.current = null;
+          setDiagnostics((current) => ({ ...current, finalStatus: "ready", reason: "ready", pdfRenderResolved: true }));
+          debugRef.current(`Source visual page rendered: source=${selection?.source.id}, page=${viewedPage}`);
+        }
       });
     }).catch((error: unknown) => {
-      if (active && !(error instanceof Error && error.name === "RenderingCancelledException")) setStatus("error");
+      if (!active || (error instanceof Error && error.name === "RenderingCancelledException")) return;
+      const renderStarted = renderTaskRef.current !== null;
+      const reason: AvailabilityReason = renderStarted ? "pdf-render-failed" : "pdf-get-page-failed";
+      setStatus("error");
+      setDiagnostics((current) => ({ ...current, finalStatus: "error", reason,
+        pdfRenderRejected: renderStarted, ...safePdfError(error, renderStarted ? "render" : "get-page") }));
     });
     return () => { active = false; renderTaskRef.current?.cancel(); };
   }, [pdf, viewedPage, renderWidth, status, selection]);
@@ -363,7 +484,17 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
     const candidate = visualSelection.candidates[index];
     debugRef.current(`Manual visual reference selected: source=${candidate.source.id}, page=${candidate.reference.page ?? "none"}, reference=${index + 1}/${visualSelection.candidates.length}`);
   };
-  const retry = () => { setPdf(null); setStatus("idle"); if (selection) cacheRef.current.delete(`${selection.source.id}:${selection.source.storagePath}`); setViewedPage(automaticPage); setRetryNonce((value) => value + 1); };
+  const retry = () => {
+    renderTaskRef.current?.cancel();
+    for (const task of loadingTasksRef.current) void task.destroy().catch(() => undefined);
+    loadingTasksRef.current.clear();
+    setPdf(null);
+    setStatus("idle");
+    setDiagnostics(INITIAL_DIAGNOSTICS);
+    if (selection) cacheRef.current.delete(`${selection.source.id}:${selection.source.storagePath}`);
+    setViewedPage(automaticPage);
+    setRetryNonce((value) => value + 1);
+  };
 
   const debugText = [
     "SOURCE VISUAL DEBUG",
@@ -390,7 +521,26 @@ export function SourceVisual({ conceptId, conceptTitle, contract, teachingPointI
     `pdfByteCount: ${diagnostics.pdfByteCount}`,
     `pdfLoadStarted: ${diagnostics.pdfLoadResult !== "not-run"}`,
     `pdfLoadResult: ${diagnostics.pdfLoadResult === "started" ? "not-run" : diagnostics.pdfLoadResult}`,
+    `pdfDataPrepared: ${diagnostics.pdfDataPrepared}`,
+    `pdfModuleImportStarted: ${diagnostics.pdfModuleImportStarted}`,
+    `pdfModuleImportResolved: ${diagnostics.pdfModuleImportResolved}`,
+    `workerConfigured: ${diagnostics.workerConfigured}`,
+    `workerSrcKind: ${diagnostics.workerSrcKind}`,
+    `pdfGetDocumentCalled: ${diagnostics.pdfGetDocumentCalled}`,
+    `pdfLoadingTaskCreated: ${diagnostics.pdfLoadingTaskCreated}`,
+    `pdfLoadingTaskPromiseStarted: ${diagnostics.pdfLoadingTaskPromiseStarted}`,
+    `pdfLoadingTaskPromiseResolved: ${diagnostics.pdfLoadingTaskPromiseResolved}`,
+    `pdfLoadingTaskPromiseRejected: ${diagnostics.pdfLoadingTaskPromiseRejected}`,
+    `pdfDocumentLoaded: ${diagnostics.pdfDocumentLoaded}`,
     `pdfPageCount: ${diagnostics.pdfPageCount || "unknown"}`,
+    `pdfGetPageStarted: ${diagnostics.pdfGetPageStarted}`,
+    `pdfGetPageResolved: ${diagnostics.pdfGetPageResolved}`,
+    `pdfRenderStarted: ${diagnostics.pdfRenderStarted}`,
+    `pdfRenderResolved: ${diagnostics.pdfRenderResolved}`,
+    `pdfRenderRejected: ${diagnostics.pdfRenderRejected}`,
+    `errorName: ${diagnostics.errorName}`,
+    `errorCategory: ${diagnostics.errorCategory}`,
+    `errorMessage: ${diagnostics.errorMessage}`,
     `finalStatus: ${diagnostics.finalStatus}`,
     `reason: ${diagnostics.reason}`,
   ].join("\n");
