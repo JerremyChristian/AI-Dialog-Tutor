@@ -8,6 +8,7 @@ import {
 export const GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview";
 export const PERSISTED_LESSON_RESUME_CONTROL =
   "[[APP_CONTROL:PERSISTED_LESSON_RESUME:RECAP_THEN_RESUME_LOCATION_THEN_CONTINUE_TEACHING;DO_NOT_ASK_WHAT_TO_COVER]]";
+export const LESSON_WRAP_UP_CONTROL = "[[APP_CONTROL:LESSON_WRAP_UP]]";
 
 export type LessonStatus = "idle" | "teaching" | "interrupted" |
   "resolving-interruption" | "resuming" | "completed";
@@ -227,7 +228,7 @@ export function pauseLessonState(
   }
   return {
     ...state,
-    status: "idle" as const,
+    status: state.status === "completed" ? "completed" as const : "idle" as const,
     nodes: deriveParentStatuses(nodes, state.currentNodeId),
     resumePoint: hasCurrentProgress && progress ? progress.resumePoint : state.resumePoint,
   };
@@ -334,23 +335,17 @@ export function completeLessonConcept(state: LessonState, conceptId: string) {
   }
   const nodes = cloneNodes(state.nodes);
   nodes[node.id].status = "taught";
-  const atomicIds = getAtomicNodeIds(state);
-  const completedIndex = atomicIds.indexOf(node.id);
-  const nextId = atomicIds.slice(completedIndex + 1).find((id) =>
-    nodes[id].status !== "taught" && nodes[id].status !== "skipped",
-  ) ?? null;
-  if (nextId) nodes[nextId].status = "teaching";
   const next = {
-    ...withDerivedNodes(state, nodes, nextId, "teaching"),
+    ...withDerivedNodes(state, nodes, node.id, "teaching"),
     resumePoint: "",
   };
   const events = [`Atomic concept completed: ${node.title}`];
-  if (nextId) events.push(`Sequential advancement: ${node.title} -> ${nodes[nextId].title}`);
+  const nextSequential = getNextSequentialConcept(next);
   return {
     state: next,
     result: {
-      ...snapshot(next, "complete", true, nextId
-        ? `Completed ${node.title}; continue with ${nodes[nextId].title}`
+      ...snapshot(next, "complete", true, nextSequential
+        ? `Completed ${node.title}; ${nextSequential.title} is the next delivery target`
         : `Completed ${node.title}; no later atomic concept remains`),
       completedNodeId: node.id,
     },
@@ -403,6 +398,25 @@ export function getNextSequentialConcept(state: LessonState) {
     return status !== "taught" && status !== "skipped";
   });
   return id ? state.nodes[id] : null;
+}
+
+export function isLessonPlanComplete(state: LessonState) {
+  const teachable = Object.values(state.nodes).filter(isTeachableLessonNode);
+  return teachable.length > 0 && teachable.every(
+    (node) => node.status === "taught" || node.status === "skipped",
+  );
+}
+
+/** Activates the next delivery target only when its first presentation beat is assigned. */
+export function activateNextSequentialConcept(state: LessonState): LessonState | null {
+  const next = getNextSequentialConcept(state);
+  if (!next) return null;
+  const nodes = cloneNodes(state.nodes);
+  nodes[next.id].status = "teaching";
+  return {
+    ...withDerivedNodes(state, nodes, next.id, "teaching"),
+    resumePoint: "",
+  };
 }
 
 function getFirstIncompleteDescendant(state: LessonState, nodeId: string) {
@@ -637,6 +651,8 @@ Teaching contracts describe tutor coverage, not learner understanding. A taught 
 Never claim a parent is fully covered unless its returned status is taught. Never describe tool mechanics aloud. Teach depth-first in source order with concise explanations and occasional checks. On a clarification interruption, yield and answer without changing coverage. Wait afterward; when the learner asks to continue, query state silently so the application can restart the unconfirmed presentation beat.
 
 Never speak or quote text wrapped in [[APP_CONTROL:...]]. ${PERSISTED_LESSON_RESUME_CONTROL} is the one-time saved-lesson start signal governed above; it is not learner speech. [[APP_CONTROL:TEACH_PRESENTATION_BEAT]] assigns the only structured content for that response; follow its beat position and boundary instructions. [[APP_CONTROL:IDLE_CONFIRMATION]] is an internal application signal, not learner speech. When received, naturally ask whether the learner is still there and wants to continue. Then use session_control exactly once when their response clearly means continue, end, or is unclear. During this confirmation, unrelated speech, television, ambient conversation, and nonsense are not confirmation; choose unclear unless intent is clearly directed to this lesson. After continue, query lesson_state with purpose continue so the application assigns the next beat. After end, briefly acknowledge without continuing the lesson.
+
+${LESSON_WRAP_UP_CONTROL} means all planned lesson content is covered. Ask once whether the learner has any final questions without restarting lesson content. Answer final questions normally and remain in wrap-up. When the learner clearly indicates they have no more questions, call session_control with action end, then briefly acknowledge without continuing the lesson.
 
 [[APP_CONTROL:POST_RESUME_SYNC]] is an internal memory-alignment turn. Call lesson_state with action query exactly once, silently accept the returned application state and continuity snapshot as your own existing memory, then end this internal turn with no spoken or written learner-facing response. Do not greet, recap, teach, or continue output during this turn.
 [[APP_CONTROL:CONTINUE_INTERRUPTED_TUTOR_TURN]] means the transport changed while your immediately preceding explanation was unfinished. Continue directly from the interruptedAssistantTranscript/resumePoint in the continuity snapshot. Complete the unfinished thought naturally and concisely without greeting, announcing continuation, recapping the topic, or restarting the explanation.

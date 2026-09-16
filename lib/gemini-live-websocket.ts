@@ -76,7 +76,7 @@ function buildLiveSetup(config: SetupConfig) {
           {
             name: "session_control",
             description:
-              "Resolve the application's idle confirmation. Use only when the application has asked whether the learner wants to continue. Continue only for speech clearly directed to the tutor or a clear lesson request; end for a clear stop/finish response; otherwise use unclear.",
+              "Resolve an application-owned idle or final-question confirmation. During idle confirmation, continue only for speech clearly directed to the tutor or a clear lesson request, end for a clear stop/finish response, otherwise unclear. During lesson wrap-up, use end only when the learner clearly has no more questions.",
             parametersJsonSchema: {
               type: "object",
               properties: {

@@ -37,6 +37,7 @@ import {
   type LiveTransportState,
 } from "../lib/live-transport-manager";
 import {
+  activateNextSequentialConcept,
   buildLessonInstruction,
   commitDeliveredTeachingBeat,
   createLessonState,
@@ -44,6 +45,8 @@ import {
   GEMINI_LIVE_MODEL,
   getCurrentConcept,
   getLessonTreeRows,
+  isLessonPlanComplete,
+  LESSON_WRAP_UP_CONTROL,
   mergeTranscript,
   navigateLessonState,
   pauseLessonState,
@@ -380,6 +383,7 @@ export default function Home() {
   const activeTeachingBeatRef = useRef<ActiveTeachingBeat | null>(null);
   const presentationBeatRef = useRef<PresentationBeat | null>(null);
   const generationEpochRef = useRef(0);
+  const lessonWrapUpRef = useRef(false);
 
   const addDebugMessage = useCallback((text: string) => {
     if (!isMountedRef.current) return;
@@ -459,6 +463,13 @@ export default function Home() {
     const position = active.isFirstBeatInUnit
       ? active.isFinalBeatInUnit ? "only" : "first"
       : active.isFinalBeatInUnit ? "final" : "middle";
+    const otherOutstandingConcept = Object.values(state.nodes).some((candidate) =>
+      candidate.id !== active.conceptId && candidate.childrenIds.length === 0 &&
+      Boolean(candidate.teaching) && candidate.status !== "taught" &&
+      candidate.status !== "skipped",
+    );
+    const completesPlannedLesson = active.teachingPointIndexes.at(-1) ===
+      contract.teachingPoints.length - 1 && !otherOutstandingConcept;
     return `${prefix}\n[[APP_CONTROL:TEACH_PRESENTATION_BEAT]]
 Teach exactly this application-assigned presentation beat as one natural source-grounded spoken explanation. Do not call progress or complete.
 CONCEPT: ${concept.title}
@@ -467,13 +478,26 @@ BEAT_POSITION: ${position}
 ASSIGNED_TEACHING_POINTS: ${JSON.stringify(points)}
 RELEVANT_COMPLETION_CRITERIA: ${JSON.stringify(criteria)}
 ${active.isFirstBeatInUnit ? "Establish the unit naturally." : "Continue directly from the preceding explanation without greeting, praise, announcing a new section, or unnecessary recap."}
-${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natural learner interaction boundary; vary the check-in and do not use a fixed script." : "Do not ask a question or invite learner interaction at the end; finish with natural continuity because the application will immediately assign the next beat."}`.trim();
+${completesPlannedLesson
+  ? `All planned lesson content will be covered after this beat. ${LESSON_WRAP_UP_CONTROL} Ask naturally whether the learner has any final questions. Do not restart or revisit content unless they ask. If they clearly have no more questions, call session_control with action end.`
+  : active.isFinalBeatInUnit
+    ? "Briefly synthesize if useful, then create a natural learner interaction boundary; vary the check-in and do not use a fixed script."
+    : "Do not ask a question or invite learner interaction at the end; finish with natural continuity because the application will immediately assign the next beat."}`.trim();
   }
 
   function assignNextTeachingBeat(prefix = "", sendInstruction = true): ActiveTeachingBeat | null {
-    const state = lessonStateRef.current;
-    const concept = getCurrentConcept(state);
-    if (!lessonActiveRef.current || !concept?.teaching || activeTeachingBeatRef.current) return null;
+    if (!lessonActiveRef.current || activeTeachingBeatRef.current) return null;
+    let state = lessonStateRef.current;
+    let concept = getCurrentConcept(state);
+    let activatedState: LessonState | null = null;
+    if (concept?.status === "taught" && !lessonWrapUpRef.current) {
+      const activated = activateNextSequentialConcept(state);
+      if (!activated) return null;
+      state = activated;
+      activatedState = activated;
+      concept = getCurrentConcept(activated);
+    }
+    if (!concept?.teaching) return null;
     const nextIndex = state.teachingContractProgress[concept.id]?.nextTeachingPointIndex ?? 0;
     const resolved = resolveNextPresentationBeat(concept.teaching, nextIndex);
     if (!resolved) return null;
@@ -514,6 +538,11 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
       invalidateActiveTeachingBeat("send-failed");
       return null;
     }
+    if (activatedState) {
+      lessonStateRef.current = activatedState;
+      setLessonState(activatedState);
+      addDebugMessage(`Sequential concept activated for teaching: ${concept.title}`);
+    }
     return active;
   }
 
@@ -550,6 +579,10 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     addDebugMessage(
       `Teaching beat committed: concept=${active.conceptId}, points=${active.teachingPointIndexes[0]}-${active.teachingPointIndexes.at(-1)}, nextTeachingPointIndex=${nextIndex}`,
     );
+    if (transition.state.status === "completed") {
+      lessonWrapUpRef.current = true;
+      addDebugMessage(`Lesson wrap-up entered: finalConcept=${active.conceptId}`);
+    }
     if (!active.isFinalBeatInUnit) {
       addDebugMessage(
         `Teaching beat auto-chain: from=${active.deliveryUnitIndex}/${active.beatIndex} ` +
@@ -811,6 +844,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     }
     preparedSourceRef.current = saved.source.prepared;
     lessonStateRef.current = saved.lessonState;
+    lessonWrapUpRef.current = false;
     recentTeachingContextRef.current = saved.recentTeachingContext;
     teachingPreferencesRef.current = saved.teachingPreferences;
     savedLessonIdRef.current = saved.id;
@@ -842,6 +876,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     const emptyLesson = createLessonState("Uploaded material", []);
     preparedSourceRef.current = null;
     lessonStateRef.current = emptyLesson;
+    lessonWrapUpRef.current = false;
     recentTeachingContextRef.current = [];
     teachingPreferencesRef.current = DEFAULT_TEACHING_PREFERENCES;
     savedLessonIdRef.current = null;
@@ -1616,7 +1651,9 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
         );
         return {
           ...state,
-          status: state.status === "idle" ? "idle" : "teaching",
+          status: lessonWrapUpRef.current
+            ? "completed"
+            : state.status === "idle" ? "idle" : "teaching",
           lastAssistantTranscript: assistantTranscript,
           resumePoint: checkpointMatchesCurrent ? checkpoint : state.resumePoint,
         };
@@ -1701,7 +1738,17 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
           };
         }
       } else if (call.name === "session_control") {
-        if (engagementStateRef.current !== "confirming" && action === "continue") {
+        if (lessonWrapUpRef.current && action === "end") {
+          addDebugMessage("Final questions completed");
+          result = { ok: true, action: "end", message: "End the completed lesson" };
+          endAfterResponse = true;
+        } else if (lessonWrapUpRef.current) {
+          result = {
+            ok: true,
+            action: action === "continue" ? "continue" : "unclear",
+            message: "Remain in final-question wrap-up",
+          };
+        } else if (engagementStateRef.current !== "confirming" && action === "continue") {
           result = { ok: true, action: "continue", message: "Session is already active" };
         } else if (engagementStateRef.current !== "confirming") {
           result = { ok: false, message: "No idle confirmation is active" };
@@ -1775,6 +1822,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
         result = transition.result;
         events = transition.events;
         if (transition.state !== lessonStateRef.current) {
+          if (action === "navigate" && transition.result.ok) lessonWrapUpRef.current = false;
           lessonStateRef.current = transition.state;
           setLessonState(transition.state);
         }
@@ -1931,6 +1979,7 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
     const initialLessonState = continuingSavedLesson
       ? lessonStateRef.current
       : createLessonState(lessonTopic, preparedSource.lessonTree);
+    lessonWrapUpRef.current = isLessonPlanComplete(initialLessonState);
     if (!continuingSavedLesson) {
       lessonStateRef.current = initialLessonState;
       setLessonState(initialLessonState);
@@ -2151,7 +2200,10 @@ ${active.isFinalBeatInUnit ? "Briefly synthesize if useful, then create a natura
       lessonStartupPendingRef.current = false;
       beginIdleMonitoring();
       void requestWakeLock();
-      if (sessionStartMode === "persisted-resume") {
+      if (lessonWrapUpRef.current) {
+        addDebugMessage("Completed lesson restored in wrap-up");
+        transportRef.current?.sendRealtimeInput({ text: LESSON_WRAP_UP_CONTROL });
+      } else if (sessionStartMode === "persisted-resume") {
         const current = getCurrentConcept(lessonStateRef.current);
         const resumePoint = lessonStateRef.current.resumePoint.trim();
         addDebugMessage("Persisted lesson continuation started");
