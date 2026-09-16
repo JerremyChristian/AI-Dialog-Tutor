@@ -26,6 +26,13 @@ function friendlyAuthError(message: string): string {
   return "Cloud authentication is unavailable right now. Local learning still works.";
 }
 
+function friendlyPasswordResetRequestError(message: string): string {
+  const value = message.toLowerCase();
+  if (value.includes("rate") || value.includes("too many")) return "Please wait before requesting another reset link.";
+  if (value.includes("email")) return "Enter a valid email address.";
+  return "We couldn't send a reset link right now. Please try again.";
+}
+
 export default function CloudAccount({
   onDebug,
   onAuthResolved,
@@ -41,7 +48,7 @@ export default function CloudAccount({
   const authResolvedRef = useRef(onAuthResolved);
   const [user, setUser] = useState<User | null>(null);
   const [checking, setChecking] = useState(Boolean(supabase));
-  const [mode, setMode] = useState<"signin" | "signup" | null>(null);
+  const [mode, setMode] = useState<"signin" | "signup" | "forgot" | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -112,7 +119,17 @@ export default function CloudAccount({
     setBusy(true);
     setError(null);
     setMessage(null);
-    if (mode === "signup") {
+    if (mode === "forgot") {
+      try {
+        const { error: authError } = await supabase.auth.resetPasswordForEmail(email, {
+          redirectTo: `${window.location.origin}/auth/confirm?next=/reset-password`,
+        });
+        if (authError) setError(friendlyPasswordResetRequestError(authError.message));
+        else setMessage("If an account exists for that email, a password reset link has been sent.");
+      } catch {
+        setError("We couldn't send a reset link right now. Please try again.");
+      }
+    } else if (mode === "signup") {
       const { data, error: authError } = await supabase.auth.signUp({
         email,
         password,
@@ -207,15 +224,16 @@ export default function CloudAccount({
             </div>
           ) : (
             <form className="cloud-auth-form" onSubmit={(event) => void submit(event)}>
-              <h3>{mode === "signin" ? "Sign in" : "Create account"}</h3>
+              <h3>{mode === "signin" ? "Sign in" : mode === "signup" ? "Create account" : "Reset password"}</h3>
               <label>Email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
-              <label>
+              {mode !== "forgot" && <label>
                 Password
                 <input type="password" autoComplete={mode === "signin" ? "current-password" : "new-password"} minLength={6} value={password} onChange={(event) => setPassword(event.target.value)} required />
-              </label>
+              </label>}
+              {mode === "signin" && <button type="button" className="cloud-auth-link" onClick={() => { setMode("forgot"); setError(null); setMessage(null); }} disabled={busy}>Forgot password?</button>}
               <div className="cloud-actions">
-                <button type="submit" disabled={busy}>{busy ? "Please wait…" : mode === "signin" ? "Sign in" : "Sign up"}</button>
-                <button type="button" className="secondary" onClick={() => setMode(null)} disabled={busy}>Cancel</button>
+                <button type="submit" disabled={busy}>{busy ? "Please wait…" : mode === "signin" ? "Sign in" : mode === "signup" ? "Sign up" : "Send reset link"}</button>
+                <button type="button" className="secondary" onClick={() => { setMode(mode === "forgot" ? "signin" : null); setError(null); setMessage(null); }} disabled={busy}>{mode === "forgot" ? "Back to sign in" : "Cancel"}</button>
               </div>
             </form>
           )}

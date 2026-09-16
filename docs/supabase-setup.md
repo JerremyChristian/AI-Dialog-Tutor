@@ -25,8 +25,10 @@ The migration creates the tables, ownership constraints, grants, Row Level Secur
 In Authentication URL Configuration:
 
 - Set the Site URL to the stable production URL (or `http://localhost:3000` while developing).
-- Add redirect URLs for `http://localhost:3000/auth/confirm` and each stable production domain's `/auth/confirm` path.
+- Add redirect URLs for `http://localhost:3000/auth/confirm`, `https://ai-dialog-tutor.vercel.app/auth/confirm`, and the allowed Vercel preview wildcard covering `/auth/confirm`.
 - For SSR email confirmation, configure the confirmation template to send `token_hash` and `type=email` to `/auth/confirm`, following Supabase's SSR email-confirmation template guidance.
+
+Password recovery passes the current browser origin as `redirectTo`, so localhost, production, and each preview deployment return to the same origin at `/auth/confirm?next=/reset-password`. The default Supabase recovery template's `{{ .ConfirmationURL }}` respects this redirect. If the recovery template is customized for SSR token-hash verification, it must preserve `{{ .RedirectTo }}` and send `token_hash={{ .TokenHash }}` with `type=recovery` to `/auth/confirm`; do not replace the dynamic redirect with a hard-coded production URL.
 
 Email/password sign-up respects the project's Supabase email-confirmation setting. If confirmation is enabled, the app asks the learner to check email before signing in.
 

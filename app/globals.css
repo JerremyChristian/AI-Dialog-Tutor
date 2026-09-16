@@ -301,6 +301,7 @@ h1 {
   color: var(--text);
   font: inherit;
 }
+.cloud-auth-link { width: fit-content; min-height: auto; padding: 0; border: 0; background: transparent; color: var(--accent); font-size: .8rem; font-weight: 650; text-decoration: underline; text-underline-offset: 2px; }
 
 .recent-lessons-heading,
 .current-saved-lesson,
