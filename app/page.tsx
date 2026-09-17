@@ -513,6 +513,8 @@ export default function Home() {
 
   function enterWrapUpWaiting(event: string, epoch?: number, hadAudio = true) {
     wrapUpTurnRef.current = null;
+    assistantSpeakingRef.current = false;
+    transportRef.current?.setAssistantSpeaking(false);
     setAuthoritativeEndPhase("wrap-up-waiting");
     wrapUpAwaitingAfterSequenceRef.current = learnerTurnSequenceRef.current;
     logLessonEndFlow(event, { epoch, providerComplete: true, hadAudio });
@@ -1712,6 +1714,13 @@ ${completesReview
   }, []);
 
   const handleLearnerInterruption = (discreteTextTurn = false) => {
+    if (lessonEndPhaseRef.current === "closing-farewell" ||
+        lessonEndPhaseRef.current === "completion-transition") {
+      logLessonEndFlow("closing-interruption-ignored", {
+        epoch: closingTurnRef.current?.generationEpoch,
+      });
+      return;
+    }
     // Gemini cuts playback immediately. Smoothing a mid-phoneme cutoff is a
     // later UX refinement; yielding to the learner remains the priority.
     invalidateActiveTeachingBeat("barge-in");
@@ -2006,6 +2015,11 @@ ${completesReview
         });
         if (completion && !completion.hadAudio) {
           beginCompletionTransition(closing.generationEpoch, "farewell-zero-audio");
+        } else if (!completion) {
+          logLessonEndFlow("farewell-batch-missing-at-generation-complete", {
+            epoch: closing.generationEpoch,
+            providerComplete: true,
+          });
         }
       }
       if (wrapUpTurn) {
