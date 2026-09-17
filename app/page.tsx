@@ -142,9 +142,13 @@ type NodeReviewState = {
   complete: boolean;
 };
 
-type ClosingTurn = {
+type FarewellTurn = {
+  conversationRun: number;
   generationEpoch: number;
   generationComplete: boolean;
+  audioReceived: boolean;
+  audioNaturallyDrained: boolean;
+  completionStarted: boolean;
 };
 
 type ConversationContinuity = {
@@ -405,8 +409,9 @@ export default function Home() {
   const restartPendingRef = useRef(false);
   const restartActiveLessonRef = useRef<() => Promise<void>>(async () => undefined);
   const nodeReviewRef = useRef<NodeReviewState | null>(null);
-  const closingTurnRef = useRef<ClosingTurn | null>(null);
+  const closingTurnRef = useRef<FarewellTurn | null>(null);
   const completionAnimationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [farewellFinishing, setFarewellFinishing] = useState(false);
 
   const addDebugMessage = useCallback((text: string) => {
     if (!isMountedRef.current) return;
@@ -614,27 +619,49 @@ ${completesReview
     return active;
   }
 
+  function maybeFinishFarewell() {
+    const farewell = closingTurnRef.current;
+    if (!farewell || farewell.completionStarted ||
+        farewell.conversationRun !== conversationRunRef.current ||
+        farewell.generationEpoch !== generationEpochRef.current ||
+        !farewell.generationComplete ||
+        (farewell.audioReceived && !farewell.audioNaturallyDrained)) return;
+    farewell.completionStarted = true;
+    assistantSpeakingRef.current = false;
+    transportRef.current?.setAssistantSpeaking(false);
+    setShowLessonComplete(true);
+    addDebugMessage(farewell.audioReceived
+      ? "FAREWELL_FLOW audio-drained"
+      : "FAREWELL_FLOW zero-audio");
+    addDebugMessage("FAREWELL_FLOW completion-animation");
+    completionAnimationTimerRef.current = setTimeout(() => {
+      completionAnimationTimerRef.current = null;
+      addDebugMessage("FAREWELL_FLOW stop");
+      void stopConversation("confirmed");
+    }, 800);
+  }
+
   function beginClosingFarewell() {
     if (closingTurnRef.current || restartPendingRef.current) return false;
     invalidateActiveTeachingBeat("lesson-closing");
     const generationEpoch = ++generationEpochRef.current;
-    closingTurnRef.current = { generationEpoch, generationComplete: false };
-    microphoneMutedRef.current = true;
-    setMicrophoneMuted(true);
+    closingTurnRef.current = {
+      conversationRun: conversationRunRef.current,
+      generationEpoch,
+      generationComplete: false,
+      audioReceived: false,
+      audioNaturallyDrained: false,
+      completionStarted: false,
+    };
+    setFarewellFinishing(true);
     playerRef.current?.beginBatch(generationEpoch, (epoch) => {
-      const closing = closingTurnRef.current;
-      if (!closing || closing.generationEpoch !== epoch || !closing.generationComplete) return;
-      closingTurnRef.current = null;
-      assistantSpeakingRef.current = false;
-      transportRef.current?.setAssistantSpeaking(false);
-      setShowLessonComplete(true);
-      addDebugMessage("Lesson farewell audio naturally drained");
-      completionAnimationTimerRef.current = setTimeout(() => {
-        completionAnimationTimerRef.current = null;
-        void stopConversation("confirmed");
-      }, 800);
+      const farewell = closingTurnRef.current;
+      if (!farewell || farewell.conversationRun !== conversationRunRef.current ||
+          farewell.generationEpoch !== epoch || epoch !== generationEpochRef.current) return;
+      farewell.audioNaturallyDrained = true;
+      maybeFinishFarewell();
     });
-    addDebugMessage(`Lesson closing farewell started: epoch=${generationEpoch}`);
+    addDebugMessage("FAREWELL_FLOW started");
     return true;
   }
 
@@ -736,6 +763,7 @@ ${completesReview
     cancelledToolCallIdsRef.current.clear();
     lessonActiveRef.current = false;
     closingTurnRef.current = null;
+    setFarewellFinishing(false);
     nodeReviewRef.current = null;
     setNodeReview(null);
     setShowLessonComplete(false);
@@ -1284,6 +1312,7 @@ ${completesReview
   };
 
   const sendQuickResponse = (response: QuickResponse) => {
+    if (closingTurnRef.current) return;
     const confirming = engagementStateRef.current === "confirming";
     let text = response === "Yes"
       ? "Yes."
@@ -1551,6 +1580,9 @@ ${completesReview
   }, []);
 
   const handleLearnerInterruption = (discreteTextTurn = false) => {
+    const farewell = closingTurnRef.current;
+    if (farewell && farewell.conversationRun === conversationRunRef.current &&
+        farewell.generationEpoch === generationEpochRef.current) return;
     // Gemini cuts playback immediately. Smoothing a mid-phoneme cutoff is a
     // later UX refinement; yielding to the learner remains the priority.
     invalidateActiveTeachingBeat("barge-in");
@@ -1591,6 +1623,7 @@ ${completesReview
 
   const submitTypedReply = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (closingTurnRef.current) return;
     const text = typedReply.trim();
     if (!text) return;
     if (!transportRef.current?.sendLearnerText(text)) {
@@ -1768,6 +1801,12 @@ ${completesReview
       const audio = part.inlineData;
       if (!audio?.data || !audio.mimeType?.startsWith("audio/")) continue;
 
+      const farewell = closingTurnRef.current;
+      if (farewell && farewell.conversationRun === conversationRunRef.current &&
+          farewell.generationEpoch === generationEpochRef.current) {
+        farewell.audioReceived = true;
+      }
+
       if (!assistantSpeakingRef.current) {
         typedInterruptionHandledRef.current = false;
         assistantSpeakingRef.current = true;
@@ -1808,9 +1847,12 @@ ${completesReview
         playerRef.current?.completeBatch(active.generationEpoch);
       }
       if (closing) {
+        if (closing.conversationRun !== conversationRunRef.current ||
+            closing.generationEpoch !== generationEpochRef.current) return;
         closing.generationComplete = true;
-        addDebugMessage(`Lesson farewell generation complete: epoch=${closing.generationEpoch}`);
+        addDebugMessage("FAREWELL_FLOW generation-complete");
         playerRef.current?.completeBatch(closing.generationEpoch);
+        maybeFinishFarewell();
       }
       if (!active && !closing) assistantSpeakingRef.current = false;
       assistantTurnActiveRef.current = false;
@@ -2432,7 +2474,7 @@ ${completesReview
             addDebugMessage("Acoustic activity detected");
           }
         }
-        if (!microphoneMutedRef.current) transport.sendAudio(chunk);
+        if (!microphoneMutedRef.current && !closingTurnRef.current) transport.sendAudio(chunk);
       });
       microphoneStreamerRef.current = microphoneStreamer;
       await microphoneStreamer.start();
@@ -2809,8 +2851,8 @@ ${completesReview
               aria-hidden="true"
             />
             <span className="status-copy">
-              <strong>{microphoneMuted ? "Muted" : "Listening"}</strong>
-              <small>{microphoneMuted ? "Microphone is off" : "You can speak at any time"}</small>
+              <strong>{farewellFinishing ? "Finishing lesson…" : microphoneMuted ? "Muted" : "Listening"}</strong>
+              <small>{farewellFinishing ? "Playing the tutor’s farewell" : microphoneMuted ? "Microphone is off" : "You can speak at any time"}</small>
             </span>
             <button className={`mute-button${microphoneMuted ? " mute-button-active" : ""}`} type="button" onClick={toggleMicrophoneMute} aria-label={microphoneMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={microphoneMuted}>{microphoneMuted ? "Unmute" : "Mute"}</button>
           </div>
