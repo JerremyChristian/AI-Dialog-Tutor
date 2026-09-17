@@ -362,6 +362,7 @@ export default function Home() {
   const assistantSpeakingRef = useRef(false);
   const typedInterruptionHandledRef = useRef(false);
   const assistantTurnActiveRef = useRef(false);
+  const learnerActivityRunRef = useRef<number | null>(null);
   const userTranscriptRef = useRef("");
   const voiceDraftRef = useRef("");
   const voiceDraftOpenRef = useRef(false);
@@ -409,6 +410,8 @@ export default function Home() {
   const restartPendingRef = useRef(false);
   const restartActiveLessonRef = useRef<() => Promise<void>>(async () => undefined);
   const nodeReviewRef = useRef<NodeReviewState | null>(null);
+  const reviewResumeGuardRef = useRef(false);
+  const reviewRecoveryPendingRef = useRef(false);
   const closingTurnRef = useRef<FarewellTurn | null>(null);
   const completionAnimationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [farewellFinishing, setFarewellFinishing] = useState(false);
@@ -425,6 +428,24 @@ export default function Home() {
       },
     ]);
   }, []);
+
+  function hasCurrentLearnerActivity() {
+    if (learnerActivityRunRef.current !== conversationRunRef.current) return false;
+    const continuity = transportRef.current?.getInterruptionContinuity();
+    return Boolean(continuity?.learnerUtteranceActive || continuity?.learnerUtteranceOpen);
+  }
+
+  function addReviewFlowDiagnostic(event: string, details = "") {
+    if (process.env.NODE_ENV !== "development") return;
+    const review = nodeReviewRef.current;
+    const active = activeTeachingBeatRef.current;
+    addDebugMessage(
+      `REVIEW_FLOW event=${event} reviewActive=${Boolean(review)} ` +
+      `reviewCursor=${review?.nextTeachingPointIndex ?? "none"} ` +
+      `activeMode=${active?.mode ?? "none"} generationEpoch=${generationEpochRef.current} ` +
+      `conversationRun=current${details ? ` ${details}` : ""}`,
+    );
+  }
 
   useEffect(() => {
     try {
@@ -508,8 +529,10 @@ BEAT_POSITION: ${position}
 ASSIGNED_TEACHING_POINTS: ${JSON.stringify(points)}
 RELEVANT_COMPLETION_CRITERIA: ${JSON.stringify(criteria)}
 ${active.isFirstBeatInUnit ? "Establish the unit naturally." : "Continue directly from the preceding explanation without greeting, praise, announcing a new section, or unnecessary recap."}
-${completesReview
-  ? "This is the final beat of a bounded node review. Briefly check whether the learner has questions or is ready to return to the main lesson. Do not continue into another concept and do not describe this review as new canonical progress."
+${active.mode === "review"
+  ? completesReview
+    ? "This is the final beat of a bounded node review. Finish the explanation cleanly without asking a question or inviting the learner to continue. Do not continue into another concept and do not describe this review as new canonical progress."
+    : "This review continues after this beat. Do not ask a question, invite learner interaction, or create a check-in merely because a delivery unit ended; finish with natural continuity because the application will immediately assign the next review beat."
   : completesPlannedLesson
   ? `All planned lesson content will be covered after this beat. ${LESSON_WRAP_UP_CONTROL} Ask naturally whether the learner has any final questions. Do not restart or revisit content unless they ask. If they clearly have no more questions, call session_control with action end.`
   : active.isFinalBeatInUnit
@@ -605,10 +628,17 @@ ${completesReview
       const current = activeTeachingBeatRef.current;
       if (!current || current.generationEpoch !== epoch) return;
       current.audioNaturallyDrained = true;
+      addReviewFlowDiagnostic("review-audio-drained");
       assistantSpeakingRef.current = false;
       transportRef.current?.setAssistantSpeaking(false);
       maybeCommitTeachingBeat(epoch);
     });
+    addReviewFlowDiagnostic(
+      "review-beat-assigned",
+      `unitIndex=${resolved.deliveryUnitIndex} beatIndex=${resolved.beatIndex} ` +
+      `wholeNodeFinal=${resolved.teachingPointIndexes.at(-1) === concept.teaching.teachingPoints.length - 1} ` +
+      `unitFinal=${resolved.isFinalBeatInUnit}`,
+    );
     const instruction = buildTeachingBeatControl(active, prefix ||
       "Review this concept from its beginning using the existing lesson contract. This is a bounded review and must not alter canonical lesson coverage.");
     if (sendInstruction && (!instruction || !transportRef.current?.sendRealtimeInput({ text: instruction }))) {
@@ -639,6 +669,25 @@ ${completesReview
       addDebugMessage("FAREWELL_FLOW stop");
       void stopConversation("confirmed");
     }, 2_000);
+  }
+
+  function finishNodeReviewAndResume(reason: "completed" | "manual") {
+    const review = nodeReviewRef.current;
+    if (!review || reviewResumeGuardRef.current) return false;
+    reviewResumeGuardRef.current = true;
+    const active = activeTeachingBeatRef.current;
+    if (active?.mode === "review") {
+      invalidateActiveTeachingBeat(`node-review-${reason}`);
+      playerRef.current?.clear();
+    }
+    nodeReviewRef.current = null;
+    setNodeReview(null);
+    presentationBeatRef.current = review.returnPresentationBeat;
+    setPresentationBeat(review.returnPresentationBeat);
+    addDebugMessage(`Node review exited: reason=${reason}`);
+    if (lessonWrapUpRef.current || isLessonPlanComplete(lessonStateRef.current)) return true;
+    assignNextTeachingBeat();
+    return true;
   }
 
   function beginClosingFarewell() {
@@ -688,7 +737,13 @@ ${completesReview
       activeTeachingBeatRef.current = null;
       playerRef.current?.cancelBatch(epoch);
       addDebugMessage(`Node review beat committed: concept=${review.nodeId}, next=${nextIndex}, complete=${complete}`);
-      if (!complete && !active.isFinalBeatInUnit) assignNextReviewBeat();
+      addReviewFlowDiagnostic(
+        "review-beat-committed",
+        `nextReviewCursor=${nextIndex} nodeComplete=${complete} ` +
+        `nextAction=${complete ? "review-exit-resume" : "review-next"}`,
+      );
+      if (!complete) assignNextReviewBeat();
+      else finishNodeReviewAndResume("completed");
       return;
     }
     const currentNext = state.teachingContractProgress[active.conceptId]?.nextTeachingPointIndex ?? 0;
@@ -751,6 +806,7 @@ ${completesReview
     playerRef.current = null;
     await player?.close();
     assistantSpeakingRef.current = false;
+    learnerActivityRunRef.current = null;
     typedInterruptionHandledRef.current = false;
     assistantTurnActiveRef.current = false;
     lastAssistantTurnCompleteRef.current = true;
@@ -765,6 +821,7 @@ ${completesReview
     closingTurnRef.current = null;
     setFarewellFinishing(false);
     nodeReviewRef.current = null;
+    reviewRecoveryPendingRef.current = false;
     setNodeReview(null);
     setShowLessonComplete(false);
     if (completionAnimationTimerRef.current) clearTimeout(completionAnimationTimerRef.current);
@@ -1313,6 +1370,7 @@ ${completesReview
 
   const sendQuickResponse = (response: QuickResponse) => {
     if (closingTurnRef.current) return;
+    reviewResumeGuardRef.current = false;
     const confirming = engagementStateRef.current === "confirming";
     let text = response === "Yes"
       ? "Yes."
@@ -1624,6 +1682,7 @@ ${completesReview
   const submitTypedReply = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (closingTurnRef.current) return;
+    reviewResumeGuardRef.current = false;
     const text = typedReply.trim();
     if (!text) return;
     if (!transportRef.current?.sendLearnerText(text)) {
@@ -1670,6 +1729,8 @@ ${completesReview
     // ACTIVITY_START and interrupted together; ordering this first prevents a
     // pending graceful rollover from retiring the socket between those events.
     if (voiceActivity === "ACTIVITY_START") {
+      learnerActivityRunRef.current = conversationRunRef.current;
+      reviewResumeGuardRef.current = false;
       transportRef.current?.setLearnerSpeaking(true);
       userTranscriptRef.current = "";
       voiceDraftRef.current = "";
@@ -1757,17 +1818,14 @@ ${completesReview
       if (engagementStateRef.current === "confirming" && !assistantSpeakingRef.current) {
         addDebugMessage("Idle confirmation spoken");
       }
-      assistantTranscriptRef.current = mergeTranscript(
-        assistantTranscriptRef.current,
-        serverContent.outputTranscription.text,
-      );
       visibleTutorTranscriptRawRef.current = mergeTranscript(
         visibleTutorTranscriptRawRef.current,
         serverContent.outputTranscription.text,
       );
-      setVisibleTutorTranscript(sanitizeLearnerVisibleTutorTranscript(
+      assistantTranscriptRef.current = sanitizeLearnerVisibleTutorTranscript(
         visibleTutorTranscriptRawRef.current,
-      ));
+      );
+      setVisibleTutorTranscript(assistantTranscriptRef.current);
       updateLessonState((current) => ({
         ...current,
         lastAssistantTranscript: assistantTranscriptRef.current,
@@ -1778,8 +1836,11 @@ ${completesReview
       if (typedInterruptionHandledRef.current) {
         typedInterruptionHandledRef.current = false;
         addDebugMessage("Provider confirmed typed interruption");
-      } else {
+      } else if (hasCurrentLearnerActivity()) {
+        addReviewFlowDiagnostic("provider-interrupted-accepted", "reason=current-learner-activity");
         handleLearnerInterruption();
+      } else {
+        addReviewFlowDiagnostic("provider-interrupted-ignored", "reason=no-learner-activity");
       }
     }
 
@@ -1841,8 +1902,10 @@ ${completesReview
     if (serverContent.generationComplete) {
       const active = activeTeachingBeatRef.current;
       const closing = closingTurnRef.current;
+      addReviewFlowDiagnostic("provider-generation-complete");
       if (active) {
         active.generationComplete = true;
+        if (active.mode === "review") addReviewFlowDiagnostic("review-generation-complete");
         addDebugMessage(`Teaching generation complete: epoch=${active.generationEpoch}`);
         playerRef.current?.completeBatch(active.generationEpoch);
       }
@@ -2058,22 +2121,32 @@ ${completesReview
         if (queryPurpose === "continue" && !postResumeQueryReceived &&
             !silentLessonRecoveryPendingRef.current) {
           const review = nodeReviewRef.current;
-          if (review?.complete) exitNodeReview();
-          const assignment = review && !review.complete
-            ? assignNextReviewBeat("", false)
-            : isLessonPlanComplete(lessonStateRef.current)
-              ? null
-              : assignNextTeachingBeat("", false);
-          if (assignment) assignmentControl = buildTeachingBeatControl(assignment);
-          else if (review?.complete && isLessonPlanComplete(lessonStateRef.current)) {
-            assignmentControl = LESSON_WRAP_UP_CONTROL;
+          let assignment: ActiveTeachingBeat | null = null;
+          if (review?.complete) {
+            finishNodeReviewAndResume("completed");
+          } else if (review) {
+            assignment = assignNextReviewBeat("", false);
+          } else if (!reviewResumeGuardRef.current && !isLessonPlanComplete(lessonStateRef.current)) {
+            assignment = assignNextTeachingBeat("", false);
           }
+          if (assignment) assignmentControl = buildTeachingBeatControl(assignment);
         }
         if (postResumeQueryReceived) {
           addDebugMessage("Post-resume continuity snapshot prepared");
           addDebugMessage("Teaching preferences included in post-resume state");
         }
         addDebugMessage("Lesson state queried");
+      } else if (
+        (action === "navigate" || action === "skip") &&
+        nodeReviewRef.current
+      ) {
+        addReviewFlowDiagnostic("navigation-rejected-during-review");
+        result = {
+          ok: false,
+          action,
+          error: "review_active",
+          message: "Review is active. Continue the current Review or wait for the learner to explicitly exit Review.",
+        };
       } else if (
         (action === "navigate" || action === "skip") &&
         typeof conceptId === "string" && conceptId
@@ -2187,6 +2260,7 @@ ${completesReview
     invalidateActiveTeachingBeat("node-review-exited");
     playerRef.current?.clear();
     nodeReviewRef.current = null;
+    reviewResumeGuardRef.current = false;
     setNodeReview(null);
     presentationBeatRef.current = review.returnPresentationBeat;
     setPresentationBeat(review.returnPresentationBeat);
@@ -2205,8 +2279,10 @@ ${completesReview
       complete: false,
     };
     nodeReviewRef.current = review;
+    reviewResumeGuardRef.current = false;
     setNodeReview(review);
     addDebugMessage(`Node review started: concept=${node.id}`);
+    addReviewFlowDiagnostic("review-start");
     assignNextReviewBeat();
   };
 
@@ -2381,8 +2457,22 @@ ${completesReview
         onStateChange: (state) => {
           if (!isMountedRef.current || run !== conversationRunRef.current) return;
           if (state === "recovering") {
+            const review = nodeReviewRef.current;
+            const canonical = getCurrentConcept(lessonStateRef.current);
+            addReviewFlowDiagnostic(
+              "recovery-start",
+              `reviewedNodePresent=${Boolean(review && lessonStateRef.current.nodes[review.nodeId])} ` +
+              `canonicalNode=${canonical ? "present" : "none"} ` +
+              `canonicalCursor=${canonical
+                ? lessonStateRef.current.teachingContractProgress[canonical.id]?.nextTeachingPointIndex ?? 0
+                : "none"} recoveryIncludesReview=false`,
+            );
+            reviewRecoveryPendingRef.current = true;
             invalidateActiveTeachingBeat("transport-recovery");
             playerRef.current?.clear();
+          } else if (state === "active" && reviewRecoveryPendingRef.current) {
+            reviewRecoveryPendingRef.current = false;
+            addReviewFlowDiagnostic("recovery-complete", "recoveryIncludesReview=false");
           }
           setTransportState(state);
           setAiConnectionStatus(
@@ -2902,7 +2992,7 @@ ${completesReview
           onNavigate={navigateFromRoadmap}
           reviewNodeId={nodeReview?.nodeId ?? null}
           onReview={startNodeReview}
-          onExitReview={exitNodeReview}
+          onExitReview={() => finishNodeReviewAndResume("manual")}
         /></div>}
         </div>}
 
