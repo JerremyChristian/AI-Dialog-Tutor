@@ -1385,7 +1385,8 @@ h1 {
 .roadmap-review-button { min-height: 32px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--accent); cursor: pointer; font-size: .68rem; font-weight: 700; }
 .roadmap-review-button:disabled { cursor: default; opacity: .65; }
 .roadmap-review-banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 2px 4px 8px; padding: 8px 10px; border-radius: 8px; background: rgb(37 87 214 / 8%); color: var(--accent); font-size: .72rem; font-weight: 700; }
-.roadmap-review-banner button { border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; text-decoration: underline; }
+.roadmap-review-banner span { min-width: 0; overflow-wrap: anywhere; }
+.roadmap-review-banner button { flex: none; border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; text-decoration: underline; }
 
 @media (max-width: 899px) {
   .active-learning-grid {
@@ -1786,6 +1787,7 @@ summary:focus-visible {
 .lesson-detail-actions { display: flex; gap: 10px; }
 .lesson-detail-actions .button-primary { flex: 1; }
 .restart-lesson-confirmation { margin-top: 14px; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.teaching-shell > .restart-lesson-confirmation { margin-bottom: var(--teaching-room-section-gap); }
 .restart-lesson-confirmation h2 { margin: 0 0 6px; font-size: 1rem; }
 .restart-lesson-confirmation p { margin: 0; color: var(--muted); font-size: .85rem; line-height: 1.5; }
 .restart-lesson-confirmation > div { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
