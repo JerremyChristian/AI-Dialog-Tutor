@@ -153,7 +153,7 @@ export function LessonRoadmap({
           {structural && (
             <span className="roadmap-expand-icon" aria-hidden="true">{expanded ? "−" : "+"}</span>
           )}
-          {teachable && node.status !== "not-started" && lessonActive && onReview && (
+          {teachable && lessonActive && onReview && (
             <button type="button" className="roadmap-review-button" disabled={navigationPending || reviewing} aria-label={`Review ${node.title} from start`} onClick={() => onReview(node)}>{reviewing ? "Reviewing" : "Review"}</button>
           )}
         </div>
@@ -171,7 +171,7 @@ export function LessonRoadmap({
         <small>{summary}</small>
       </summary>
       <div className="roadmap-body">
-        {reviewNodeId && onExitReview && <div className="roadmap-review-banner"><span>Reviewing {lessonState.nodes[reviewNodeId]?.title || "concept"}</span><button type="button" onClick={onExitReview}>Exit Review</button></div>}
+        {reviewNodeId && onExitReview && <div className="roadmap-review-banner"><span>Reviewing one concept from the beginning</span><button type="button" onClick={onExitReview}>Exit Review</button></div>}
         {navigationPending && <p className="roadmap-pending" role="status">Moving to selected concept…</p>}
         {lessonState.rootNodeIds.length ? (
           <ol className="roadmap-tree">

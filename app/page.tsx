@@ -147,15 +147,6 @@ type ClosingTurn = {
   generationComplete: boolean;
 };
 
-type LearnerInputEvidence = {
-  run: number;
-  audioFrameCount: number;
-  acousticFrameCount: number;
-  speechStarted: boolean;
-  restoredHistory: boolean;
-  turnAccepted: boolean;
-};
-
 type ConversationContinuity = {
   lastMeaningfulLearnerTranscript?: string;
   lastAssistantTranscript?: string;
@@ -302,7 +293,6 @@ export default function Home() {
   const [engagementState, setEngagementState] = useState<EngagementState>("ended");
   const [transportState, setTransportState] = useState<LiveTransportState>("closed");
   const [microphoneMuted, setMicrophoneMuted] = useState(false);
-  const [closingInputSuppressed, setClosingInputSuppressed] = useState(false);
   const [quickResponseFeedback, setQuickResponseFeedback] = useState("");
   const [mobileTranscriptExpanded, setMobileTranscriptExpanded] = useState(false);
   const [desktopTeachingStyleExpanded, setDesktopTeachingStyleExpanded] = useState(true);
@@ -397,7 +387,6 @@ export default function Home() {
   const engagementTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const confirmationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const microphoneMutedRef = useRef(false);
-  const closingInputSuppressedRef = useRef(false);
   const microphoneMuteTransitionRef = useRef(false);
   const quickResponseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const typedReplyInputRef = useRef<HTMLInputElement | null>(null);
@@ -412,18 +401,12 @@ export default function Home() {
   const presentationBeatRef = useRef<PresentationBeat | null>(null);
   const generationEpochRef = useRef(0);
   const lessonWrapUpRef = useRef(false);
-  const freshLearnerTurnSequenceRef = useRef(0);
-  const wrapUpLearnerTurnBaselineRef = useRef(0);
   const conversationalRestartConfirmationRef = useRef(false);
   const restartPendingRef = useRef(false);
   const restartActiveLessonRef = useRef<() => Promise<void>>(async () => undefined);
   const nodeReviewRef = useRef<NodeReviewState | null>(null);
   const closingTurnRef = useRef<ClosingTurn | null>(null);
   const completionAnimationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const learnerInputEvidenceRef = useRef<LearnerInputEvidence>({
-    run: 0, audioFrameCount: 0, acousticFrameCount: 0,
-    speechStarted: false, restoredHistory: false, turnAccepted: false,
-  });
 
   const addDebugMessage = useCallback((text: string) => {
     if (!isMountedRef.current) return;
@@ -437,20 +420,6 @@ export default function Home() {
       },
     ]);
   }, []);
-
-  const logLearnerTurnDiagnostic = (source: "mic-asr" | "typed" | "quick-reply", accepted: boolean, reason: string) => {
-    if (process.env.NODE_ENV === "production") return;
-    const evidence = learnerInputEvidenceRef.current;
-    addDebugMessage(
-      `LEARNER TURN ${accepted ? "ACCEPTED" : "REJECTED"}: source=${source}, ` +
-      `conversationRun=${evidence.run === conversationRunRef.current ? "current" : "stale"}, ` +
-      `session=${transportRef.current ? "current" : "missing"}, speechStarted=${evidence.speechStarted}, ` +
-      `hadAudioFrames=${evidence.audioFrameCount > 0}, audioFrameCount=${evidence.audioFrameCount}, ` +
-      `asrDraftPresent=${Boolean(voiceDraftRef.current)}, finalTranscriptPresent=${source === "mic-asr"}, ` +
-      `restoredHistory=${evidence.restoredHistory}, wrapUpState=${lessonWrapUpRef.current}, ` +
-      `accepted=${accepted}, reason=${reason}`,
-    );
-  };
 
   useEffect(() => {
     try {
@@ -650,9 +619,8 @@ ${completesReview
     invalidateActiveTeachingBeat("lesson-closing");
     const generationEpoch = ++generationEpochRef.current;
     closingTurnRef.current = { generationEpoch, generationComplete: false };
-    closingInputSuppressedRef.current = true;
-    setClosingInputSuppressed(true);
-    transportRef.current?.setMicrophoneForwardingEnabled(false);
+    microphoneMutedRef.current = true;
+    setMicrophoneMuted(true);
     playerRef.current?.beginBatch(generationEpoch, (epoch) => {
       const closing = closingTurnRef.current;
       if (!closing || closing.generationEpoch !== epoch || !closing.generationComplete) return;
@@ -724,7 +692,6 @@ ${completesReview
     );
     if (transition.state.status === "completed") {
       lessonWrapUpRef.current = true;
-      wrapUpLearnerTurnBaselineRef.current = freshLearnerTurnSequenceRef.current;
       addDebugMessage(`Lesson wrap-up entered: finalConcept=${active.conceptId}`);
     }
     if (!active.isFinalBeatInUnit) {
@@ -769,8 +736,6 @@ ${completesReview
     cancelledToolCallIdsRef.current.clear();
     lessonActiveRef.current = false;
     closingTurnRef.current = null;
-    closingInputSuppressedRef.current = false;
-    setClosingInputSuppressed(false);
     nodeReviewRef.current = null;
     setNodeReview(null);
     setShowLessonComplete(false);
@@ -1225,7 +1190,7 @@ ${completesReview
 
   const navigateFromRoadmap = (node: LessonState["nodes"][string]) => {
     if (!lessonActiveRef.current || roadmapNavigationPendingRef.current) return;
-    if (nodeReviewRef.current) exitNodeReview(false);
+    if (nodeReviewRef.current) exitNodeReview();
     if (node.id === lessonStateRef.current.currentNodeId || node.childrenIds.length) return;
     invalidateActiveTeachingBeat("roadmap-navigation");
     playerRef.current?.clear();
@@ -1297,7 +1262,7 @@ ${completesReview
   };
 
   const toggleMicrophoneMute = async () => {
-    if (microphoneMuteTransitionRef.current || closingInputSuppressedRef.current) return;
+    if (microphoneMuteTransitionRef.current) return;
     const muted = !microphoneMutedRef.current;
     microphoneMuteTransitionRef.current = true;
     try {
@@ -1340,9 +1305,7 @@ ${completesReview
     voiceDraftOpenRef.current = false;
     setLatestLearnerReply(response);
     markMeaningfulActivity();
-    freshLearnerTurnSequenceRef.current += 1;
     addDebugMessage(`Quick response sent: ${response}`);
-    logLearnerTurnDiagnostic("quick-reply", true, "fresh-user-input");
     if (confirming && (response === "Yes" || response === "Continue")) {
       if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
       confirmationTimerRef.current = null;
@@ -1650,11 +1613,9 @@ ${completesReview
       lastUserTranscript: text,
     }));
     markMeaningfulActivity();
-    freshLearnerTurnSequenceRef.current += 1;
     setUserError("");
     setTypedReply("");
     addDebugMessage("Typed learner reply sent");
-    logLearnerTurnDiagnostic("typed", true, "fresh-user-input");
     window.requestAnimationFrame(() => typedReplyInputRef.current?.focus());
   };
 
@@ -1677,9 +1638,6 @@ ${completesReview
     // pending graceful rollover from retiring the socket between those events.
     if (voiceActivity === "ACTIVITY_START") {
       transportRef.current?.setLearnerSpeaking(true);
-      if (learnerInputEvidenceRef.current.run === conversationRunRef.current) {
-        learnerInputEvidenceRef.current.speechStarted = true;
-      }
       userTranscriptRef.current = "";
       voiceDraftRef.current = "";
       voiceDraftOpenRef.current = true;
@@ -1690,16 +1648,8 @@ ${completesReview
     } else if (voiceActivity === "ACTIVITY_END") {
       transportRef.current?.setLearnerSpeaking(false);
     }
-    const inputEvidence = learnerInputEvidenceRef.current;
-    const hasFreshMicEvidence = inputEvidence.run === conversationRunRef.current &&
-      inputEvidence.speechStarted;
-    if (serverContent?.inputTranscription?.text && hasFreshMicEvidence) {
+    if (serverContent?.inputTranscription?.text) {
       const transcriptFragment = serverContent.inputTranscription.text;
-      if (!inputEvidence.turnAccepted) {
-        inputEvidence.turnAccepted = true;
-        freshLearnerTurnSequenceRef.current += 1;
-        logLearnerTurnDiagnostic("mic-asr", true, "fresh-user-input");
-      }
       if (!voiceDraftOpenRef.current) {
         voiceDraftRef.current = "";
         voiceDraftOpenRef.current = true;
@@ -1738,17 +1688,7 @@ ${completesReview
       if (wasInterrupted) {
         addDebugMessage("Resolving learner interruption");
       }
-    } else if (serverContent?.inputTranscription?.text) {
-      logLearnerTurnDiagnostic(
-        "mic-asr",
-        false,
-        inputEvidence.run !== conversationRunRef.current
-          ? "stale-event"
-          : inputEvidence.restoredHistory
-            ? "history-only"
-            : "no-fresh-audio",
-      );
-    } else if (serverContent?.interimInputTranscription?.text && hasFreshMicEvidence) {
+    } else if (serverContent?.interimInputTranscription?.text) {
       if (!voiceDraftOpenRef.current) {
         voiceDraftRef.current = "";
         voiceDraftOpenRef.current = true;
@@ -1763,13 +1703,6 @@ ${completesReview
         voiceActivity === "ACTIVITY_END" || serverContent?.turnComplete) {
       voiceDraftRef.current = "";
       voiceDraftOpenRef.current = false;
-      if (inputEvidence.run === conversationRunRef.current) {
-        inputEvidence.audioFrameCount = 0;
-        inputEvidence.acousticFrameCount = 0;
-        inputEvidence.speechStarted = false;
-        inputEvidence.restoredHistory = false;
-        inputEvidence.turnAccepted = false;
-      }
     }
 
     if (serverContent?.outputTranscription?.text) {
@@ -1912,9 +1845,6 @@ ${completesReview
         persistedResumeBriefingPendingRef.current = false;
         addDebugMessage("Resume briefing completed");
       }
-      if (lessonWrapUpRef.current && !closingTurnRef.current) {
-        wrapUpLearnerTurnBaselineRef.current = freshLearnerTurnSequenceRef.current;
-      }
       addDebugMessage("Assistant response completed");
     }
   };
@@ -2014,14 +1944,6 @@ ${completesReview
         } else if (action === "restart_cancel") {
           conversationalRestartConfirmationRef.current = false;
           result = { ok: true, action, message: "Keep the completed lesson unchanged" };
-        } else if (lessonWrapUpRef.current && action === "end" &&
-            freshLearnerTurnSequenceRef.current <= wrapUpLearnerTurnBaselineRef.current) {
-          addDebugMessage("Session control end ignored: no fresh learner turn in wrap-up");
-          result = {
-            ok: false,
-            action: "end",
-            message: "No fresh learner response has been received. Remain in final-question wrap-up and wait silently for the learner.",
-          };
         } else if (lessonWrapUpRef.current && action === "end") {
           if (beginClosingFarewell()) {
             addDebugMessage("Final questions completed; graceful closing started");
@@ -2094,7 +2016,7 @@ ${completesReview
         if (queryPurpose === "continue" && !postResumeQueryReceived &&
             !silentLessonRecoveryPendingRef.current) {
           const review = nodeReviewRef.current;
-          if (review?.complete) exitNodeReview(false);
+          if (review?.complete) exitNodeReview();
           const assignment = review && !review.complete
             ? assignNextReviewBeat("", false)
             : isLessonPlanComplete(lessonStateRef.current)
@@ -2217,7 +2139,7 @@ ${completesReview
     }
   };
 
-  const exitNodeReview = (resumeMainLesson = true) => {
+  const exitNodeReview = () => {
     const review = nodeReviewRef.current;
     if (!review) return;
     invalidateActiveTeachingBeat("node-review-exited");
@@ -2227,24 +2149,10 @@ ${completesReview
     presentationBeatRef.current = review.returnPresentationBeat;
     setPresentationBeat(review.returnPresentationBeat);
     addDebugMessage(`Node review exited: concept=${review.nodeId}`);
-    if (!resumeMainLesson || !lessonActiveRef.current) return;
-    if (isLessonPlanComplete(lessonStateRef.current)) {
-      lessonWrapUpRef.current = true;
-      addDebugMessage("Node review returned to completed lesson wrap-up");
-      return;
-    }
-    const resumed = assignNextTeachingBeat(
-      "Continue the authoritative main lesson now from the assigned presentation beat. Do not recap the review or wait for another learner reply.",
-      true,
-    );
-    addDebugMessage(resumed
-      ? `Node review resumed main lesson: concept=${resumed.conceptId}`
-      : "Node review main lesson resume was not scheduled");
   };
 
   const startNodeReview = (node: LessonState["nodes"][string]) => {
     if (!lessonActiveRef.current || !node.teaching || node.childrenIds.length ||
-        node.status === "not-started" ||
         restartPendingRef.current || closingTurnRef.current) return;
     invalidateActiveTeachingBeat("node-review-started");
     playerRef.current?.clear();
@@ -2368,18 +2276,6 @@ ${completesReview
     }
 
     const run = ++conversationRunRef.current;
-    freshLearnerTurnSequenceRef.current = 0;
-    wrapUpLearnerTurnBaselineRef.current = 0;
-    learnerInputEvidenceRef.current = {
-      run,
-      audioFrameCount: 0,
-      acousticFrameCount: 0,
-      speechStarted: false,
-      restoredHistory: continuingSavedLesson,
-      turnAccepted: false,
-    };
-    closingInputSuppressedRef.current = false;
-    setClosingInputSuppressed(false);
     setMicrophoneStatus("Requesting permission");
     setAiConnectionStatus("Not connected");
     addDebugMessage("Microphone permission requested");
@@ -2528,20 +2424,15 @@ ${completesReview
       const microphoneStreamer = new MicrophonePcmStreamer(stream, (chunk) => {
         if (run !== conversationRunRef.current || transportRef.current !== transport) return;
         const rms = pcm16Rms(chunk);
-        const inputEvidence = learnerInputEvidenceRef.current;
-        if (inputEvidence.run === run && !microphoneMutedRef.current &&
-            !closingInputSuppressedRef.current) inputEvidence.audioFrameCount += 1;
         noiseFloorRef.current += (rms - noiseFloorRef.current) * NOISE_FLOOR_SMOOTHING;
         if (rms >= Math.max(MIN_ACOUSTIC_RMS, noiseFloorRef.current * ACOUSTIC_ACTIVITY_MULTIPLIER)) {
-          if (inputEvidence.run === run && !microphoneMutedRef.current &&
-              !closingInputSuppressedRef.current) inputEvidence.acousticFrameCount += 1;
           lastAcousticActivityAtRef.current = Date.now();
           if (Date.now() - lastAcousticLogAtRef.current >= ACOUSTIC_LOG_COOLDOWN_MS) {
             lastAcousticLogAtRef.current = Date.now();
             addDebugMessage("Acoustic activity detected");
           }
         }
-        if (!microphoneMutedRef.current && !closingInputSuppressedRef.current) transport.sendAudio(chunk);
+        if (!microphoneMutedRef.current) transport.sendAudio(chunk);
       });
       microphoneStreamerRef.current = microphoneStreamer;
       await microphoneStreamer.start();
@@ -2564,7 +2455,6 @@ ${completesReview
       beginIdleMonitoring();
       void requestWakeLock();
       if (lessonWrapUpRef.current) {
-        wrapUpLearnerTurnBaselineRef.current = freshLearnerTurnSequenceRef.current;
         addDebugMessage("Completed lesson restored in wrap-up");
         transportRef.current?.sendRealtimeInput({ text: LESSON_WRAP_UP_CONTROL });
       } else if (sessionStartMode === "persisted-resume") {
@@ -2915,14 +2805,14 @@ ${completesReview
         {lessonActive && <div className="status-row" aria-label="Conversation status">
           <div className="status-item" aria-live="polite">
             <span
-              className={`status-dot${microphoneActive && !closingInputSuppressed ? " status-dot-active" : ""}`}
+              className={`status-dot${microphoneActive ? " status-dot-active" : ""}`}
               aria-hidden="true"
             />
             <span className="status-copy">
-              <strong>{closingInputSuppressed ? "Finishing lesson\u2026" : microphoneMuted ? "Muted" : "Listening"}</strong>
-              <small>{closingInputSuppressed ? "Closing the lesson" : microphoneMuted ? "Microphone is off" : "You can speak at any time"}</small>
+              <strong>{microphoneMuted ? "Muted" : "Listening"}</strong>
+              <small>{microphoneMuted ? "Microphone is off" : "You can speak at any time"}</small>
             </span>
-            <button className={`mute-button${microphoneMuted ? " mute-button-active" : ""}`} type="button" disabled={closingInputSuppressed} onClick={toggleMicrophoneMute} aria-label={microphoneMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={microphoneMuted}>{microphoneMuted ? "Unmute" : "Mute"}</button>
+            <button className={`mute-button${microphoneMuted ? " mute-button-active" : ""}`} type="button" onClick={toggleMicrophoneMute} aria-label={microphoneMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={microphoneMuted}>{microphoneMuted ? "Unmute" : "Mute"}</button>
           </div>
           <div className="status-item" aria-live="polite">
             <span
@@ -2970,7 +2860,7 @@ ${completesReview
           onNavigate={navigateFromRoadmap}
           reviewNodeId={nodeReview?.nodeId ?? null}
           onReview={startNodeReview}
-          onExitReview={() => exitNodeReview(true)}
+          onExitReview={exitNodeReview}
         /></div>}
         </div>}
 
