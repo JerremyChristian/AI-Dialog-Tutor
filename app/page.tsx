@@ -147,6 +147,24 @@ type ClosingTurn = {
   generationComplete: boolean;
 };
 
+type LessonEndPhase =
+  | "teaching"
+  | "wrap-up-question"
+  | "wrap-up-response"
+  | "wrap-up-waiting"
+  | "closing-farewell"
+  | "completion-transition"
+  | "stopped";
+
+type WrapUpTurn = {
+  kind: "restored-question" | "learner-question-response";
+  conversationRun: number;
+  generationEpoch: number;
+  generationComplete: boolean;
+};
+
+type StopOwner = "farewell" | "manual" | "inactivity" | "idle-confirmation" | "restart";
+
 type ConversationContinuity = {
   lastMeaningfulLearnerTranscript?: string;
   lastAssistantTranscript?: string;
@@ -293,6 +311,7 @@ export default function Home() {
   const [engagementState, setEngagementState] = useState<EngagementState>("ended");
   const [transportState, setTransportState] = useState<LiveTransportState>("closed");
   const [microphoneMuted, setMicrophoneMuted] = useState(false);
+  const [closingInputSuppressed, setClosingInputSuppressed] = useState(false);
   const [quickResponseFeedback, setQuickResponseFeedback] = useState("");
   const [mobileTranscriptExpanded, setMobileTranscriptExpanded] = useState(false);
   const [desktopTeachingStyleExpanded, setDesktopTeachingStyleExpanded] = useState(true);
@@ -331,6 +350,7 @@ export default function Home() {
   const [restartPending, setRestartPending] = useState(false);
   const [nodeReview, setNodeReview] = useState<NodeReviewState | null>(null);
   const [showLessonComplete, setShowLessonComplete] = useState(false);
+  const [lessonEndPhase, setLessonEndPhase] = useState<LessonEndPhase>("stopped");
   const preparedSourceRef = useRef<PreparedLearningSource | null>(null);
   const savedLessonIdRef = useRef<string | null>(null);
   const savedLessonCreatedAtRef = useRef<string | null>(null);
@@ -387,6 +407,7 @@ export default function Home() {
   const engagementTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const confirmationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const microphoneMutedRef = useRef(false);
+  const closingInputSuppressedRef = useRef(false);
   const microphoneMuteTransitionRef = useRef(false);
   const quickResponseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const typedReplyInputRef = useRef<HTMLInputElement | null>(null);
@@ -401,12 +422,20 @@ export default function Home() {
   const presentationBeatRef = useRef<PresentationBeat | null>(null);
   const generationEpochRef = useRef(0);
   const lessonWrapUpRef = useRef(false);
+  const lessonEndPhaseRef = useRef<LessonEndPhase>("stopped");
+  const lessonEndConversationRunRef = useRef(0);
+  const learnerTurnSequenceRef = useRef(0);
+  const wrapUpAwaitingAfterSequenceRef = useRef(0);
+  const microphoneTurnEvidenceRef = useRef({ run: 0, speechStarted: false, counted: false });
+  const wrapUpTurnRef = useRef<WrapUpTurn | null>(null);
   const conversationalRestartConfirmationRef = useRef(false);
   const restartPendingRef = useRef(false);
   const restartActiveLessonRef = useRef<() => Promise<void>>(async () => undefined);
   const nodeReviewRef = useRef<NodeReviewState | null>(null);
   const closingTurnRef = useRef<ClosingTurn | null>(null);
   const completionAnimationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stopConversationPromiseRef = useRef<Promise<void> | null>(null);
+  const stopOwnerRef = useRef<StopOwner | null>(null);
 
   const addDebugMessage = useCallback((text: string) => {
     if (!isMountedRef.current) return;
@@ -459,6 +488,80 @@ export default function Home() {
     setLessonState(next);
   };
 
+  function setAuthoritativeEndPhase(phase: LessonEndPhase) {
+    lessonEndPhaseRef.current = phase;
+    setLessonEndPhase(phase);
+  }
+
+  function logLessonEndFlow(
+    event: string,
+    details: { epoch?: number | null; providerComplete?: boolean; hadAudio?: boolean; owner?: StopOwner | null; inputSource?: "mic" | "typed" | "quick-reply" } = {},
+  ) {
+    if (process.env.NODE_ENV === "production") return;
+    addDebugMessage(
+      `LESSON_END_FLOW event=${event} phase=${lessonEndPhaseRef.current} ` +
+      `conversationRun=${lessonEndConversationRunRef.current === conversationRunRef.current ? "current" : "stale"} ` +
+      `generationEpoch=${details.epoch ?? "none"} learnerTurnSequence=${learnerTurnSequenceRef.current} ` +
+      `awaitingAfterSequence=${wrapUpAwaitingAfterSequenceRef.current} ` +
+      `activeBeat=${activeTeachingBeatRef.current ? "present" : "missing"} ` +
+      `wrapUpTurn=${wrapUpTurnRef.current ? "present" : "missing"} ` +
+      `closingTurn=${closingTurnRef.current ? "present" : "missing"} ` +
+      `providerComplete=${details.providerComplete ?? false} audioBatchHadAudio=${details.hadAudio ?? false} ` +
+      `stopOwner=${details.owner ?? stopOwnerRef.current ?? "none"} inputSource=${details.inputSource ?? "none"}`,
+    );
+  }
+
+  function enterWrapUpWaiting(event: string, epoch?: number, hadAudio = true) {
+    wrapUpTurnRef.current = null;
+    setAuthoritativeEndPhase("wrap-up-waiting");
+    wrapUpAwaitingAfterSequenceRef.current = learnerTurnSequenceRef.current;
+    logLessonEndFlow(event, { epoch, providerComplete: true, hadAudio });
+    logLessonEndFlow("wrap-up-baseline-set", { epoch, providerComplete: true, hadAudio });
+  }
+
+  function beginOwnedWrapUpTurn(kind: WrapUpTurn["kind"]) {
+    if (!lessonActiveRef.current || wrapUpTurnRef.current || closingTurnRef.current) return false;
+    const generationEpoch = ++generationEpochRef.current;
+    const turn: WrapUpTurn = {
+      kind,
+      conversationRun: conversationRunRef.current,
+      generationEpoch,
+      generationComplete: false,
+    };
+    wrapUpTurnRef.current = turn;
+    setAuthoritativeEndPhase(kind === "restored-question" ? "wrap-up-question" : "wrap-up-response");
+    playerRef.current?.beginBatch(generationEpoch, (epoch) => {
+      const current = wrapUpTurnRef.current;
+      if (!current || current.generationEpoch !== epoch || !current.generationComplete ||
+          current.conversationRun !== conversationRunRef.current) return;
+      enterWrapUpWaiting(
+        current.kind === "restored-question"
+          ? "restored-wrap-up-question-complete"
+          : "wrap-up-response-complete",
+        epoch,
+      );
+    });
+    logLessonEndFlow(
+      kind === "restored-question"
+        ? "restored-wrap-up-question-started"
+        : "wrap-up-response-started",
+      { epoch: generationEpoch },
+    );
+    return true;
+  }
+
+  function noteAcceptedLearnerTurn(source: "mic" | "typed" | "quick-reply") {
+    learnerTurnSequenceRef.current += 1;
+    logLessonEndFlow("learner-turn-accepted", { inputSource: source });
+  }
+
+  function ownWrapUpResponseIfNeeded() {
+    if (lessonWrapUpRef.current && lessonEndPhaseRef.current === "wrap-up-waiting" &&
+        learnerTurnSequenceRef.current > wrapUpAwaitingAfterSequenceRef.current) {
+      beginOwnedWrapUpTurn("learner-question-response");
+    }
+  }
+
   function invalidateActiveTeachingBeat(reason: string) {
     const active = activeTeachingBeatRef.current;
     if (!active) return;
@@ -466,6 +569,8 @@ export default function Home() {
     activeTeachingBeatRef.current = null;
     playerRef.current?.cancelBatch(active.generationEpoch);
     generationEpochRef.current += 1;
+    if (active.mode === "lesson" && lessonEndPhaseRef.current === "wrap-up-question" &&
+        !lessonWrapUpRef.current) setAuthoritativeEndPhase("teaching");
     addDebugMessage(`Teaching beat interrupted: epoch=${active.generationEpoch}, commit=no, reason=${reason}`);
   }
 
@@ -540,6 +645,17 @@ ${completesReview
       cancelled: false,
     };
     activeTeachingBeatRef.current = active;
+    const finalPlannedBeat = active.teachingPointIndexes.at(-1) ===
+      concept.teaching.teachingPoints.length - 1 &&
+      !Object.values(state.nodes).some((candidate) =>
+        candidate.id !== active.conceptId && candidate.childrenIds.length === 0 &&
+        Boolean(candidate.teaching) && candidate.status !== "taught" && candidate.status !== "skipped"
+      );
+    if (finalPlannedBeat) {
+      lessonEndConversationRunRef.current = conversationRunRef.current;
+      setAuthoritativeEndPhase("wrap-up-question");
+      logLessonEndFlow("fresh-wrap-up-question-started", { epoch: generationEpoch });
+    }
     const presentation = { ...resolved, conceptId: concept.id };
     presentationBeatRef.current = presentation;
     setPresentationBeat(presentation);
@@ -614,27 +730,51 @@ ${completesReview
     return active;
   }
 
+  function beginCompletionTransition(epoch: number, event: "farewell-audio-drained" | "farewell-zero-audio") {
+    const closing = closingTurnRef.current;
+    if (!closing || closing.generationEpoch !== epoch ||
+        lessonEndPhaseRef.current !== "closing-farewell") return;
+    setAuthoritativeEndPhase("completion-transition");
+    setShowLessonComplete(true);
+    logLessonEndFlow(event, {
+      epoch,
+      providerComplete: closing.generationComplete,
+      hadAudio: event === "farewell-audio-drained",
+    });
+    logLessonEndFlow("completion-transition-started", {
+      epoch,
+      providerComplete: closing.generationComplete,
+      hadAudio: event === "farewell-audio-drained",
+    });
+    if (completionAnimationTimerRef.current) return;
+    completionAnimationTimerRef.current = setTimeout(() => {
+      completionAnimationTimerRef.current = null;
+      void stopConversation("confirmed", "farewell");
+    }, 800);
+  }
+
   function beginClosingFarewell() {
-    if (closingTurnRef.current || restartPendingRef.current) return false;
+    if (lessonEndPhaseRef.current !== "wrap-up-waiting" || closingTurnRef.current ||
+        restartPendingRef.current ||
+        lessonEndConversationRunRef.current !== conversationRunRef.current) return false;
     invalidateActiveTeachingBeat("lesson-closing");
+    wrapUpTurnRef.current = null;
     const generationEpoch = ++generationEpochRef.current;
     closingTurnRef.current = { generationEpoch, generationComplete: false };
-    microphoneMutedRef.current = true;
-    setMicrophoneMuted(true);
+    setAuthoritativeEndPhase("closing-farewell");
+    setRestartConfirmationOpen(false);
+    closingInputSuppressedRef.current = true;
+    setClosingInputSuppressed(true);
+    transportRef.current?.setMicrophoneForwardingEnabled(false);
     playerRef.current?.beginBatch(generationEpoch, (epoch) => {
       const closing = closingTurnRef.current;
       if (!closing || closing.generationEpoch !== epoch || !closing.generationComplete) return;
-      closingTurnRef.current = null;
       assistantSpeakingRef.current = false;
       transportRef.current?.setAssistantSpeaking(false);
-      setShowLessonComplete(true);
-      addDebugMessage("Lesson farewell audio naturally drained");
-      completionAnimationTimerRef.current = setTimeout(() => {
-        completionAnimationTimerRef.current = null;
-        void stopConversation("confirmed");
-      }, 800);
+      beginCompletionTransition(epoch, "farewell-audio-drained");
     });
     addDebugMessage(`Lesson closing farewell started: epoch=${generationEpoch}`);
+    logLessonEndFlow("farewell-started", { epoch: generationEpoch });
     return true;
   }
 
@@ -692,6 +832,8 @@ ${completesReview
     );
     if (transition.state.status === "completed") {
       lessonWrapUpRef.current = true;
+      lessonEndConversationRunRef.current = conversationRunRef.current;
+      enterWrapUpWaiting("final-beat-committed", epoch);
       addDebugMessage(`Lesson wrap-up entered: finalConcept=${active.conceptId}`);
     }
     if (!active.isFinalBeatInUnit) {
@@ -736,6 +878,10 @@ ${completesReview
     cancelledToolCallIdsRef.current.clear();
     lessonActiveRef.current = false;
     closingTurnRef.current = null;
+    wrapUpTurnRef.current = null;
+    closingInputSuppressedRef.current = false;
+    setClosingInputSuppressed(false);
+    setAuthoritativeEndPhase("stopped");
     nodeReviewRef.current = null;
     setNodeReview(null);
     setShowLessonComplete(false);
@@ -963,6 +1109,10 @@ ${completesReview
     setPresentationBeat(null);
     lessonWrapUpRef.current = false;
     closingTurnRef.current = null;
+    wrapUpTurnRef.current = null;
+    closingInputSuppressedRef.current = false;
+    setClosingInputSuppressed(false);
+    setAuthoritativeEndPhase("stopped");
     nodeReviewRef.current = null;
     setNodeReview(null);
     setShowLessonComplete(false);
@@ -1008,6 +1158,11 @@ ${completesReview
     preparedSourceRef.current = saved.source.prepared;
     lessonStateRef.current = saved.lessonState;
     lessonWrapUpRef.current = false;
+    wrapUpTurnRef.current = null;
+    closingTurnRef.current = null;
+    closingInputSuppressedRef.current = false;
+    setClosingInputSuppressed(false);
+    setAuthoritativeEndPhase("stopped");
     conversationalRestartConfirmationRef.current = false;
     setRestartConfirmationOpen(false);
     recentTeachingContextRef.current = saved.recentTeachingContext;
@@ -1042,6 +1197,11 @@ ${completesReview
     preparedSourceRef.current = null;
     lessonStateRef.current = emptyLesson;
     lessonWrapUpRef.current = false;
+    wrapUpTurnRef.current = null;
+    closingTurnRef.current = null;
+    closingInputSuppressedRef.current = false;
+    setClosingInputSuppressed(false);
+    setAuthoritativeEndPhase("stopped");
     conversationalRestartConfirmationRef.current = false;
     setRestartConfirmationOpen(false);
     recentTeachingContextRef.current = [];
@@ -1232,7 +1392,7 @@ ${completesReview
     confirmationTimerRef.current = setTimeout(() => {
       if (engagementStateRef.current !== "confirming") return;
       addDebugMessage("Session ended due to inactivity");
-      void stopConversation("inactivity");
+      void stopConversation("inactivity", "inactivity");
     }, IDLE_CONFIRMATION_MS);
   };
 
@@ -1262,7 +1422,7 @@ ${completesReview
   };
 
   const toggleMicrophoneMute = async () => {
-    if (microphoneMuteTransitionRef.current) return;
+    if (microphoneMuteTransitionRef.current || closingInputSuppressedRef.current) return;
     const muted = !microphoneMutedRef.current;
     microphoneMuteTransitionRef.current = true;
     try {
@@ -1305,6 +1465,7 @@ ${completesReview
     voiceDraftOpenRef.current = false;
     setLatestLearnerReply(response);
     markMeaningfulActivity();
+    noteAcceptedLearnerTurn("quick-reply");
     addDebugMessage(`Quick response sent: ${response}`);
     if (confirming && (response === "Yes" || response === "Continue")) {
       if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
@@ -1555,6 +1716,13 @@ ${completesReview
     // later UX refinement; yielding to the learner remains the priority.
     invalidateActiveTeachingBeat("barge-in");
     playerRef.current?.clear();
+    if (wrapUpTurnRef.current) {
+      const interruptedEpoch = wrapUpTurnRef.current.generationEpoch;
+      wrapUpTurnRef.current = null;
+      setAuthoritativeEndPhase("wrap-up-waiting");
+      wrapUpAwaitingAfterSequenceRef.current = learnerTurnSequenceRef.current;
+      logLessonEndFlow("wrap-up-turn-interrupted", { epoch: interruptedEpoch });
+    }
     assistantSpeakingRef.current = false;
     typedInterruptionHandledRef.current = false;
     const interruption = transportRef.current?.registerInterruption(
@@ -1613,6 +1781,7 @@ ${completesReview
       lastUserTranscript: text,
     }));
     markMeaningfulActivity();
+    noteAcceptedLearnerTurn("typed");
     setUserError("");
     setTypedReply("");
     addDebugMessage("Typed learner reply sent");
@@ -1638,6 +1807,11 @@ ${completesReview
     // pending graceful rollover from retiring the socket between those events.
     if (voiceActivity === "ACTIVITY_START") {
       transportRef.current?.setLearnerSpeaking(true);
+      microphoneTurnEvidenceRef.current = {
+        run: conversationRunRef.current,
+        speechStarted: true,
+        counted: false,
+      };
       userTranscriptRef.current = "";
       voiceDraftRef.current = "";
       voiceDraftOpenRef.current = true;
@@ -1650,6 +1824,12 @@ ${completesReview
     }
     if (serverContent?.inputTranscription?.text) {
       const transcriptFragment = serverContent.inputTranscription.text;
+      const microphoneEvidence = microphoneTurnEvidenceRef.current;
+      if (microphoneEvidence.run === conversationRunRef.current &&
+          microphoneEvidence.speechStarted && !microphoneEvidence.counted) {
+        microphoneEvidence.counted = true;
+        noteAcceptedLearnerTurn("mic");
+      }
       if (!voiceDraftOpenRef.current) {
         voiceDraftRef.current = "";
         voiceDraftOpenRef.current = true;
@@ -1703,9 +1883,14 @@ ${completesReview
         voiceActivity === "ACTIVITY_END" || serverContent?.turnComplete) {
       voiceDraftRef.current = "";
       voiceDraftOpenRef.current = false;
+      if (microphoneTurnEvidenceRef.current.run === conversationRunRef.current) {
+        microphoneTurnEvidenceRef.current.speechStarted = false;
+        microphoneTurnEvidenceRef.current.counted = false;
+      }
     }
 
     if (serverContent?.outputTranscription?.text) {
+      ownWrapUpResponseIfNeeded();
       lastAssistantTurnCompleteRef.current = false;
       if (!assistantTurnActiveRef.current) {
         assistantTurnActiveRef.current = true;
@@ -1768,6 +1953,8 @@ ${completesReview
       const audio = part.inlineData;
       if (!audio?.data || !audio.mimeType?.startsWith("audio/")) continue;
 
+      ownWrapUpResponseIfNeeded();
+
       if (!assistantSpeakingRef.current) {
         typedInterruptionHandledRef.current = false;
         assistantSpeakingRef.current = true;
@@ -1801,6 +1988,7 @@ ${completesReview
 
     if (serverContent.generationComplete) {
       const active = activeTeachingBeatRef.current;
+      const wrapUpTurn = wrapUpTurnRef.current;
       const closing = closingTurnRef.current;
       if (active) {
         active.generationComplete = true;
@@ -1810,12 +1998,33 @@ ${completesReview
       if (closing) {
         closing.generationComplete = true;
         addDebugMessage(`Lesson farewell generation complete: epoch=${closing.generationEpoch}`);
-        playerRef.current?.completeBatch(closing.generationEpoch);
+        const completion = playerRef.current?.completeBatch(closing.generationEpoch);
+        logLessonEndFlow("farewell-generation-complete", {
+          epoch: closing.generationEpoch,
+          providerComplete: true,
+          hadAudio: completion?.hadAudio ?? false,
+        });
+        if (completion && !completion.hadAudio) {
+          beginCompletionTransition(closing.generationEpoch, "farewell-zero-audio");
+        }
       }
-      if (!active && !closing) assistantSpeakingRef.current = false;
+      if (wrapUpTurn) {
+        wrapUpTurn.generationComplete = true;
+        const completion = playerRef.current?.completeBatch(wrapUpTurn.generationEpoch);
+        if (completion && !completion.hadAudio) {
+          enterWrapUpWaiting(
+            wrapUpTurn.kind === "restored-question"
+              ? "restored-wrap-up-question-complete"
+              : "wrap-up-response-complete",
+            wrapUpTurn.generationEpoch,
+            false,
+          );
+        }
+      }
+      if (!active && !closing && !wrapUpTurn) assistantSpeakingRef.current = false;
       assistantTurnActiveRef.current = false;
       lastAssistantTurnCompleteRef.current = true;
-      if (!active && !closing) transportRef.current?.setAssistantSpeaking(false);
+      if (!active && !closing && !wrapUpTurn) transportRef.current?.setAssistantSpeaking(false);
       const completedAssistantTranscript =
         assistantTranscriptRef.current || lessonStateRef.current.lastAssistantTranscript;
       if (engagementStateRef.current !== "confirming") {
@@ -1945,7 +2154,24 @@ ${completesReview
           conversationalRestartConfirmationRef.current = false;
           result = { ok: true, action, message: "Keep the completed lesson unchanged" };
         } else if (lessonWrapUpRef.current && action === "end") {
-          if (beginClosingFarewell()) {
+          const phase = lessonEndPhaseRef.current;
+          const freshLearnerTurn = learnerTurnSequenceRef.current >
+            wrapUpAwaitingAfterSequenceRef.current;
+          const authoritativeRun = lessonEndConversationRunRef.current === conversationRunRef.current;
+          if (phase === "closing-farewell" || phase === "completion-transition") {
+            logLessonEndFlow("session-control-end-rejected");
+            result = { ok: true, action: "end", message: "Lesson closing is already in progress" };
+          } else if (phase !== "wrap-up-waiting" || !freshLearnerTurn || !authoritativeRun) {
+            logLessonEndFlow("session-control-end-rejected");
+            result = {
+              ok: false,
+              action: "end",
+              message: "Remain in final-question wrap-up and wait for a genuine new learner response before ending",
+            };
+          } else if (beginClosingFarewell()) {
+            logLessonEndFlow("session-control-end-accepted", {
+              epoch: closingTurnRef.current?.generationEpoch,
+            });
             addDebugMessage("Final questions completed; graceful closing started");
             result = {
               ok: true,
@@ -1953,7 +2179,8 @@ ${completesReview
               message: "The learner has no more questions. Give exactly one brief, warm, natural closing sentence. Do not teach new material and do not ask another question.",
             };
           } else {
-            result = { ok: true, action: "end", message: "Lesson closing is already in progress" };
+            logLessonEndFlow("session-control-end-rejected");
+            result = { ok: false, action: "end", message: "Remain in final-question wrap-up" };
           }
         } else if (lessonWrapUpRef.current) {
           result = {
@@ -2133,7 +2360,9 @@ ${completesReview
     } else {
       addDebugMessage("Realtime error: Live connection closed before lesson state response");
     }
-    if (endAfterResponse) window.setTimeout(() => void stopConversation("confirmed"), 250);
+    if (endAfterResponse) {
+      window.setTimeout(() => void stopConversation("confirmed", "idle-confirmation"), 250);
+    }
     if (restartAfterResponse) {
       window.setTimeout(() => void restartActiveLessonRef.current(), 250);
     }
@@ -2169,6 +2398,9 @@ ${completesReview
   };
 
   const startConversation = async () => {
+    if (stopConversationPromiseRef.current) {
+      await stopConversationPromiseRef.current;
+    }
     setUserError("");
     setPersistenceNotice("");
     if (
@@ -2276,6 +2508,18 @@ ${completesReview
     }
 
     const run = ++conversationRunRef.current;
+    lessonEndConversationRunRef.current = run;
+    learnerTurnSequenceRef.current = 0;
+    wrapUpAwaitingAfterSequenceRef.current = 0;
+    microphoneTurnEvidenceRef.current = { run, speechStarted: false, counted: false };
+    wrapUpTurnRef.current = null;
+    closingTurnRef.current = null;
+    closingInputSuppressedRef.current = false;
+    setClosingInputSuppressed(false);
+    setShowLessonComplete(false);
+    stopConversationPromiseRef.current = null;
+    stopOwnerRef.current = null;
+    setAuthoritativeEndPhase("teaching");
     setMicrophoneStatus("Requesting permission");
     setAiConnectionStatus("Not connected");
     addDebugMessage("Microphone permission requested");
@@ -2432,7 +2676,9 @@ ${completesReview
             addDebugMessage("Acoustic activity detected");
           }
         }
-        if (!microphoneMutedRef.current) transport.sendAudio(chunk);
+        if (!microphoneMutedRef.current && !closingInputSuppressedRef.current) {
+          transport.sendAudio(chunk);
+        }
       });
       microphoneStreamerRef.current = microphoneStreamer;
       await microphoneStreamer.start();
@@ -2456,7 +2702,15 @@ ${completesReview
       void requestWakeLock();
       if (lessonWrapUpRef.current) {
         addDebugMessage("Completed lesson restored in wrap-up");
-        transportRef.current?.sendRealtimeInput({ text: LESSON_WRAP_UP_CONTROL });
+        if (beginOwnedWrapUpTurn("restored-question")) {
+          if (!transportRef.current?.sendRealtimeInput({ text: LESSON_WRAP_UP_CONTROL })) {
+            playerRef.current?.cancelBatch(generationEpochRef.current);
+            wrapUpTurnRef.current = null;
+            setAuthoritativeEndPhase("wrap-up-waiting");
+            wrapUpAwaitingAfterSequenceRef.current = learnerTurnSequenceRef.current;
+            setUserError("The final-question prompt could not be started. Try ending and reopening the lesson.");
+          }
+        }
       } else if (sessionStartMode === "persisted-resume") {
         const current = getCurrentConcept(lessonStateRef.current);
         const resumePoint = lessonStateRef.current.resumePoint.trim();
@@ -2520,7 +2774,17 @@ ${completesReview
     }
   };
 
-  const stopConversation = async (reason?: "inactivity" | "confirmed") => {
+  const stopConversation = (
+    reason?: "inactivity" | "confirmed",
+    owner: StopOwner = "manual",
+  ) => {
+    if (stopConversationPromiseRef.current) {
+      logLessonEndFlow("stop-joined-existing", { owner });
+      return stopConversationPromiseRef.current;
+    }
+    stopOwnerRef.current = owner;
+    logLessonEndFlow("stop-requested", { owner });
+    const stopPromise = (async () => {
     conversationRunRef.current += 1;
     invalidateActiveTeachingBeat("lesson-ended");
     playerRef.current?.clear();
@@ -2574,15 +2838,22 @@ ${completesReview
 
     if (hadMicrophone) addDebugMessage("Microphone stopped");
     if (hadSession) addDebugMessage("Live connection closed");
+    setAuthoritativeEndPhase("stopped");
+    logLessonEndFlow("stopped", { owner });
+    })();
+    stopConversationPromiseRef.current = stopPromise;
+    return stopPromise;
   };
 
   const restartLesson = async () => {
-    if (restartPendingRef.current || !resumeExistingLessonRef.current) return;
+    if (restartPendingRef.current || !resumeExistingLessonRef.current ||
+        lessonEndPhaseRef.current === "closing-farewell" ||
+        lessonEndPhaseRef.current === "completion-transition") return;
     restartPendingRef.current = true;
     setRestartPending(true);
     setRestartConfirmationOpen(false);
     try {
-      if (lessonActiveRef.current) await stopConversation();
+      if (lessonActiveRef.current) await stopConversation(undefined, "restart");
       if (await resetCurrentLessonProgress()) await startConversation();
     } finally {
       restartPendingRef.current = false;
@@ -2610,6 +2881,8 @@ ${completesReview
     ? `${presentationBeat.conceptId}:${presentationBeat.deliveryUnitIndex}:${presentationBeat.beatIndex}`
     : `${currentConcept?.id ?? "none"}:pending`;
   const lessonActive = microphoneActive || requestingPermission || aiConnected;
+  const endFlowClosing = lessonEndPhase === "closing-farewell" ||
+    lessonEndPhase === "completion-transition";
   const resumableLesson = savedLessons.find((lesson) => lesson.hasStarted);
   const hasRecentLessons = savedLessons.some((lesson) => lesson.id !== resumableLesson?.id);
   const selectedSavedLesson = savedLessonId
@@ -2657,7 +2930,7 @@ ${completesReview
     <main className={`page-shell${lessonActive ? " teaching-shell" : ""}`}>
       {!lessonActive && <AppNavigation activeView={appView} onNavigate={navigateProduct} />}
       <section className={`tutor-card${lessonActive ? " lesson-active" : ""}`}>
-        {lessonActive ? <header className="teaching-header"><div><p className="eyebrow">Teaching room</p><h1 id="page-title">{learningSource?.name || "Your lesson"}</h1></div><div className="teaching-header-actions"><button className="button-secondary" type="button" disabled={restartPending || Boolean(closingTurnRef.current)} onClick={() => setRestartConfirmationOpen(true)}>Restart Lesson</button><button className="button-danger end-lesson-top" type="button" aria-label="End lesson" onClick={() => void stopConversation()}><span className="end-lesson-desktop">End Lesson</span><span className="end-lesson-mobile" aria-hidden="true">End</span></button></div></header> : null}
+        {lessonActive ? <header className="teaching-header"><div><p className="eyebrow">Teaching room</p><h1 id="page-title">{learningSource?.name || "Your lesson"}</h1></div><div className="teaching-header-actions"><button className="button-secondary" type="button" disabled={restartPending || endFlowClosing} onClick={() => setRestartConfirmationOpen(true)}>Restart Lesson</button><button className="button-danger end-lesson-top" type="button" aria-label="End lesson" onClick={() => void stopConversation(undefined, "manual")}><span className="end-lesson-desktop">End Lesson</span><span className="end-lesson-mobile" aria-hidden="true">End</span></button></div></header> : null}
 
         {lessonActive && restartConfirmationOpen && <section className="restart-lesson-confirmation" role="alertdialog" aria-labelledby="active-restart-lesson-title" aria-describedby="active-restart-lesson-description"><h2 id="active-restart-lesson-title">Restart this lesson?</h2><p id="active-restart-lesson-description">This will clear all teaching progress for this lesson and start it again from the beginning. Your materials and lesson content will not be deleted.</p><div><button className="button-secondary" type="button" disabled={restartPending} onClick={() => setRestartConfirmationOpen(false)}>Cancel</button><button className="button-danger" type="button" disabled={restartPending} onClick={() => void restartLesson()}>{restartPending ? "Restarting…" : "Restart"}</button></div></section>}
         {lessonActive && showLessonComplete && <div className="lesson-complete-transition" role="status"><span aria-hidden="true">✓</span><strong>Lesson complete</strong></div>}
@@ -2805,14 +3078,14 @@ ${completesReview
         {lessonActive && <div className="status-row" aria-label="Conversation status">
           <div className="status-item" aria-live="polite">
             <span
-              className={`status-dot${microphoneActive ? " status-dot-active" : ""}`}
+              className={`status-dot${microphoneActive && !endFlowClosing ? " status-dot-active" : ""}`}
               aria-hidden="true"
             />
             <span className="status-copy">
-              <strong>{microphoneMuted ? "Muted" : "Listening"}</strong>
-              <small>{microphoneMuted ? "Microphone is off" : "You can speak at any time"}</small>
+              <strong>{endFlowClosing ? "Finishing lesson\u2026" : microphoneMuted ? "Muted" : "Listening"}</strong>
+              <small>{endFlowClosing ? "Closing the lesson" : microphoneMuted ? "Microphone is off" : "You can speak at any time"}</small>
             </span>
-            <button className={`mute-button${microphoneMuted ? " mute-button-active" : ""}`} type="button" onClick={toggleMicrophoneMute} aria-label={microphoneMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={microphoneMuted}>{microphoneMuted ? "Unmute" : "Mute"}</button>
+            <button className={`mute-button${microphoneMuted ? " mute-button-active" : ""}`} type="button" disabled={endFlowClosing} onClick={toggleMicrophoneMute} aria-label={microphoneMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={microphoneMuted}>{microphoneMuted ? "Unmute" : "Mute"}</button>
           </div>
           <div className="status-item" aria-live="polite">
             <span
@@ -2867,7 +3140,7 @@ ${completesReview
         {lessonActive && <button
           className="start-button"
           type="button"
-          onClick={microphoneActive ? () => void stopConversation() : startConversation}
+          onClick={microphoneActive ? () => void stopConversation(undefined, "manual") : startConversation}
           disabled={
             requestingPermission ||
             (!microphoneActive && (!persistenceHydrated || learningSource?.status !== "ready"))

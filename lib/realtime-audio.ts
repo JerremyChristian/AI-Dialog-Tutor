@@ -110,9 +110,14 @@ export class PcmAudioPlayer {
   }
 
   completeBatch(epoch: number) {
-    if (!this.batch || this.batch.epoch !== epoch || this.batch.cancelled) return;
+    if (!this.batch || this.batch.epoch !== epoch || this.batch.cancelled) return null;
     this.batch.providerComplete = true;
+    const completion = {
+      hadAudio: this.batch.hadAudio,
+      pendingSourceCount: this.batch.sources.size,
+    };
     this.maybeReportNaturalDrain();
+    return completion;
   }
 
   cancelBatch(epoch?: number) {
