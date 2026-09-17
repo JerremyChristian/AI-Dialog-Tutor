@@ -638,7 +638,7 @@ ${completesReview
       completionAnimationTimerRef.current = null;
       addDebugMessage("FAREWELL_FLOW stop");
       void stopConversation("confirmed");
-    }, 1_400);
+    }, 2_000);
   }
 
   function beginClosingFarewell() {

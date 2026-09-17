@@ -153,7 +153,7 @@ export function LessonRoadmap({
           {structural && (
             <span className="roadmap-expand-icon" aria-hidden="true">{expanded ? "−" : "+"}</span>
           )}
-          {teachable && lessonActive && onReview && (
+          {teachable && node.status === "taught" && lessonActive && onReview && (
             <button type="button" className="roadmap-review-button" disabled={navigationPending || reviewing} aria-label={`Review ${node.title} from start`} onClick={() => onReview(node)}>{reviewing ? "Reviewing" : "Review"}</button>
           )}
         </div>
