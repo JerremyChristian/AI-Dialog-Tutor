@@ -531,7 +531,7 @@ RELEVANT_COMPLETION_CRITERIA: ${JSON.stringify(criteria)}
 ${active.isFirstBeatInUnit ? "Establish the unit naturally." : "Continue directly from the preceding explanation without greeting, praise, announcing a new section, or unnecessary recap."}
 ${active.mode === "review"
   ? completesReview
-    ? "This is the final beat of a bounded node review. Finish the explanation cleanly without asking a question or inviting the learner to continue. Do not continue into another concept and do not describe this review as new canonical progress."
+    ? "This is the final beat of a bounded node review. Briefly check whether the learner has questions or is ready to return to the main lesson. Do not continue into another concept and do not describe this review as new canonical progress."
     : "This review continues after this beat. Do not ask a question, invite learner interaction, or create a check-in merely because a delivery unit ended; finish with natural continuity because the application will immediately assign the next review beat."
   : completesPlannedLesson
   ? `All planned lesson content will be covered after this beat. ${LESSON_WRAP_UP_CONTROL} Ask naturally whether the learner has any final questions. Do not restart or revisit content unless they ask. If they clearly have no more questions, call session_control with action end.`
@@ -740,10 +740,9 @@ ${active.mode === "review"
       addReviewFlowDiagnostic(
         "review-beat-committed",
         `nextReviewCursor=${nextIndex} nodeComplete=${complete} ` +
-        `nextAction=${complete ? "review-exit-resume" : "review-next"}`,
+        `nextAction=${complete ? "review-final-wait" : "review-next"}`,
       );
       if (!complete) assignNextReviewBeat();
-      else finishNodeReviewAndResume("completed");
       return;
     }
     const currentNext = state.teachingContractProgress[active.conceptId]?.nextTeachingPointIndex ?? 0;
