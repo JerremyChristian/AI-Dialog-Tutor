@@ -1785,7 +1785,7 @@ summary:focus-visible {
 .lesson-detail-card dd { margin: 0; overflow-wrap: anywhere; font-size: .95rem; font-weight: 700; }
 .lesson-detail-actions { display: flex; gap: 10px; }
 .lesson-detail-actions .button-primary { flex: 1; }
-.restart-lesson-confirmation { margin-top: 14px; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.restart-lesson-confirmation { margin-block: var(--teaching-room-section-gap); padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
 .restart-lesson-confirmation h2 { margin: 0 0 6px; font-size: 1rem; }
 .restart-lesson-confirmation p { margin: 0; color: var(--muted); font-size: .85rem; line-height: 1.5; }
 .restart-lesson-confirmation > div { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
@@ -1806,7 +1806,7 @@ summary:focus-visible {
 
 .teaching-shell { padding-top: max(18px, env(safe-area-inset-top)); }
 .teaching-shell .tutor-card { width: min(100%, 1280px); }
-.lesson-active { --teaching-room-section-gap: 24px; }
+.lesson-active, .lesson-detail-view { --teaching-room-section-gap: 24px; }
 .teaching-controls-stack { display: flex; flex-direction: column; gap: var(--teaching-room-section-gap); }
 .teaching-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 24px; }
 .teaching-header > div { min-width: 0; flex: 1 1 auto; }
@@ -1857,7 +1857,7 @@ summary:focus-visible {
   .home-create-footer .button-secondary { width: 100%; }
   .teaching-shell { padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); }
   .teaching-shell .tutor-card { padding: 14px; }
-  .lesson-active {
+  .lesson-active, .lesson-detail-view {
     --teaching-mobile-section-gap: 18px;
     --teaching-room-section-gap: var(--teaching-mobile-section-gap);
   }
