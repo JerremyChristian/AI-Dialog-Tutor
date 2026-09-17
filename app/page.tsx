@@ -126,6 +126,7 @@ type AppearancePreference = "system" | "light" | "dark";
 
 type ActiveTeachingBeat = ResolvedTeachingBeat & {
   conceptId: string;
+  mode: "lesson" | "review";
   generationEpoch: number;
   generationComplete: boolean;
   audioNaturallyDrained: boolean;
@@ -133,6 +134,18 @@ type ActiveTeachingBeat = ResolvedTeachingBeat & {
 };
 
 type PresentationBeat = ResolvedTeachingBeat & { conceptId: string };
+
+type NodeReviewState = {
+  nodeId: string;
+  nextTeachingPointIndex: number;
+  returnPresentationBeat: PresentationBeat | null;
+  complete: boolean;
+};
+
+type ClosingTurn = {
+  generationEpoch: number;
+  generationComplete: boolean;
+};
 
 type ConversationContinuity = {
   lastMeaningfulLearnerTranscript?: string;
@@ -316,6 +329,8 @@ export default function Home() {
   const [presentationBeat, setPresentationBeat] = useState<PresentationBeat | null>(null);
   const [restartConfirmationOpen, setRestartConfirmationOpen] = useState(false);
   const [restartPending, setRestartPending] = useState(false);
+  const [nodeReview, setNodeReview] = useState<NodeReviewState | null>(null);
+  const [showLessonComplete, setShowLessonComplete] = useState(false);
   const preparedSourceRef = useRef<PreparedLearningSource | null>(null);
   const savedLessonIdRef = useRef<string | null>(null);
   const savedLessonCreatedAtRef = useRef<string | null>(null);
@@ -389,6 +404,9 @@ export default function Home() {
   const conversationalRestartConfirmationRef = useRef(false);
   const restartPendingRef = useRef(false);
   const restartActiveLessonRef = useRef<() => Promise<void>>(async () => undefined);
+  const nodeReviewRef = useRef<NodeReviewState | null>(null);
+  const closingTurnRef = useRef<ClosingTurn | null>(null);
+  const completionAnimationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const addDebugMessage = useCallback((text: string) => {
     if (!isMountedRef.current) return;
@@ -473,8 +491,10 @@ export default function Home() {
       Boolean(candidate.teaching) && candidate.status !== "taught" &&
       candidate.status !== "skipped",
     );
-    const completesPlannedLesson = active.teachingPointIndexes.at(-1) ===
+    const completesPlannedLesson = active.mode === "lesson" && active.teachingPointIndexes.at(-1) ===
       contract.teachingPoints.length - 1 && !otherOutstandingConcept;
+    const completesReview = active.mode === "review" && active.teachingPointIndexes.at(-1) ===
+      contract.teachingPoints.length - 1;
     return `${prefix}\n[[APP_CONTROL:TEACH_PRESENTATION_BEAT]]
 Teach exactly this application-assigned presentation beat as one natural source-grounded spoken explanation. Do not call progress or complete.
 CONCEPT: ${concept.title}
@@ -483,7 +503,9 @@ BEAT_POSITION: ${position}
 ASSIGNED_TEACHING_POINTS: ${JSON.stringify(points)}
 RELEVANT_COMPLETION_CRITERIA: ${JSON.stringify(criteria)}
 ${active.isFirstBeatInUnit ? "Establish the unit naturally." : "Continue directly from the preceding explanation without greeting, praise, announcing a new section, or unnecessary recap."}
-${completesPlannedLesson
+${completesReview
+  ? "This is the final beat of a bounded node review. Briefly check whether the learner has questions or is ready to return to the main lesson. Do not continue into another concept and do not describe this review as new canonical progress."
+  : completesPlannedLesson
   ? `All planned lesson content will be covered after this beat. ${LESSON_WRAP_UP_CONTROL} Ask naturally whether the learner has any final questions. Do not restart or revisit content unless they ask. If they clearly have no more questions, call session_control with action end.`
   : active.isFinalBeatInUnit
     ? "Briefly synthesize if useful, then create a natural learner interaction boundary; vary the check-in and do not use a fixed script."
@@ -491,7 +513,8 @@ ${completesPlannedLesson
   }
 
   function assignNextTeachingBeat(prefix = "", sendInstruction = true): ActiveTeachingBeat | null {
-    if (!lessonActiveRef.current || activeTeachingBeatRef.current) return null;
+    if (!lessonActiveRef.current || activeTeachingBeatRef.current ||
+        closingTurnRef.current || nodeReviewRef.current) return null;
     let state = lessonStateRef.current;
     let concept = getCurrentConcept(state);
     let activatedState: LessonState | null = null;
@@ -510,6 +533,7 @@ ${completesPlannedLesson
     const active: ActiveTeachingBeat = {
       ...resolved,
       conceptId: concept.id,
+      mode: "lesson",
       generationEpoch,
       generationComplete: false,
       audioNaturallyDrained: false,
@@ -551,6 +575,69 @@ ${completesPlannedLesson
     return active;
   }
 
+  function assignNextReviewBeat(prefix = "", sendInstruction = true): ActiveTeachingBeat | null {
+    const review = nodeReviewRef.current;
+    const concept = review ? lessonStateRef.current.nodes[review.nodeId] : undefined;
+    if (!lessonActiveRef.current || !review || review.complete || !concept?.teaching ||
+        activeTeachingBeatRef.current || closingTurnRef.current) return null;
+    const resolved = resolveNextPresentationBeat(concept.teaching, review.nextTeachingPointIndex);
+    if (!resolved) return null;
+    const generationEpoch = ++generationEpochRef.current;
+    const active: ActiveTeachingBeat = {
+      ...resolved,
+      conceptId: concept.id,
+      mode: "review",
+      generationEpoch,
+      generationComplete: false,
+      audioNaturallyDrained: false,
+      cancelled: false,
+    };
+    activeTeachingBeatRef.current = active;
+    const presentation = { ...resolved, conceptId: concept.id };
+    presentationBeatRef.current = presentation;
+    setPresentationBeat(presentation);
+    playerRef.current?.beginBatch(generationEpoch, (epoch) => {
+      const current = activeTeachingBeatRef.current;
+      if (!current || current.generationEpoch !== epoch) return;
+      current.audioNaturallyDrained = true;
+      assistantSpeakingRef.current = false;
+      transportRef.current?.setAssistantSpeaking(false);
+      maybeCommitTeachingBeat(epoch);
+    });
+    const instruction = buildTeachingBeatControl(active, prefix ||
+      "Review this concept from its beginning using the existing lesson contract. This is a bounded review and must not alter canonical lesson coverage.");
+    if (sendInstruction && (!instruction || !transportRef.current?.sendRealtimeInput({ text: instruction }))) {
+      invalidateActiveTeachingBeat("review-send-failed");
+      return null;
+    }
+    addDebugMessage(`Node review beat assigned: concept=${concept.id}, beat=${resolved.deliveryUnitIndex}/${resolved.beatIndex}, epoch=${generationEpoch}`);
+    return active;
+  }
+
+  function beginClosingFarewell() {
+    if (closingTurnRef.current || restartPendingRef.current) return false;
+    invalidateActiveTeachingBeat("lesson-closing");
+    const generationEpoch = ++generationEpochRef.current;
+    closingTurnRef.current = { generationEpoch, generationComplete: false };
+    microphoneMutedRef.current = true;
+    setMicrophoneMuted(true);
+    playerRef.current?.beginBatch(generationEpoch, (epoch) => {
+      const closing = closingTurnRef.current;
+      if (!closing || closing.generationEpoch !== epoch || !closing.generationComplete) return;
+      closingTurnRef.current = null;
+      assistantSpeakingRef.current = false;
+      transportRef.current?.setAssistantSpeaking(false);
+      setShowLessonComplete(true);
+      addDebugMessage("Lesson farewell audio naturally drained");
+      completionAnimationTimerRef.current = setTimeout(() => {
+        completionAnimationTimerRef.current = null;
+        void stopConversation("confirmed");
+      }, 800);
+    });
+    addDebugMessage(`Lesson closing farewell started: epoch=${generationEpoch}`);
+    return true;
+  }
+
   function maybeCommitTeachingBeat(epoch: number) {
     const active = activeTeachingBeatRef.current;
     if (!active || active.generationEpoch !== epoch) {
@@ -558,6 +645,25 @@ ${completesPlannedLesson
       return;
     }
     const state = lessonStateRef.current;
+    if (active.mode === "review") {
+      const review = nodeReviewRef.current;
+      if (!review || review.nodeId !== active.conceptId || active.cancelled ||
+          !active.generationComplete || !active.audioNaturallyDrained ||
+          active.generationEpoch !== generationEpochRef.current ||
+          active.teachingPointIndexes[0] !== review.nextTeachingPointIndex) return;
+      const concept = state.nodes[review.nodeId];
+      if (!concept?.teaching) return;
+      const nextIndex = computeNextTeachingPointIndexAfterBeat(active.teachingPointIndexes);
+      const complete = nextIndex >= concept.teaching.teachingPoints.length;
+      const nextReview = { ...review, nextTeachingPointIndex: nextIndex, complete };
+      nodeReviewRef.current = nextReview;
+      setNodeReview(nextReview);
+      activeTeachingBeatRef.current = null;
+      playerRef.current?.cancelBatch(epoch);
+      addDebugMessage(`Node review beat committed: concept=${review.nodeId}, next=${nextIndex}, complete=${complete}`);
+      if (!complete && !active.isFinalBeatInUnit) assignNextReviewBeat();
+      return;
+    }
     const currentNext = state.teachingContractProgress[active.conceptId]?.nextTeachingPointIndex ?? 0;
     if (!isBeatCommitValid({
       expectedConceptId: active.conceptId,
@@ -629,6 +735,12 @@ ${completesPlannedLesson
     toolResultsRef.current.clear();
     cancelledToolCallIdsRef.current.clear();
     lessonActiveRef.current = false;
+    closingTurnRef.current = null;
+    nodeReviewRef.current = null;
+    setNodeReview(null);
+    setShowLessonComplete(false);
+    if (completionAnimationTimerRef.current) clearTimeout(completionAnimationTimerRef.current);
+    completionAnimationTimerRef.current = null;
     await wakeLockRef.current?.release().catch(() => undefined);
     wakeLockRef.current = null;
     if (engagementTimerRef.current) clearInterval(engagementTimerRef.current);
@@ -850,6 +962,10 @@ ${completesPlannedLesson
     presentationBeatRef.current = null;
     setPresentationBeat(null);
     lessonWrapUpRef.current = false;
+    closingTurnRef.current = null;
+    nodeReviewRef.current = null;
+    setNodeReview(null);
+    setShowLessonComplete(false);
     conversationalRestartConfirmationRef.current = false;
     resumptionPendingRef.current = false;
     persistedResumeBriefingPendingRef.current = false;
@@ -1074,6 +1190,7 @@ ${completesPlannedLesson
 
   const navigateFromRoadmap = (node: LessonState["nodes"][string]) => {
     if (!lessonActiveRef.current || roadmapNavigationPendingRef.current) return;
+    if (nodeReviewRef.current) exitNodeReview();
     if (node.id === lessonStateRef.current.currentNodeId || node.childrenIds.length) return;
     invalidateActiveTeachingBeat("roadmap-navigation");
     playerRef.current?.clear();
@@ -1447,6 +1564,10 @@ ${completesPlannedLesson
     assistantTurnActiveRef.current = false;
     lastAssistantTurnCompleteRef.current = false;
     if (!interruption?.duplicate) {
+      if (nodeReviewRef.current) {
+        addDebugMessage(`Node review interrupted without canonical progress change: concept=${nodeReviewRef.current.nodeId}`);
+        return;
+      }
       const current = lessonStateRef.current;
       const interruptedTranscript =
         assistantTranscriptRef.current || current.lastAssistantTranscript;
@@ -1591,7 +1712,9 @@ ${completesPlannedLesson
         assistantTranscriptRef.current = "";
         visibleTutorTranscriptRawRef.current = "";
         setVisibleTutorTranscript("");
-        assistantCheckpointConceptIdRef.current = lessonStateRef.current.currentNodeId;
+        assistantCheckpointConceptIdRef.current = nodeReviewRef.current || closingTurnRef.current
+          ? null
+          : lessonStateRef.current.currentNodeId;
       }
       if (persistedResumeBriefingPendingRef.current &&
           !persistedResumeFirstResponseLoggedRef.current) {
@@ -1655,7 +1778,9 @@ ${completesPlannedLesson
           assistantTranscriptRef.current = "";
           visibleTutorTranscriptRawRef.current = "";
           setVisibleTutorTranscript("");
-          assistantCheckpointConceptIdRef.current = lessonStateRef.current.currentNodeId;
+          assistantCheckpointConceptIdRef.current = nodeReviewRef.current || closingTurnRef.current
+            ? null
+            : lessonStateRef.current.currentNodeId;
         }
         if (persistedResumeBriefingPendingRef.current &&
             !persistedResumeFirstResponseLoggedRef.current) {
@@ -1676,15 +1801,21 @@ ${completesPlannedLesson
 
     if (serverContent.generationComplete) {
       const active = activeTeachingBeatRef.current;
+      const closing = closingTurnRef.current;
       if (active) {
         active.generationComplete = true;
         addDebugMessage(`Teaching generation complete: epoch=${active.generationEpoch}`);
         playerRef.current?.completeBatch(active.generationEpoch);
       }
-      if (!active) assistantSpeakingRef.current = false;
+      if (closing) {
+        closing.generationComplete = true;
+        addDebugMessage(`Lesson farewell generation complete: epoch=${closing.generationEpoch}`);
+        playerRef.current?.completeBatch(closing.generationEpoch);
+      }
+      if (!active && !closing) assistantSpeakingRef.current = false;
       assistantTurnActiveRef.current = false;
       lastAssistantTurnCompleteRef.current = true;
-      if (!active) transportRef.current?.setAssistantSpeaking(false);
+      if (!active && !closing) transportRef.current?.setAssistantSpeaking(false);
       const completedAssistantTranscript =
         assistantTranscriptRef.current || lessonStateRef.current.lastAssistantTranscript;
       if (engagementStateRef.current !== "confirming") {
@@ -1791,8 +1922,8 @@ ${completesPlannedLesson
         }
       } else if (call.name === "session_control") {
         if (action === "restart_request") {
-          if (!isLessonPlanComplete(lessonStateRef.current)) {
-            result = { ok: false, action, message: "Restart is available after lesson completion" };
+          if (!resumeExistingLessonRef.current) {
+            result = { ok: false, action, message: "The lesson has not started and does not need restarting" };
           } else {
             conversationalRestartConfirmationRef.current = true;
             addDebugMessage("Conversational lesson restart confirmation requested");
@@ -1814,9 +1945,16 @@ ${completesPlannedLesson
           conversationalRestartConfirmationRef.current = false;
           result = { ok: true, action, message: "Keep the completed lesson unchanged" };
         } else if (lessonWrapUpRef.current && action === "end") {
-          addDebugMessage("Final questions completed");
-          result = { ok: true, action: "end", message: "End the completed lesson" };
-          endAfterResponse = true;
+          if (beginClosingFarewell()) {
+            addDebugMessage("Final questions completed; graceful closing started");
+            result = {
+              ok: true,
+              action: "end",
+              message: "The learner has no more questions. Give exactly one brief, warm, natural closing sentence. Do not teach new material and do not ask another question.",
+            };
+          } else {
+            result = { ok: true, action: "end", message: "Lesson closing is already in progress" };
+          }
         } else if (lessonWrapUpRef.current) {
           result = {
             ok: true,
@@ -1877,8 +2015,17 @@ ${completesPlannedLesson
         };
         if (queryPurpose === "continue" && !postResumeQueryReceived &&
             !silentLessonRecoveryPendingRef.current) {
-          const assignment = assignNextTeachingBeat("", false);
+          const review = nodeReviewRef.current;
+          if (review?.complete) exitNodeReview();
+          const assignment = review && !review.complete
+            ? assignNextReviewBeat("", false)
+            : isLessonPlanComplete(lessonStateRef.current)
+              ? null
+              : assignNextTeachingBeat("", false);
           if (assignment) assignmentControl = buildTeachingBeatControl(assignment);
+          else if (review?.complete && isLessonPlanComplete(lessonStateRef.current)) {
+            assignmentControl = LESSON_WRAP_UP_CONTROL;
+          }
         }
         if (postResumeQueryReceived) {
           addDebugMessage("Post-resume continuity snapshot prepared");
@@ -1990,6 +2137,35 @@ ${completesPlannedLesson
     if (restartAfterResponse) {
       window.setTimeout(() => void restartActiveLessonRef.current(), 250);
     }
+  };
+
+  const exitNodeReview = () => {
+    const review = nodeReviewRef.current;
+    if (!review) return;
+    invalidateActiveTeachingBeat("node-review-exited");
+    playerRef.current?.clear();
+    nodeReviewRef.current = null;
+    setNodeReview(null);
+    presentationBeatRef.current = review.returnPresentationBeat;
+    setPresentationBeat(review.returnPresentationBeat);
+    addDebugMessage(`Node review exited: concept=${review.nodeId}`);
+  };
+
+  const startNodeReview = (node: LessonState["nodes"][string]) => {
+    if (!lessonActiveRef.current || !node.teaching || node.childrenIds.length ||
+        restartPendingRef.current || closingTurnRef.current) return;
+    invalidateActiveTeachingBeat("node-review-started");
+    playerRef.current?.clear();
+    const review: NodeReviewState = {
+      nodeId: node.id,
+      nextTeachingPointIndex: 0,
+      returnPresentationBeat: presentationBeatRef.current,
+      complete: false,
+    };
+    nodeReviewRef.current = review;
+    setNodeReview(review);
+    addDebugMessage(`Node review started: concept=${node.id}`);
+    assignNextReviewBeat();
   };
 
   const startConversation = async () => {
@@ -2400,8 +2576,8 @@ ${completesPlannedLesson
     if (hadSession) addDebugMessage("Live connection closed");
   };
 
-  const restartCompletedLesson = async () => {
-    if (restartPendingRef.current || !isLessonPlanComplete(lessonStateRef.current)) return;
+  const restartLesson = async () => {
+    if (restartPendingRef.current || !resumeExistingLessonRef.current) return;
     restartPendingRef.current = true;
     setRestartPending(true);
     setRestartConfirmationOpen(false);
@@ -2413,7 +2589,7 @@ ${completesPlannedLesson
       setRestartPending(false);
     }
   };
-  restartActiveLessonRef.current = restartCompletedLesson;
+  restartActiveLessonRef.current = restartLesson;
 
   const microphoneActive = microphoneStatus === "Active";
   const aiConnected = aiConnectionStatus === "Connected";
@@ -2439,9 +2615,7 @@ ${completesPlannedLesson
   const selectedSavedLesson = savedLessonId
     ? savedLessons.find((lesson) => lesson.id === savedLessonId)
     : undefined;
-  const selectedLessonComplete = selectedSavedLesson
-    ? isLessonPlanComplete(selectedSavedLesson.lessonState)
-    : false;
+  const selectedLessonRestartable = Boolean(selectedSavedLesson?.hasStarted);
 
   const acknowledgeReadyLessonNotifications = (lessonId: string) => {
     const matchingJobs = processingQueue.jobs.filter(
@@ -2483,7 +2657,10 @@ ${completesPlannedLesson
     <main className={`page-shell${lessonActive ? " teaching-shell" : ""}`}>
       {!lessonActive && <AppNavigation activeView={appView} onNavigate={navigateProduct} />}
       <section className={`tutor-card${lessonActive ? " lesson-active" : ""}`}>
-        {lessonActive ? <header className="teaching-header"><div><p className="eyebrow">Teaching room</p><h1 id="page-title">{learningSource?.name || "Your lesson"}</h1></div><button className="button-danger end-lesson-top" type="button" aria-label="End lesson" onClick={() => void stopConversation()}><span className="end-lesson-desktop">End Lesson</span><span className="end-lesson-mobile" aria-hidden="true">End</span></button></header> : null}
+        {lessonActive ? <header className="teaching-header"><div><p className="eyebrow">Teaching room</p><h1 id="page-title">{learningSource?.name || "Your lesson"}</h1></div><div className="teaching-header-actions"><button className="button-secondary" type="button" disabled={restartPending || Boolean(closingTurnRef.current)} onClick={() => setRestartConfirmationOpen(true)}>Restart Lesson</button><button className="button-danger end-lesson-top" type="button" aria-label="End lesson" onClick={() => void stopConversation()}><span className="end-lesson-desktop">End Lesson</span><span className="end-lesson-mobile" aria-hidden="true">End</span></button></div></header> : null}
+
+        {lessonActive && restartConfirmationOpen && <section className="restart-lesson-confirmation" role="alertdialog" aria-labelledby="active-restart-lesson-title" aria-describedby="active-restart-lesson-description"><h2 id="active-restart-lesson-title">Restart this lesson?</h2><p id="active-restart-lesson-description">This will clear all teaching progress for this lesson and start it again from the beginning. Your materials and lesson content will not be deleted.</p><div><button className="button-secondary" type="button" disabled={restartPending} onClick={() => setRestartConfirmationOpen(false)}>Cancel</button><button className="button-danger" type="button" disabled={restartPending} onClick={() => void restartLesson()}>{restartPending ? "Restarting…" : "Restart"}</button></div></section>}
+        {lessonActive && showLessonComplete && <div className="lesson-complete-transition" role="status"><span aria-hidden="true">✓</span><strong>Lesson complete</strong></div>}
 
         {!lessonActive && !persistenceHydrated && <div className="loading-state" role="status"><span className="loading-spinner" aria-hidden="true" /> Restoring your learning workspace…</div>}
 
@@ -2558,11 +2735,11 @@ ${completesPlannedLesson
               <div><dt>Sources</dt><dd>{selectedSavedLesson.sources.length}</dd></div>
             </dl></section>
             <label className="topic-field setup-only"><span>Lesson topic or focus (optional)</span><input type="text" value={topicInput} onChange={(event) => setTopicInput(event.target.value)} placeholder="Teach the source's main topics" maxLength={160} disabled={requestingPermission} /></label>
-            <div className="lesson-detail-actions"><button className="button-primary" type="button" onClick={startConversation} disabled={requestingPermission || learningSource?.status !== "ready" || restartPending}>{requestingPermission ? "Connecting…" : resumeExistingLesson ? "Continue Lesson" : "Start Lesson"}</button>{selectedLessonComplete && <button className="button-secondary" type="button" disabled={restartPending || lessonLibraryBusyId !== null} onClick={() => setRestartConfirmationOpen(true)}>Restart Lesson</button>}<button className="button-danger" type="button" disabled={restartPending || lessonLibraryBusyId !== null} onClick={() => void requestDeleteSavedLesson(selectedSavedLesson)}>Delete Lesson</button></div>
-            {selectedLessonComplete && restartConfirmationOpen && <section className="restart-lesson-confirmation" role="alertdialog" aria-labelledby="restart-lesson-title" aria-describedby="restart-lesson-description">
+            <div className="lesson-detail-actions"><button className="button-primary" type="button" onClick={startConversation} disabled={requestingPermission || learningSource?.status !== "ready" || restartPending}>{requestingPermission ? "Connecting…" : resumeExistingLesson ? "Continue Lesson" : "Start Lesson"}</button>{selectedLessonRestartable && <button className="button-secondary" type="button" disabled={restartPending || lessonLibraryBusyId !== null} onClick={() => setRestartConfirmationOpen(true)}>Restart Lesson</button>}<button className="button-danger" type="button" disabled={restartPending || lessonLibraryBusyId !== null} onClick={() => void requestDeleteSavedLesson(selectedSavedLesson)}>Delete Lesson</button></div>
+            {selectedLessonRestartable && restartConfirmationOpen && <section className="restart-lesson-confirmation" role="alertdialog" aria-labelledby="restart-lesson-title" aria-describedby="restart-lesson-description">
               <h2 id="restart-lesson-title">Restart this lesson?</h2>
-              <p id="restart-lesson-description">This will clear your teaching progress for this lesson and start it again from the beginning. Your materials and lesson content will not be deleted.</p>
-              <div><button className="button-secondary" type="button" disabled={restartPending} onClick={() => setRestartConfirmationOpen(false)}>Cancel</button><button className="button-danger" type="button" disabled={restartPending} onClick={() => void restartCompletedLesson()}>{restartPending ? "Restarting…" : "Restart"}</button></div>
+              <p id="restart-lesson-description">This will clear all teaching progress for this lesson and start it again from the beginning. Your materials and lesson content will not be deleted.</p>
+              <div><button className="button-secondary" type="button" disabled={restartPending} onClick={() => setRestartConfirmationOpen(false)}>Cancel</button><button className="button-danger" type="button" disabled={restartPending} onClick={() => void restartLesson()}>{restartPending ? "Restarting…" : "Restart"}</button></div>
             </section>}
             <div className="lesson-detail-progress"><LessonRoadmap lessonState={selectedSavedLesson.lessonState} lessonActive={false} readOnly navigationPending={false} onNavigate={() => undefined} /></div>
             {userError && <p className="session-error" role="alert">{userError}</p>}
@@ -2681,6 +2858,9 @@ ${completesPlannedLesson
           lessonActive={lessonActive}
           navigationPending={roadmapNavigationPending}
           onNavigate={navigateFromRoadmap}
+          reviewNodeId={nodeReview?.nodeId ?? null}
+          onReview={startNodeReview}
+          onExitReview={exitNodeReview}
         /></div>}
         </div>}
 

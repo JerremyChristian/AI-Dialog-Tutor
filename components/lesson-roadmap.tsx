@@ -14,6 +14,9 @@ type Props = {
   readOnly?: boolean;
   navigationPending: boolean;
   onNavigate: (node: LessonNode) => void;
+  reviewNodeId?: string | null;
+  onReview?: (node: LessonNode) => void;
+  onExitReview?: () => void;
 };
 
 const STATUS_PRESENTATION: Record<CoverageStatus, { icon: string; label: string }> = {
@@ -30,6 +33,9 @@ export function LessonRoadmap({
   readOnly = false,
   navigationPending,
   onNavigate,
+  reviewNodeId = null,
+  onReview,
+  onExitReview,
 }: Props) {
   const treeKey = useMemo(
     () => `${lessonState.rootNodeIds.join("|")}:${Object.keys(lessonState.nodes).sort().join("|")}`,
@@ -95,20 +101,25 @@ export function LessonRoadmap({
     const structural = node.childrenIds.length > 0;
     const teachable = isTeachableLessonNode(node);
     const expanded = expandedNodeIds.has(node.id);
-    const current = (lessonActive || readOnly) && node.id === lessonState.currentNodeId;
+    const reviewing = node.id === reviewNodeId;
+    const current = reviewing || ((lessonActive || readOnly) && !reviewNodeId && node.id === lessonState.currentNodeId);
     const activeBranch = structural && activePathNodeIds.has(node.id);
     const displayStatus = !lessonActive && !readOnly && node.status === "teaching"
       ? "not-started"
       : node.status;
     const status = STATUS_PRESENTATION[displayStatus];
-    const statusLabel = current
+    const statusLabel = reviewing
+      ? "Reviewing"
+      : current
       ? "You are here"
       : activeBranch
       ? node.status === "teaching"
         ? "Current branch"
         : `${status.label} · Active branch`
       : status.label;
-    const rowLabel = current
+    const rowLabel = reviewing
+      ? `Reviewing concept: ${node.title}`
+      : current
       ? `Current concept: ${node.title}`
       : structural
         ? `${expanded ? "Collapse" : "Expand"} ${node.title}`
@@ -142,6 +153,9 @@ export function LessonRoadmap({
           {structural && (
             <span className="roadmap-expand-icon" aria-hidden="true">{expanded ? "−" : "+"}</span>
           )}
+          {teachable && lessonActive && onReview && (
+            <button type="button" className="roadmap-review-button" disabled={navigationPending || reviewing} aria-label={`Review ${node.title} from start`} onClick={() => onReview(node)}>{reviewing ? "Reviewing" : "Review"}</button>
+          )}
         </div>
         {structural && expanded && (
           <ol>{node.childrenIds.map((childId) => renderNode(childId, depth + 1))}</ol>
@@ -157,6 +171,7 @@ export function LessonRoadmap({
         <small>{summary}</small>
       </summary>
       <div className="roadmap-body">
+        {reviewNodeId && onExitReview && <div className="roadmap-review-banner"><span>Reviewing one concept from the beginning</span><button type="button" onClick={onExitReview}>Exit Review</button></div>}
         {navigationPending && <p className="roadmap-pending" role="status">Moving to selected concept…</p>}
         {lessonState.rootNodeIds.length ? (
           <ol className="roadmap-tree">

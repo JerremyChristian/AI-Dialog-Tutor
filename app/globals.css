@@ -941,7 +941,7 @@ h1 {
 
 .roadmap-row {
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) 22px;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
   align-items: center;
   min-width: 0;
   margin-left: calc(var(--roadmap-depth) * min(18px, 3vw));
@@ -1382,6 +1382,10 @@ h1 {
     display: none;
   }
 }
+.roadmap-review-button { min-height: 32px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--accent); cursor: pointer; font-size: .68rem; font-weight: 700; }
+.roadmap-review-button:disabled { cursor: default; opacity: .65; }
+.roadmap-review-banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 2px 4px 8px; padding: 8px 10px; border-radius: 8px; background: rgb(37 87 214 / 8%); color: var(--accent); font-size: .72rem; font-weight: 700; }
+.roadmap-review-banner button { border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; text-decoration: underline; }
 
 @media (max-width: 899px) {
   .active-learning-grid {
@@ -1785,6 +1789,10 @@ summary:focus-visible {
 .restart-lesson-confirmation h2 { margin: 0 0 6px; font-size: 1rem; }
 .restart-lesson-confirmation p { margin: 0; color: var(--muted); font-size: .85rem; line-height: 1.5; }
 .restart-lesson-confirmation > div { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
+.lesson-complete-transition { position: fixed; z-index: 50; inset: 0; display: grid; place-content: center; gap: 10px; background: rgb(248 250 251 / 88%); color: var(--accent); text-align: center; animation: lesson-complete-fade .8s ease both; }
+.lesson-complete-transition span { font-size: 2.4rem; }
+.lesson-complete-transition strong { font-size: 1.05rem; }
+@keyframes lesson-complete-fade { from { opacity: 0; } 35%, 75% { opacity: 1; } to { opacity: 0; } }
 .lesson-detail-progress { margin-top: 32px; padding-top: 24px; border-top: 1px solid var(--border); }
 .lesson-detail-progress .lesson-roadmap { margin: 0; }
 .step-label { margin-bottom: 7px !important; color: var(--accent) !important; font-size: .7rem !important; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
@@ -1802,6 +1810,7 @@ summary:focus-visible {
 .teaching-controls-stack { display: flex; flex-direction: column; gap: var(--teaching-room-section-gap); }
 .teaching-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 24px; }
 .teaching-header > div { min-width: 0; flex: 1 1 auto; }
+.teaching-header > .teaching-header-actions { display: flex; min-width: auto; flex: 0 0 auto; align-items: center; gap: 10px; }
 .teaching-header h1 { margin: 0; font-size: clamp(1.35rem, 3vw, 2rem); }
 .end-lesson-top { flex: 0 0 auto; }
 .end-lesson-mobile { display: none; }
@@ -1871,6 +1880,7 @@ summary:focus-visible {
   .end-lesson-top { min-height: 46px; }
   .end-lesson-desktop { display: none; }
   .end-lesson-mobile { display: inline; }
+  .teaching-header-actions > .button-secondary { display: none; }
   .lesson-active .source-visual-frame { max-height: 48dvh; }
   .lesson-active .status-row { grid-template-columns: 1fr; }
   .status-item { min-height: 92px; }
@@ -1883,7 +1893,7 @@ summary:focus-visible {
   .source-visual-controls > button:nth-child(4) { grid-column: 1 / -1; min-height: 44px; }
 }
 
-@media (prefers-reduced-motion: reduce) { .loading-spinner { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .loading-spinner, .lesson-complete-transition { animation: none; } }
 
 /* Global appearance overrides. Source documents retain their original pixels. */
 :root[data-theme="dark"] .tutor-card,
@@ -1929,6 +1939,7 @@ summary:focus-visible {
 }
 
 :root[data-theme="dark"] .source-visual-frame { background: var(--surface-muted); }
+:root[data-theme="dark"] .lesson-complete-transition { background: rgb(23 30 39 / 90%); }
 :root[data-theme="dark"] .source-visual-frame canvas { background: #fff; }
 :root[data-theme="dark"] .session-error,
 :root[data-theme="dark"] .mute-button-active { background: var(--danger-soft); color: var(--danger); }
