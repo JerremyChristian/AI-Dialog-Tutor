@@ -5,6 +5,7 @@ export const QA_LESSON_ID = "qa-session-lifecycle-001";
 export type LiveSend = { socketId: number; message: Record<string, unknown> };
 
 const externalRequests = new WeakMap<Page, string[]>();
+const tokenRequests = new WeakMap<Page, number>();
 
 export async function installNoExternalNetworkGuard(page: Page) {
   const blocked: string[] = [];
@@ -38,15 +39,52 @@ export async function installFakeLive(page: Page, options: {
   schemaVersion?: number;
   cloudOwnerId?: string | null;
   secondLesson?: boolean;
+  holdFirstPlayerReady?: boolean;
 } = {}) {
   await page.route("**/auth/v1/**", (route) => route.fulfill({
     status: 401, contentType: "application/json", body: JSON.stringify({ message: "Not signed in" }),
   }));
-  await page.route("**/api/gemini-token", (route) => route.fulfill({
-    status: 200, contentType: "application/json",
-    body: JSON.stringify({ token: "local-test-token", source: { name: "plc-notes.txt", mimeType: "text/plain" } }),
-  }));
-  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences, schemaVersion, cloudOwnerId, secondLesson }) => {
+  tokenRequests.set(page, 0);
+  await page.route("**/api/gemini-token", (route) => {
+    tokenRequests.set(page, (tokenRequests.get(page) ?? 0) + 1);
+    return route.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify({ token: "local-test-token", source: { name: "plc-notes.txt", mimeType: "text/plain" } }),
+    });
+  });
+  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences, schemaVersion, cloudOwnerId, secondLesson, holdFirstPlayerReady }) => {
+    if (holdFirstPlayerReady) {
+      const NativeAudioContext = window.AudioContext;
+      let firstPlayerContext = true;
+      let releaseFirstResume: (() => void) | null = null;
+      class GatedAudioContext {
+        constructor(options?: AudioContextOptions) {
+          const context = new NativeAudioContext(options);
+          if (!firstPlayerContext || options?.sampleRate !== 24_000) return context;
+          firstPlayerContext = false;
+          let held = true;
+          const ready = new Promise<void>((resolve) => { releaseFirstResume = resolve; });
+          return new Proxy(context, {
+            get(target, property) {
+              if (property === "state" && held) return "suspended";
+              if (property === "resume") return async () => {
+                await ready;
+                held = false;
+                if (target.state === "suspended") await target.resume();
+              };
+              const value = Reflect.get(target, property, target) as unknown;
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        }
+      }
+      Object.defineProperty(window, "AudioContext", { configurable: true, value: GatedAudioContext });
+      Reflect.set(window, "__QA_PLAYER_READY__", {
+        isHeld: () => Boolean(releaseFirstResume),
+        release: () => releaseFirstResume?.(),
+      });
+    }
+
     const NativeWebSocket = window.WebSocket;
     const sockets: FakeLiveWebSocket[] = [];
     const sends: Array<{ socketId: number; message: Record<string, unknown> }> = [];
@@ -186,6 +224,19 @@ export async function installFakeLive(page: Page, options: {
     schemaVersion: options.schemaVersion ?? 1,
     cloudOwnerId: options.cloudOwnerId ?? null,
     secondLesson: options.secondLesson ?? false,
+    holdFirstPlayerReady: options.holdFirstPlayerReady ?? false,
+  });
+}
+
+export function getTokenRequestCount(page: Page) {
+  return tokenRequests.get(page) ?? 0;
+}
+
+export async function releaseFirstPlayerReady(page: Page) {
+  await page.evaluate(() => {
+    const gate = Reflect.get(window, "__QA_PLAYER_READY__") as { release?: () => void } | undefined;
+    if (!gate?.release) throw new Error("Player-ready gate was not installed");
+    gate.release();
   });
 }
 

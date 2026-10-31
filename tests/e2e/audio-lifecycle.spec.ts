@@ -1,12 +1,49 @@
 import { expect, test } from "@playwright/test";
 import {
-  deliverLive, endMicrophoneTrack, getLiveSends, installFakeLive,
-  openLessonAndStart, readTestState,
+  deliverLive, endMicrophoneTrack, getExternalRequests, getLiveSends, installFakeLive,
+  getTokenRequestCount, installNoExternalNetworkGuard, openLessonAndStart, QA_LESSON_ID,
+  readTestState, releaseFirstPlayerReady,
 } from "../helpers/fake-live";
 
 const learnerAudioCount = async (page: Parameters<typeof getLiveSends>[0]) =>
   (await getLiveSends(page)).filter(({ message }) =>
     Boolean((message.realtimeInput as { audio?: unknown } | undefined)?.audio)).length;
+
+test("a startup made stale while playerReady is pending cannot request a token", async ({ page }) => {
+  await installNoExternalNetworkGuard(page);
+  await installFakeLive(page, { persisted: true, holdFirstPlayerReady: true });
+  await page.goto("/");
+  await page.waitForFunction((id) => new Promise<boolean>((resolve) => {
+    const request = indexedDB.open("ai-dialog-tutor", 2);
+    request.onsuccess = () => {
+      const db = request.result;
+      const lookup = db.transaction("savedLessons", "readonly").objectStore("savedLessons").get(id);
+      lookup.onsuccess = () => { db.close(); resolve(Boolean(lookup.result)); };
+    };
+  }), QA_LESSON_ID);
+  await page.reload();
+  await expect.poll(() => page.evaluate(() => window.__AI_TEACHER_TEST__?.getSnapshot().persistenceHydrated)).toBe(true);
+  await page.locator(".continue-card").getByRole("button", { name: "Continue" }).click();
+
+  const start = page.getByRole("button", { name: "Continue Lesson", exact: true });
+  await start.click();
+  await expect.poll(() => page.evaluate(() => Reflect.get(window, "__QA_PLAYER_READY__")?.isHeld())).toBe(true);
+  await expect.poll(() => page.evaluate(() => Reflect.get(window, "__QA_MICROPHONE__")?.hasStream())).toBe(true);
+  expect(getTokenRequestCount(page)).toBe(0);
+
+  await page.getByRole("button", { name: "Restart Lesson" }).click();
+  await page.getByRole("alertdialog", { name: "Restart this lesson?" })
+    .getByRole("button", { name: "Restart", exact: true }).click();
+  await expect.poll(() => getTokenRequestCount(page)).toBe(1);
+  await expect.poll(() => page.evaluate(() => Reflect.get(window, "__QA_LIVE__").socketCount())).toBe(1);
+  expect(getExternalRequests(page)).toEqual([]);
+
+  await releaseFirstPlayerReady(page);
+  await expect.poll(async () => ({
+    tokenRequests: getTokenRequestCount(page),
+    socketCount: await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").socketCount()),
+  })).toEqual({ tokenRequests: 1, socketCount: 1 });
+});
 
 test("fake microphone starts and mute gates learner PCM until unmuted", async ({ page }) => {
   await installFakeLive(page);
