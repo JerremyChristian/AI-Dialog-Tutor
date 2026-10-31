@@ -24,11 +24,6 @@ import {
   TeachingRoomHeader,
 } from "../components/teaching-room";
 import { TeachingStyleControls } from "../components/teaching-style-controls";
-import type {
-  LearningSource,
-  LessonSource,
-  PreparedLearningSource,
-} from "../lib/learning-source";
 import { AudioSession } from "../lib/audio-session";
 import {
   ACOUSTIC_ACTIVITY_MULTIPLIER,
@@ -126,32 +121,11 @@ import {
   applyTeachingPreferenceUpdate,
   type TeachingPreferences,
 } from "../lib/teaching-preferences";
-import {
-  clearActiveLessonId,
-  deleteSavedLesson,
-  getSavedLesson,
-  getSavedLessonContentSignature,
-  listSavedLessons,
-  loadActiveLesson,
-  saveActiveLesson,
-  saveSavedLesson,
-  setActiveLessonId,
-  type RecentTeachingContextEntry,
-  type SavedLesson,
-} from "../lib/local-persistence";
+import type { RecentTeachingContextEntry } from "../lib/local-persistence";
 import {
   appendRecentTeachingContext,
-  buildSavedLessonSnapshot,
   getPersistedResumeContext,
 } from "../lib/lesson-snapshot";
-import {
-  createCloudCompatibleLessonId,
-  associateCloudLesson,
-  deleteCloudLesson,
-  isUuid,
-  reconcileCloudLessons,
-  type CloudSyncState,
-} from "../lib/cloud-sync";
 import { isSupabaseConfigured } from "../lib/supabase/config";
 import { sanitizeLearnerVisibleTutorTranscript } from "../lib/transcript-visibility";
 import { mergeLearnerTranscript } from "../lib/learner-transcript";
@@ -161,6 +135,7 @@ import {
 } from "../lib/test-observability";
 import { useAppearance } from "../lib/use-appearance";
 import { useLessonProcessingQueue } from "../lib/use-lesson-processing-queue";
+import { useLessonWorkspace } from "../lib/use-lesson-workspace";
 import { usePwaInstall } from "../lib/use-pwa-install";
 
 type MicrophoneStatus =
@@ -242,47 +217,19 @@ export default function Home() {
     useState<PendingTeachingPreferences>({});
   const [preferenceUpdatePending, setPreferenceUpdatePending] = useState(false);
   const [roadmapNavigationPending, setRoadmapNavigationPending] = useState(false);
-  const [persistenceHydrated, setPersistenceHydrated] = useState(false);
-  const [persistenceNotice, setPersistenceNotice] = useState("");
-  const [savedLessonId, setSavedLessonId] = useState<string | null>(null);
-  const [resumeExistingLesson, setResumeExistingLesson] = useState(false);
-  const [savedLessons, setSavedLessons] = useState<SavedLesson[]>([]);
-  const [lessonLibraryBusyId, setLessonLibraryBusyId] = useState<string | null>(null);
   const [cloudUserId, setCloudUserId] = useState<string | null>(null);
   const [cloudAuthReady, setCloudAuthReady] = useState(!isSupabaseConfigured());
-  const [cloudSyncState, setCloudSyncState] = useState<CloudSyncState>("local-only");
-  const [cloudLessonCount, setCloudLessonCount] = useState(0);
-  const [localOnlyLessonCount, setLocalOnlyLessonCount] = useState(0);
-  const [topicInput, setTopicInput] = useState("");
   const [lessonState, setLessonState] = useState<LessonState>(() =>
     createLessonState("Uploaded material"),
   );
-  const [learningSource, setLearningSource] = useState<LearningSource | null>(null);
-  const [lessonSources, setLessonSources] = useState<LessonSource[]>([]);
   const [presentationBeat, setPresentationBeat] = useState<PresentationBeat | null>(null);
   const [restartConfirmationOpen, setRestartConfirmationOpen] = useState(false);
   const [restartPending, setRestartPending] = useState(false);
   const [nodeReview, setNodeReview] = useState<NodeReviewState | null>(null);
   const [showLessonComplete, setShowLessonComplete] = useState(false);
-  const preparedSourceRef = useRef<PreparedLearningSource | null>(null);
-  const savedLessonIdRef = useRef<string | null>(null);
-  const savedLessonCreatedAtRef = useRef<string | null>(null);
-  const savedLessonUpdatedAtRef = useRef<string | null>(null);
-  const savedLessonContentSignatureRef = useRef<string | null>(null);
-  const savedLessonWasPersistedRef = useRef(false);
-  const resumeExistingLessonRef = useRef(false);
-  const persistenceAvailableRef = useRef(true);
-  const persistenceHydratedRef = useRef(false);
   const cloudAuthReadyRef = useRef(cloudAuthReady);
   const cloudUserIdTestRef = useRef<string | null>(cloudUserId);
   const transportStateTestRef = useRef<LiveTransportState>(transportState);
-  const workspaceOwnerIdRef = useRef<string | null>(null);
-  const cloudOwnerIdRef = useRef<string | null>(null);
-  const cloudSyncMetadataRef = useRef<SavedLesson["cloudSync"]>(undefined);
-  const cloudUploadTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  const workspaceLoadGenerationRef = useRef(0);
-  const lessonHydrationGenerationRef = useRef(0);
-  const workspaceLoadedRef = useRef(false);
 
   const transportRef = useRef<LiveTransportManager | null>(null);
   const audioSessionRef = useRef<AudioSession | null>(null);
@@ -323,7 +270,6 @@ export default function Home() {
   const typedReplyInputRef = useRef<HTMLInputElement | null>(null);
   const preferenceUpdateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const roadmapNavigationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const persistenceSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const roadmapNavigationPendingRef = useRef(false);
   const teachingPreferencesRef = useRef<TeachingPreferences>(teachingPreferences);
   const meaningfulConfirmationSpeechRef = useRef(false);
@@ -365,7 +311,7 @@ export default function Home() {
     const active = activeTeachingBeatRef.current;
     const transcript = [state.lastUserTranscript, state.lastAssistantTranscript].filter(Boolean);
     return {
-      lessonId: savedLessonIdRef.current,
+      lessonId: workspace.savedLessonIdRef.current,
       currentNodeId: state.currentNodeId,
       coverage: Object.fromEntries(Object.values(state.nodes).map((node) => [node.id, node.status])),
       status: state.status,
@@ -392,7 +338,7 @@ export default function Home() {
         ? "learner"
         : state.lastAssistantTranscript ? "tutor" : null,
       lessonActive: lessonActiveRef.current,
-      persistenceHydrated: persistenceHydratedRef.current,
+      persistenceHydrated: workspace.persistenceHydratedRef.current,
       cloudAuthReady: cloudAuthReadyRef.current,
       cloudUserId: cloudUserIdTestRef.current,
     };
@@ -689,13 +635,12 @@ export default function Home() {
     if (quickResponseTimerRef.current) clearTimeout(quickResponseTimerRef.current);
     if (preferenceUpdateTimerRef.current) clearTimeout(preferenceUpdateTimerRef.current);
     if (roadmapNavigationTimerRef.current) clearTimeout(roadmapNavigationTimerRef.current);
-    if (persistenceSaveTimerRef.current) clearTimeout(persistenceSaveTimerRef.current);
+    workspace.cancelScheduledSave();
     engagementTimerRef.current = null;
     confirmationTimerRef.current = null;
     quickResponseTimerRef.current = null;
     preferenceUpdateTimerRef.current = null;
     roadmapNavigationTimerRef.current = null;
-    persistenceSaveTimerRef.current = null;
     engagementStateRef.current = "ended";
     setEngagementState("ended");
     setTransportState("closed");
@@ -748,50 +693,6 @@ export default function Home() {
     teachingPreferences.speakingSpeed,
   ]);
 
-  const applySyncedLessonMetadata = (synced: SavedLesson) => {
-    setSavedLessons((current) => current.map((lesson) =>
-      lesson.id === synced.id ? synced : lesson
-    ));
-    if (savedLessonIdRef.current === synced.id) {
-      cloudSyncMetadataRef.current = synced.cloudSync;
-    }
-  };
-
-  const scheduleCloudUpload = (snapshot: SavedLesson) => {
-    const ownerId = snapshot.cloudOwnerId ?? null;
-    if (!ownerId || ownerId !== cloudUserId) return;
-    const existing = cloudUploadTimersRef.current.get(snapshot.id);
-    if (existing) clearTimeout(existing);
-    setCloudSyncState("pending");
-    const timer = setTimeout(() => {
-      cloudUploadTimersRef.current.delete(snapshot.id);
-      setCloudSyncState("syncing");
-      void reconcileCloudLessons({
-        userId: ownerId,
-        deferDownloadLessonId: lessonActiveRef.current ? snapshot.id : null,
-        debug: addDebugMessage,
-      })
-        .then(async (summary) => {
-          const synced = await getSavedLesson(snapshot.id);
-          if (synced) {
-            applySyncedLessonMetadata(synced);
-          } else if (!lessonActiveRef.current && !lessonStartupPendingRef.current &&
-              savedLessonIdRef.current === snapshot.id) {
-            resetIdleLessonWorkspace();
-            await clearActiveLessonId(ownerId);
-          }
-          await refreshScopedLibrary(ownerId);
-          setCloudLessonCount(summary.cloudLessonCount);
-          setCloudSyncState(summary.deferred > 0 ? "pending" : "synced");
-        })
-        .catch(() => {
-          setCloudSyncState("pending");
-          addDebugMessage("Cloud sync failed: category=lesson-upload");
-        });
-    }, 1_200);
-    cloudUploadTimersRef.current.set(snapshot.id, timer);
-  };
-
   const updateRecentTeachingContext = (conceptId: string | null, transcript: string) => {
     const next = appendRecentTeachingContext(
       recentTeachingContextRef.current,
@@ -807,68 +708,8 @@ export default function Home() {
     );
   };
 
-  const createCurrentLessonSnapshot = (stateOverride?: LessonState) => {
-    if (!persistenceAvailableRef.current || !persistenceHydratedRef.current) return;
-    const id = savedLessonIdRef.current;
-    const prepared = preparedSourceRef.current;
-    const source = learningSource;
-    if (!id || !prepared || !source || source.status !== "ready") return;
-    const now = new Date().toISOString();
-    const createdAt = savedLessonCreatedAtRef.current ?? now;
-    savedLessonCreatedAtRef.current = createdAt;
-    return buildSavedLessonSnapshot({
-      id,
-      prepared,
-      source,
-      lessonSources,
-      topicInput,
-      hasStarted: resumeExistingLessonRef.current,
-      state: stateOverride ?? lessonStateRef.current,
-      recentTeachingContext: recentTeachingContextRef.current,
-      teachingPreferences: teachingPreferencesRef.current,
-      createdAt,
-      previousUpdatedAt: savedLessonUpdatedAtRef.current,
-      previousContentSignature: savedLessonContentSignatureRef.current,
-      cloudOwnerId: cloudOwnerIdRef.current,
-      cloudSync: cloudSyncMetadataRef.current,
-      now,
-    });
-  };
-
-  const persistLessonSnapshot = async (snapshot: SavedLesson) => {
-    try {
-      await saveActiveLesson(snapshot);
-      if (savedLessonIdRef.current === snapshot.id) {
-        savedLessonUpdatedAtRef.current = snapshot.updatedAt;
-        savedLessonContentSignatureRef.current = getSavedLessonContentSignature(snapshot);
-      }
-      if ((snapshot.cloudOwnerId ?? null) === workspaceOwnerIdRef.current) {
-        setSavedLessons((current) => [
-          snapshot,
-          ...current.filter((lesson) => lesson.id !== snapshot.id),
-        ].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
-      }
-      if (savedLessonIdRef.current === snapshot.id && !savedLessonWasPersistedRef.current) {
-        savedLessonWasPersistedRef.current = true;
-        addDebugMessage(`Saved lesson created: ${snapshot.id}`);
-      } else {
-        addDebugMessage("Lesson autosaved");
-      }
-      scheduleCloudUpload(snapshot);
-    } catch {
-      persistenceAvailableRef.current = false;
-      setPersistenceNotice("Local lesson saving is unavailable on this device.");
-      addDebugMessage("Local persistence unavailable");
-    }
-  };
-
-  const persistCurrentLesson = async (stateOverride?: LessonState) => {
-    const snapshot = createCurrentLessonSnapshot(stateOverride);
-    if (snapshot) await persistLessonSnapshot(snapshot);
-  };
-
   const resetCurrentLessonProgress = async () => {
-    const prepared = preparedSourceRef.current;
+    const prepared = workspace.preparedSourceRef.current;
     if (!prepared) return false;
     const freshState = createLessonState(lessonStateRef.current.topic, prepared.lessonTree);
     invalidateActiveTeachingBeat("lesson-restarted");
@@ -906,160 +747,10 @@ export default function Home() {
     setPendingTeachingPreferences({});
     setPreferenceUpdatePending(false);
     setUserError("");
-    resumeExistingLessonRef.current = false;
-    setResumeExistingLesson(false);
-    await persistCurrentLesson(freshState);
-    addDebugMessage(`Completed lesson progress reset: lesson=${savedLessonIdRef.current || "unknown"}`);
+    workspace.markLessonNotStarted();
+    await workspace.persistCurrentLesson(freshState);
+    addDebugMessage(`Completed lesson progress reset: lesson=${workspace.savedLessonIdRef.current || "unknown"}`);
     return true;
-  };
-
-  const hydrateSavedLesson = (saved: SavedLesson, requestedGeneration?: number) => {
-    if (lessonActiveRef.current || lessonStartupPendingRef.current ||
-        (requestedGeneration !== undefined && requestedGeneration !== lessonHydrationGenerationRef.current)) {
-      addDebugMessage(`Stale workspace hydration skipped: reason=${lessonActiveRef.current ? "lesson-active" : lessonStartupPendingRef.current ? "startup-pending" : "request-stale"}`);
-      return false;
-    }
-    preparedSourceRef.current = saved.source.prepared;
-    lessonStateRef.current = saved.lessonState;
-    lessonWrapUpRef.current = false;
-    conversationalRestartConfirmationRef.current = false;
-    setRestartConfirmationOpen(false);
-    recentTeachingContextRef.current = saved.recentTeachingContext;
-    teachingPreferencesRef.current = saved.teachingPreferences;
-    savedLessonIdRef.current = saved.id;
-    savedLessonCreatedAtRef.current = saved.createdAt;
-    savedLessonUpdatedAtRef.current = saved.updatedAt;
-    savedLessonContentSignatureRef.current = getSavedLessonContentSignature(saved);
-    savedLessonWasPersistedRef.current = true;
-    cloudOwnerIdRef.current = saved.cloudOwnerId ?? null;
-    cloudSyncMetadataRef.current = saved.cloudSync;
-    resumeExistingLessonRef.current = saved.hasStarted;
-    setLearningSource(saved.source.metadata);
-    setLessonSources(saved.sources);
-    saved.sources.forEach((item) => addDebugMessage(`Source restored from cloud metadata: source=${item.id}`));
-    setLessonState(saved.lessonState);
-    setTeachingPreferences(saved.teachingPreferences);
-    setTopicInput(saved.lessonFocus);
-    setSavedLessonId(saved.id);
-    setResumeExistingLesson(saved.hasStarted);
-    presentationBeatRef.current = null;
-    setPresentationBeat(null);
-    setUserError("");
-    addDebugMessage(
-      `Restored resume teaching context: entries=${saved.recentTeachingContext.length}`,
-    );
-    return true;
-  };
-
-  const resetIdleLessonWorkspace = () => {
-    const emptyLesson = createLessonState("Uploaded material", []);
-    preparedSourceRef.current = null;
-    lessonStateRef.current = emptyLesson;
-    lessonWrapUpRef.current = false;
-    conversationalRestartConfirmationRef.current = false;
-    setRestartConfirmationOpen(false);
-    recentTeachingContextRef.current = [];
-    teachingPreferencesRef.current = DEFAULT_TEACHING_PREFERENCES;
-    savedLessonIdRef.current = null;
-    savedLessonCreatedAtRef.current = null;
-    savedLessonUpdatedAtRef.current = null;
-    savedLessonContentSignatureRef.current = null;
-    savedLessonWasPersistedRef.current = false;
-    cloudOwnerIdRef.current = workspaceOwnerIdRef.current;
-    cloudSyncMetadataRef.current = undefined;
-    resumeExistingLessonRef.current = false;
-    setLearningSource(null);
-    setLessonSources([]);
-    setLessonState(emptyLesson);
-    setTeachingPreferences(DEFAULT_TEACHING_PREFERENCES);
-    setTopicInput("");
-    setSavedLessonId(null);
-    setResumeExistingLesson(false);
-    presentationBeatRef.current = null;
-    setPresentationBeat(null);
-    setUserError("");
-  };
-
-  const startNewLessonFlow = () => {
-    if (lessonActiveRef.current) return;
-    setPersistenceNotice("");
-    if (persistenceSaveTimerRef.current) clearTimeout(persistenceSaveTimerRef.current);
-    persistenceSaveTimerRef.current = null;
-    const outgoingSnapshot = createCurrentLessonSnapshot();
-    if (outgoingSnapshot) void persistLessonSnapshot(outgoingSnapshot);
-    resetIdleLessonWorkspace();
-    setAppView("library");
-    setLibraryView("new");
-    addDebugMessage("New lesson setup opened");
-  };
-
-  const selectSavedLesson = async (id: string) => {
-    if (lessonActiveRef.current || lessonLibraryBusyId) return;
-    setPersistenceNotice("");
-    setLessonLibraryBusyId(id);
-    const hydrationGeneration = ++lessonHydrationGenerationRef.current;
-    try {
-      if (persistenceSaveTimerRef.current) clearTimeout(persistenceSaveTimerRef.current);
-      persistenceSaveTimerRef.current = null;
-      const outgoingSnapshot = createCurrentLessonSnapshot();
-      if (outgoingSnapshot) await persistLessonSnapshot(outgoingSnapshot);
-      const saved = await getSavedLesson(id);
-      if (!saved || (saved.cloudOwnerId ?? null) !== workspaceOwnerIdRef.current) {
-        setUserError("That saved lesson is unavailable or incompatible.");
-        setSavedLessons((current) => current.filter((lesson) => lesson.id !== id));
-        return;
-      }
-      await setActiveLessonId(id, workspaceOwnerIdRef.current);
-      if (!hydrateSavedLesson(saved, hydrationGeneration)) return;
-      addDebugMessage(`Saved lesson selected: ${id}`);
-      addDebugMessage(`Active lesson changed: ${id}`);
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    } catch {
-      setPersistenceNotice("Local lesson saving is unavailable on this device.");
-      addDebugMessage("Local persistence unavailable");
-    } finally {
-      setLessonLibraryBusyId(null);
-    }
-  };
-
-  const requestDeleteSavedLesson = async (saved: SavedLesson) => {
-    if (lessonActiveRef.current || lessonLibraryBusyId) return;
-    const deleteScope = saved.cloudOwnerId
-      ? "This removes its cloud snapshot and local cached source and progress."
-      : "This removes its local source and progress.";
-    if (!window.confirm(`Delete "${saved.title}"?\n\n${deleteScope}`)) {
-      return;
-    }
-    setLessonLibraryBusyId(saved.id);
-    try {
-      if (savedLessonIdRef.current === saved.id && persistenceSaveTimerRef.current) {
-        clearTimeout(persistenceSaveTimerRef.current);
-        persistenceSaveTimerRef.current = null;
-      }
-      if (saved.cloudOwnerId) {
-        if (saved.cloudOwnerId !== cloudUserId) {
-          throw new Error("cloud-owner-mismatch");
-        }
-        await deleteCloudLesson(saved.id, saved.cloudOwnerId, addDebugMessage);
-        setCloudLessonCount((count) => Math.max(0, count - 1));
-      }
-      await deleteSavedLesson(saved.id);
-      setSavedLessons((current) => current.filter((lesson) => lesson.id !== saved.id));
-      if (savedLessonIdRef.current === saved.id) {
-        resetIdleLessonWorkspace();
-        setLibraryView("index");
-      }
-      addDebugMessage(`Saved lesson deleted: ${saved.id}`);
-    } catch {
-      setPersistenceNotice(saved.cloudOwnerId
-        ? "That lesson could not be deleted from the cloud. Its local copy was kept."
-        : "That saved lesson could not be deleted on this device.");
-      addDebugMessage(saved.cloudOwnerId
-        ? "Cloud sync failed: category=lesson-delete"
-        : "Local persistence unavailable");
-    } finally {
-      setLessonLibraryBusyId(null);
-    }
   };
 
   const changeActiveTeachingPreference = (update: TeachingPreferenceUpdate) => {
@@ -1233,198 +924,42 @@ export default function Home() {
     }, 1_500);
   };
 
-  const refreshScopedLibrary = async (ownerId: string | null, reason = "workspace") => {
-    const library = await listSavedLessons();
-    const scoped = library.filter((lesson) => (lesson.cloudOwnerId ?? null) === ownerId);
-    setSavedLessons(scoped);
-    setLocalOnlyLessonCount(ownerId
-      ? library.filter((lesson) => !lesson.cloudOwnerId).length
-      : 0);
-    addDebugMessage(`Library refreshed: reason=${reason}, activeLessonHydrated=no`);
-    addDebugMessage(`Saved lesson library loaded: ${scoped.length} lessons`);
-    addDebugMessage(`Recent Lessons cache: scopedUniqueLessons=${new Set(scoped.map((lesson) => lesson.id)).size}`);
-    const titleIds = new Map<string, string[]>();
-    scoped.forEach((lesson) => {
-      titleIds.set(lesson.title, [...(titleIds.get(lesson.title) ?? []), lesson.id]);
-    });
-    titleIds.forEach((ids) => {
-      if (ids.length > 1) addDebugMessage(`Recent Lessons same-title IDs: ${ids.join(",")}`);
-    });
-    return scoped;
-  };
-
   const processingQueue = useLessonProcessingQueue({
     ownerId: cloudUserId,
     onDebug: addDebugMessage,
     onLessonReady: async () => {
-      await refreshScopedLibrary(workspaceOwnerIdRef.current, "processing-ready");
-      setPersistenceNotice("Your processed lesson is ready in the library.");
+      await workspace.refreshScopedLibrary(workspace.workspaceOwnerIdRef.current, "processing-ready");
+      workspace.setPersistenceNotice("Your processed lesson is ready in the library.");
     },
   });
 
-  const syncCurrentAccount = async () => {
-    const ownerId = workspaceOwnerIdRef.current;
-    if (!ownerId || ownerId !== cloudUserId) return;
-    setCloudSyncState("syncing");
-    try {
-      await persistCurrentLesson();
-      const summary = await reconcileCloudLessons({
-        userId: ownerId,
-        deferDownloadLessonId: lessonActiveRef.current ? savedLessonIdRef.current : null,
-        debug: addDebugMessage,
-      });
-      setCloudLessonCount(summary.cloudLessonCount);
-      await refreshScopedLibrary(ownerId, "cloud-sync");
-      if (!lessonActiveRef.current && savedLessonIdRef.current) {
-        const hydrationGeneration = lessonHydrationGenerationRef.current;
-        const refreshed = await getSavedLesson(savedLessonIdRef.current);
-        if (refreshed?.cloudOwnerId === ownerId) {
-          hydrateSavedLesson(refreshed, hydrationGeneration);
-        } else if (!lessonActiveRef.current && !lessonStartupPendingRef.current) {
-          resetIdleLessonWorkspace();
-          await clearActiveLessonId(ownerId);
-        }
-      }
-      setCloudSyncState(summary.deferred > 0 ? "pending" : "synced");
-    } catch {
-      setCloudSyncState("error");
-      addDebugMessage("Cloud sync failed: category=reconciliation");
-    }
-  };
-
-  const importLocalLessons = async () => {
-    const ownerId = workspaceOwnerIdRef.current;
-    if (!ownerId || ownerId !== cloudUserId || lessonActiveRef.current) return;
-    if (!window.confirm("Sync all unowned local lessons to this account? They will become associated with the signed-in account.")) return;
-    setCloudSyncState("syncing");
-    try {
-      const localOnly = (await listSavedLessons()).filter((lesson) => !lesson.cloudOwnerId);
-      let imported = 0;
-      for (const lesson of localOnly) {
-        const cloudId = isUuid(lesson.id) ? lesson.id : createCloudCompatibleLessonId();
-        const candidate: SavedLesson = {
-          ...structuredClone(lesson),
-          id: cloudId,
-          cloudOwnerId: ownerId,
-          cloudSync: undefined,
-        };
-        try {
-          const synced = await associateCloudLesson(candidate, ownerId, addDebugMessage);
-          await saveSavedLesson(synced);
-          if (synced.id !== lesson.id) await deleteSavedLesson(lesson.id);
-          addDebugMessage(
-            `Legacy import: localId=${lesson.id}, cloudId=${synced.id}, ` +
-            `identityChanged=${synced.id === lesson.id ? "no" : "yes"}`,
-          );
-          imported += 1;
-        } catch {
-          addDebugMessage(`Cloud sync failed: category=local-import, id=${lesson.id}`);
-        }
-      }
-      await clearActiveLessonId(null);
-      addDebugMessage(`Local lessons imported: ${imported}/${localOnly.length}`);
-      await syncCurrentAccount();
-    } catch {
-      setCloudSyncState("error");
-      addDebugMessage("Cloud sync failed: category=local-import");
-    }
-  };
-
-  useEffect(() => {
-    if (!cloudAuthReady || lessonActiveRef.current || lessonStartupPendingRef.current) return;
-    const ownerId = cloudUserId;
-    if (workspaceLoadedRef.current && workspaceOwnerIdRef.current === ownerId) return;
-    const generation = ++workspaceLoadGenerationRef.current;
-    void (async () => {
-      try {
-        if (persistenceHydratedRef.current) {
-          const outgoing = createCurrentLessonSnapshot();
-          if (outgoing) await persistLessonSnapshot(outgoing);
-        }
-        if (generation !== workspaceLoadGenerationRef.current ||
-            lessonActiveRef.current || lessonStartupPendingRef.current) {
-          addDebugMessage(`Stale workspace hydration skipped: reason=${lessonActiveRef.current ? "lesson-active" : lessonStartupPendingRef.current ? "startup-pending" : "request-stale"}`);
-          return;
-        }
-        resetIdleLessonWorkspace();
-        workspaceOwnerIdRef.current = ownerId;
-        cloudOwnerIdRef.current = ownerId;
-        cloudSyncMetadataRef.current = undefined;
-
-        if (ownerId) {
-          setCloudSyncState("syncing");
-          try {
-            const summary = await reconcileCloudLessons({ userId: ownerId, debug: addDebugMessage });
-            setCloudLessonCount(summary.cloudLessonCount);
-            setCloudSyncState("synced");
-          } catch {
-            setCloudSyncState("error");
-            addDebugMessage("Cloud sync failed: category=initial-reconciliation");
-          }
-        } else {
-          setCloudSyncState("local-only");
-          setCloudLessonCount(0);
-        }
-
-        if (generation !== workspaceLoadGenerationRef.current) return;
-        const [result] = await Promise.all([
-          loadActiveLesson(ownerId),
-          refreshScopedLibrary(ownerId, "workspace-restore"),
-        ]);
-        addDebugMessage("IndexedDB opened");
-        if (result.status === "incompatible") {
-          addDebugMessage("Saved lesson schema incompatible");
-          await clearActiveLessonId(ownerId);
-        } else if (result.status === "restored") {
-          const hydrationGeneration = lessonHydrationGenerationRef.current;
-          if (generation !== workspaceLoadGenerationRef.current ||
-              ownerId !== workspaceOwnerIdRef.current ||
-              lessonActiveRef.current || lessonStartupPendingRef.current) {
-            addDebugMessage(`Stale workspace hydration skipped: reason=${lessonActiveRef.current ? "lesson-active" : lessonStartupPendingRef.current ? "startup-pending" : "request-stale"}`);
-          } else if (hydrateSavedLesson(result.lesson, hydrationGeneration)) {
-            addDebugMessage(`Restored saved lesson: ${result.lesson.id}`);
-          }
-        }
-        workspaceLoadedRef.current = true;
-      } catch {
-        persistenceAvailableRef.current = false;
-        setPersistenceNotice("Local lesson saving is unavailable on this device.");
-        addDebugMessage("Local persistence unavailable");
-      } finally {
-        if (generation === workspaceLoadGenerationRef.current) {
-          persistenceHydratedRef.current = true;
-          setPersistenceHydrated(true);
-        }
-      }
-    })();
-  }, [aiConnectionStatus, cloudAuthReady, cloudUserId, microphoneStatus]);
-
-  useEffect(() => {
-    if (!persistenceHydrated || !savedLessonId || learningSource?.status !== "ready") return;
-    const snapshot = createCurrentLessonSnapshot();
-    if (!snapshot) return;
-    if (persistenceSaveTimerRef.current) clearTimeout(persistenceSaveTimerRef.current);
-    persistenceSaveTimerRef.current = setTimeout(() => {
-      persistenceSaveTimerRef.current = null;
-      void persistLessonSnapshot(snapshot);
-    }, 600);
-    return () => {
-      if (persistenceSaveTimerRef.current) clearTimeout(persistenceSaveTimerRef.current);
-      persistenceSaveTimerRef.current = null;
-    };
-  }, [
-    persistenceHydrated,
-    savedLessonId,
-    learningSource,
-    lessonSources,
-    lessonState.currentNodeId,
-    lessonState.nodes,
-    lessonState.teachingContractProgress,
-    lessonState.resumePoint,
-    lessonState.status,
+  // Called where the workspace-load and autosave effects used to be declared, so
+  // effect order (after the processing queue, before PWA/mount) is unchanged.
+  const workspace = useLessonWorkspace({
+    lessonActiveRef,
+    lessonStartupPendingRef,
+    lessonState,
+    lessonStateRef,
+    setLessonState,
+    recentTeachingContextRef,
     teachingPreferences,
-    topicInput,
-  ]);
+    teachingPreferencesRef,
+    setTeachingPreferences,
+    cloudUserId,
+    cloudAuthReady,
+    aiConnectionStatus,
+    microphoneStatus,
+    addDebugMessage,
+    setUserError,
+    onWorkspaceReplaced: () => {
+      lessonWrapUpRef.current = false;
+      conversationalRestartConfirmationRef.current = false;
+      setRestartConfirmationOpen(false);
+      presentationBeatRef.current = null;
+      setPresentationBeat(null);
+    },
+    onCurrentLessonDeleted: () => setLibraryView("index"),
+  });
 
   const { installPrompt, showIosInstallHint, requestInstall } = usePwaInstall();
 
@@ -1854,8 +1389,8 @@ export default function Home() {
         if (next) {
           applyAuthoritativeTeachingPreferences(next);
           transportRef.current?.updateSystemInstruction(buildLessonInstruction(
-            topicInput.trim(),
-            learningSource?.name,
+            workspace.topicInput.trim(),
+            workspace.learningSource?.name,
             next,
           ));
           addDebugMessage(
@@ -1871,7 +1406,7 @@ export default function Home() {
         }
       } else if (route === "session_control") {
         const decision = decideSessionControl(action, {
-          lessonStarted: resumeExistingLessonRef.current,
+          lessonStarted: workspace.resumeExistingLessonRef.current,
           restartConfirmationPending: conversationalRestartConfirmationRef.current,
           wrapUpActive: lessonWrapUpRef.current,
           idleConfirmationActive: engagementStateRef.current === "confirming",
@@ -2094,26 +1629,25 @@ export default function Home() {
   };
 
   const startConversation = async () => {
-    emitTestEvent("lesson.start-requested", { lessonId: savedLessonIdRef.current });
+    emitTestEvent("lesson.start-requested", { lessonId: workspace.savedLessonIdRef.current });
     setUserError("");
-    setPersistenceNotice("");
+    workspace.setPersistenceNotice("");
     if (
-      learningSource?.status !== "ready" ||
-      !preparedSourceRef.current
+      workspace.learningSource?.status !== "ready" ||
+      !workspace.preparedSourceRef.current
     ) {
       addDebugMessage("Source grounding failed: a ready learning source is required");
       return;
     }
 
     lessonStartupPendingRef.current = true;
-    workspaceLoadGenerationRef.current += 1;
-    lessonHydrationGenerationRef.current += 1;
+    workspace.invalidatePendingHydration();
 
-    const activeSource = learningSource;
-    const preparedSource = preparedSourceRef.current;
-    const lessonFocus = topicInput.trim();
+    const activeSource = workspace.learningSource;
+    const preparedSource = workspace.preparedSourceRef.current;
+    const lessonFocus = workspace.topicInput.trim();
     const lessonTopic = lessonFocus || `Main topics in ${activeSource.name}`;
-    const continuingSavedLesson = resumeExistingLessonRef.current;
+    const continuingSavedLesson = workspace.resumeExistingLessonRef.current;
     const sessionStartMode: LessonSessionStartMode = continuingSavedLesson
       ? "persisted-resume"
       : "new";
@@ -2172,7 +1706,7 @@ export default function Home() {
           ?.nextTeachingPointIndex ?? 0}, total=${startingConcept.teaching.teachingPoints.length}`,
       );
     }
-    setTopicInput(lessonFocus);
+    workspace.setTopicInput(lessonFocus);
     userTranscriptRef.current = "";
     voiceDraftRef.current = "";
     voiceDraftOpenRef.current = false;
@@ -2377,8 +1911,7 @@ export default function Home() {
         ...current,
         status: "teaching",
       }));
-      resumeExistingLessonRef.current = true;
-      setResumeExistingLesson(true);
+      workspace.markLessonStarted();
       addDebugMessage("Lesson started");
       lessonActiveRef.current = true;
       lessonStartupPendingRef.current = false;
@@ -2493,7 +2026,7 @@ export default function Home() {
           ?.nextTeachingPointIndex ?? 0}, total=${persistedCurrent.teaching.teachingPoints.length}`,
       );
     }
-    await persistCurrentLesson(stoppedLessonState);
+    await workspace.persistCurrentLesson(stoppedLessonState);
     await disposeResources(true);
 
     if (reason === "inactivity") {
@@ -2507,7 +2040,7 @@ export default function Home() {
   };
 
   const restartLesson = async () => {
-    if (restartPendingRef.current || !resumeExistingLessonRef.current) return;
+    if (restartPendingRef.current || !workspace.resumeExistingLessonRef.current) return;
     restartPendingRef.current = true;
     setRestartPending(true);
     setRestartConfirmationOpen(false);
@@ -2539,10 +2072,10 @@ export default function Home() {
     ? `${presentationBeat.conceptId}:${presentationBeat.deliveryUnitIndex}:${presentationBeat.beatIndex}`
     : `${currentConcept?.id ?? "none"}:pending`;
   const lessonActive = microphoneActive || requestingPermission || aiConnected;
-  const resumableLesson = savedLessons.find((lesson) => lesson.hasStarted);
-  const hasRecentLessons = savedLessons.some((lesson) => lesson.id !== resumableLesson?.id);
-  const selectedSavedLesson = savedLessonId
-    ? savedLessons.find((lesson) => lesson.id === savedLessonId)
+  const resumableLesson = workspace.savedLessons.find((lesson) => lesson.hasStarted);
+  const hasRecentLessons = workspace.savedLessons.some((lesson) => lesson.id !== resumableLesson?.id);
+  const selectedSavedLesson = workspace.savedLessonId
+    ? workspace.savedLessons.find((lesson) => lesson.id === workspace.savedLessonId)
     : undefined;
   const selectedLessonRestartable = Boolean(selectedSavedLesson?.hasStarted);
 
@@ -2565,9 +2098,16 @@ export default function Home() {
 
   const openLesson = async (id: string) => {
     acknowledgeReadyLessonNotifications(id);
-    await selectSavedLesson(id);
+    await workspace.selectSavedLesson(id);
     setAppView("library");
     setLibraryView("lesson");
+  };
+
+  const startNewLessonFlow = () => {
+    if (!workspace.prepareNewLesson()) return;
+    setAppView("library");
+    setLibraryView("new");
+    addDebugMessage("New lesson setup opened");
   };
 
   const navigateProduct = (view: AppView) => {
@@ -2579,9 +2119,9 @@ export default function Home() {
     <main className={`page-shell${lessonActive ? " teaching-shell" : ""}`}>
       {!lessonActive && <AppNavigation activeView={appView} onNavigate={navigateProduct} />}
       <section className={`tutor-card${lessonActive ? " lesson-active" : ""}`}>
-        <PreprocessingDiagnostic jobs={processingQueue.jobs} lessons={savedLessons} />
+        <PreprocessingDiagnostic jobs={processingQueue.jobs} lessons={workspace.savedLessons} />
         {lessonActive ? <TeachingRoomHeader
-          title={learningSource?.name || "Your lesson"}
+          title={workspace.learningSource?.name || "Your lesson"}
           restartDisabled={restartPending || Boolean(closingTurnRef.current)}
           onRequestRestart={() => setRestartConfirmationOpen(true)}
           onEndLesson={() => void stopConversation()}
@@ -2595,82 +2135,78 @@ export default function Home() {
         />}
         {lessonActive && showLessonComplete && <div className="lesson-complete-transition" role="status"><span aria-hidden="true">✓</span><strong>Lesson complete</strong></div>}
 
-        {!lessonActive && !persistenceHydrated && <div className="loading-state" role="status"><span className="loading-spinner" aria-hidden="true" /> Restoring your learning workspace…</div>}
+        {!lessonActive && !workspace.persistenceHydrated && <div className="loading-state" role="status"><span className="loading-spinner" aria-hidden="true" /> Restoring your learning workspace…</div>}
 
-        {!lessonActive && persistenceHydrated && appView === "home" && <section className="product-view home-view" aria-labelledby="page-title">
+        {!lessonActive && workspace.persistenceHydrated && appView === "home" && <section className="product-view home-view" aria-labelledby="page-title">
           <div className="home-heading"><p className="eyebrow">Home</p><h1 id="page-title">Continue learning</h1><p>Pick up where you left off or revisit a recent lesson.</p></div>
-          {resumableLesson ? <section className="continue-card" aria-labelledby="continue-title"><div><p className="eyebrow">Up next</p><h2 id="continue-title">{resumableLesson.title}</h2><p>{lessonProgress(resumableLesson)}% complete{resumableLesson.lessonState.currentNodeId && resumableLesson.lessonState.nodes[resumableLesson.lessonState.currentNodeId]?.title ? ` · ${resumableLesson.lessonState.nodes[resumableLesson.lessonState.currentNodeId].title}` : ""}</p></div><button className="button-primary" type="button" disabled={lessonLibraryBusyId !== null} onClick={() => void openLesson(resumableLesson.id)}>Continue</button></section> : <section className="continue-empty" aria-label="Continue learning"><h2>Ready for your next lesson?</h2><p>Your most recent learning will appear here once you begin.</p></section>}
-          {hasRecentLessons && <RecentLessons lessons={savedLessons.slice(0, 5)} activeLessonId={resumableLesson?.id ?? null} busyLessonId={lessonLibraryBusyId} onContinue={(id) => void openLesson(id)} onDelete={(saved) => void requestDeleteSavedLesson(saved)} onNewLesson={startNewLessonFlow} />}
-          <ProcessingQueue jobs={processingQueue.jobs} lessonActive={lessonActive} onOpen={(id) => void openLesson(id)} onRetry={(job) => void processingQueue.retry(job)} onReselect={(job, files) => void processingQueue.reselect(job, files).catch((error) => setPersistenceNotice(error instanceof Error ? error.message : "Those files did not match this lesson."))} onDiscard={(job) => void processingQueue.discard(job).catch(() => setPersistenceNotice("The lesson could not be discarded safely."))} />
+          {resumableLesson ? <section className="continue-card" aria-labelledby="continue-title"><div><p className="eyebrow">Up next</p><h2 id="continue-title">{resumableLesson.title}</h2><p>{lessonProgress(resumableLesson)}% complete{resumableLesson.lessonState.currentNodeId && resumableLesson.lessonState.nodes[resumableLesson.lessonState.currentNodeId]?.title ? ` · ${resumableLesson.lessonState.nodes[resumableLesson.lessonState.currentNodeId].title}` : ""}</p></div><button className="button-primary" type="button" disabled={workspace.lessonLibraryBusyId !== null} onClick={() => void openLesson(resumableLesson.id)}>Continue</button></section> : <section className="continue-empty" aria-label="Continue learning"><h2>Ready for your next lesson?</h2><p>Your most recent learning will appear here once you begin.</p></section>}
+          {hasRecentLessons && <RecentLessons lessons={workspace.savedLessons.slice(0, 5)} activeLessonId={resumableLesson?.id ?? null} busyLessonId={workspace.lessonLibraryBusyId} onContinue={(id) => void openLesson(id)} onDelete={(saved) => void workspace.requestDeleteSavedLesson(saved)} onNewLesson={startNewLessonFlow} />}
+          <ProcessingQueue jobs={processingQueue.jobs} lessonActive={lessonActive} onOpen={(id) => void openLesson(id)} onRetry={(job) => void processingQueue.retry(job)} onReselect={(job, files) => void processingQueue.reselect(job, files).catch((error) => workspace.setPersistenceNotice(error instanceof Error ? error.message : "Those files did not match this lesson."))} onDiscard={(job) => void processingQueue.discard(job).catch(() => workspace.setPersistenceNotice("The lesson could not be discarded safely."))} />
           <div className="home-create-footer"><button className="button-secondary" type="button" onClick={startNewLessonFlow}>+ Add New Lesson</button></div>
         </section>}
 
-        <div hidden={lessonActive || !persistenceHydrated || appView !== "library" || libraryView !== "index"}>
-          <LessonLibrary lessons={savedLessons} processingJobs={processingQueue.jobs} busyLessonId={lessonLibraryBusyId} onOpen={(lesson) => void openLesson(lesson.id)} onDelete={(lesson) => void requestDeleteSavedLesson(lesson)} onNewLesson={startNewLessonFlow} />
-          {persistenceNotice && !isRedundantPreparationNotice(persistenceNotice) && <p className="session-notice" role="status">{persistenceNotice}</p>}
+        <div hidden={lessonActive || !workspace.persistenceHydrated || appView !== "library" || libraryView !== "index"}>
+          <LessonLibrary lessons={workspace.savedLessons} processingJobs={processingQueue.jobs} busyLessonId={workspace.lessonLibraryBusyId} onOpen={(lesson) => void openLesson(lesson.id)} onDelete={(lesson) => void workspace.requestDeleteSavedLesson(lesson)} onNewLesson={startNewLessonFlow} />
+          {workspace.persistenceNotice && !isRedundantPreparationNotice(workspace.persistenceNotice) && <p className="session-notice" role="status">{workspace.persistenceNotice}</p>}
         </div>
 
-        <div className="product-view profile-view" hidden={lessonActive || !persistenceHydrated || appView !== "profile"}>
+        <div className="product-view profile-view" hidden={lessonActive || !workspace.persistenceHydrated || appView !== "profile"}>
           <div className="view-heading"><div><p className="eyebrow">Your account</p><h1>Profile</h1><p>Manage account access and how your tutor teaches.</p></div></div>
           <CloudAccount
             onDebug={addDebugMessage}
             onAuthResolved={(user: User | null) => {
               const nextUserId = user?.id ?? null;
-              if (workspaceOwnerIdRef.current !== nextUserId) {
-                cloudUploadTimersRef.current.forEach((timer) => clearTimeout(timer));
-                cloudUploadTimersRef.current.clear();
-                workspaceLoadedRef.current = false;
-              }
+              workspace.handleAuthResolved(nextUserId);
               setCloudUserId(nextUserId);
               setCloudAuthReady(true);
             }}
             onBeforeSignOut={async () => {
-              await persistCurrentLesson();
+              await workspace.persistCurrentLesson();
             }}
-            syncState={cloudSyncState}
-            cloudLessonCount={cloudLessonCount}
-            localOnlyLessonCount={localOnlyLessonCount}
-            onSyncNow={() => void syncCurrentAccount()}
-            onImportLocalLessons={() => void importLocalLessons()}
+            syncState={workspace.cloudSyncState}
+            cloudLessonCount={workspace.cloudLessonCount}
+            localOnlyLessonCount={workspace.localOnlyLessonCount}
+            onSyncNow={() => void workspace.syncCurrentAccount()}
+            onImportLocalLessons={() => void workspace.importLocalLessons()}
           />
           <AppearanceSettings appearance={appearance} onChange={setAppearance} />
           <section className="teaching-style" aria-labelledby="profile-preferences-title"><p className="eyebrow">Teaching preferences</p><h2 id="profile-preferences-title">Make lessons feel right for you</h2><TeachingStyleControls preferences={teachingPreferences} onChange={(update) => applyAuthoritativeTeachingPreferences({ ...teachingPreferencesRef.current, ...update })} /></section>
         </div>
 
-        {!lessonActive && persistenceHydrated && appView === "library" && libraryView === "new" && <section className="product-view new-lesson-view" aria-labelledby="new-lesson-title">
+        {!lessonActive && workspace.persistenceHydrated && appView === "library" && libraryView === "new" && <section className="product-view new-lesson-view" aria-labelledby="new-lesson-title">
           <button className="back-button" type="button" onClick={() => setLibraryView("index")}>← Back to Library</button>
           <div className="focused-view-heading"><p className="eyebrow">New lesson</p><h1 id="new-lesson-title">Create New Lesson</h1><p>Turn your learning materials into a focused voice lesson.</p></div>
           <LearningSourceUpload
-            disabled={!persistenceHydrated}
+            disabled={!workspace.persistenceHydrated}
             cloudUserId={cloudUserId}
             onQueueBundle={async (sources, files, title) => {
               await processingQueue.enqueue(sources, files, title);
               setLibraryView("index");
-              setPersistenceNotice("");
+              workspace.setPersistenceNotice("");
             }}
             onDebug={addDebugMessage}
           />
           {userError && <p className="session-error" role="alert">{userError}</p>}
         </section>}
 
-        {!lessonActive && persistenceHydrated && appView === "library" && libraryView === "lesson" && <LessonDetail
+        {!lessonActive && workspace.persistenceHydrated && appView === "library" && libraryView === "lesson" && <LessonDetail
           lesson={selectedSavedLesson}
-          topicInput={topicInput}
+          topicInput={workspace.topicInput}
           requestingPermission={requestingPermission}
-          learningSourceReady={learningSource?.status === "ready"}
-          resumeExistingLesson={resumeExistingLesson}
+          learningSourceReady={workspace.learningSource?.status === "ready"}
+          resumeExistingLesson={workspace.resumeExistingLesson}
           restartable={selectedLessonRestartable}
           restartPending={restartPending}
           restartConfirmationOpen={restartConfirmationOpen}
-          libraryBusy={lessonLibraryBusyId !== null}
+          libraryBusy={workspace.lessonLibraryBusyId !== null}
           userError={userError}
           onBack={() => setLibraryView("index")}
-          onTopicInputChange={setTopicInput}
+          onTopicInputChange={workspace.setTopicInput}
           onStart={startConversation}
           onRequestRestart={() => setRestartConfirmationOpen(true)}
           onCancelRestart={() => setRestartConfirmationOpen(false)}
           onRestart={() => void restartLesson()}
-          onDelete={(lesson) => void requestDeleteSavedLesson(lesson)}
+          onDelete={(lesson) => void workspace.requestDeleteSavedLesson(lesson)}
         />}
 
         {lessonActive && <div className="active-learning-grid">
@@ -2680,15 +2216,15 @@ export default function Home() {
             contract={presentedConcept?.teaching}
             teachingPointIndexes={presentedTeachingPointIndexes}
             presentationKey={presentationKey}
-            sources={lessonSources}
-            lessonId={savedLessonId}
+            sources={workspace.lessonSources}
+            lessonId={workspace.savedLessonId}
             cloudOwnerId={cloudUserId}
             authReady={cloudAuthReady}
             onDebug={addDebugMessage}
           />
           <div className="active-learning-sidebar">
-          {learningSource && <ActiveLessonSummary
-            sourceName={learningSource.name}
+          {workspace.learningSource && <ActiveLessonSummary
+            sourceName={workspace.learningSource.name}
             conceptTitle={currentConcept?.title}
             teachingPreferences={teachingPreferences}
           />}
@@ -2713,7 +2249,7 @@ export default function Home() {
         </div>}
 
         {lessonActive && userError && <p className="session-error" role="alert">{userError}</p>}
-        {lessonActive && persistenceNotice && !isRedundantPreparationNotice(persistenceNotice) && <p className="session-notice" role="status">{persistenceNotice}</p>}
+        {lessonActive && workspace.persistenceNotice && !isRedundantPreparationNotice(workspace.persistenceNotice) && <p className="session-notice" role="status">{workspace.persistenceNotice}</p>}
 
         {lessonActive && <div className="teaching-controls-stack">
         {lessonActive && <ConversationStatusRow
@@ -2753,21 +2289,21 @@ export default function Home() {
           onClick={microphoneActive ? () => void stopConversation() : startConversation}
           disabled={
             requestingPermission ||
-            (!microphoneActive && (!persistenceHydrated || learningSource?.status !== "ready"))
+            (!microphoneActive && (!workspace.persistenceHydrated || workspace.learningSource?.status !== "ready"))
           }
         >
           {microphoneActive
             ? "End Lesson"
             : requestingPermission
               ? "Requesting Permission..."
-              : resumeExistingLesson
+              : workspace.resumeExistingLesson
                 ? "Continue Lesson"
                 : "Start Conversation"}
         </button>}
 
         {process.env.NODE_ENV === "development" && <DeveloperDebugPanel
           lessonState={lessonState}
-          lessonSources={lessonSources}
+          lessonSources={workspace.lessonSources}
           transportState={transportState}
           engagementState={engagementState}
           lessonActive={lessonActive}
