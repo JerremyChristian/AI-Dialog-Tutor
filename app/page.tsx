@@ -29,10 +29,7 @@ import type {
   LessonSource,
   PreparedLearningSource,
 } from "../lib/learning-source";
-import {
-  MicrophonePcmStreamer,
-  PcmAudioPlayer,
-} from "../lib/realtime-audio";
+import { AudioSession } from "../lib/audio-session";
 import {
   ACOUSTIC_ACTIVITY_MULTIPLIER,
   ACOUSTIC_LOG_COOLDOWN_MS,
@@ -287,10 +284,8 @@ export default function Home() {
   const lessonHydrationGenerationRef = useRef(0);
   const workspaceLoadedRef = useRef(false);
 
-  const streamRef = useRef<MediaStream | null>(null);
   const transportRef = useRef<LiveTransportManager | null>(null);
-  const microphoneStreamerRef = useRef<MicrophonePcmStreamer | null>(null);
-  const playerRef = useRef<PcmAudioPlayer | null>(null);
+  const audioSessionRef = useRef<AudioSession | null>(null);
   const tokenRequestRef = useRef<AbortController | null>(null);
   const isMountedRef = useRef(true);
   const conversationRunRef = useRef(0);
@@ -314,7 +309,6 @@ export default function Home() {
   const toolResultsRef = useRef(new Map<string, Record<string, unknown>>());
   const cancelledToolCallIdsRef = useRef(new Set<string>());
   const nextMessageIdRef = useRef(0);
-  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const lessonActiveRef = useRef(false);
   const lessonStartupPendingRef = useRef(false);
   const engagementStateRef = useRef<EngagementState>("ended");
@@ -360,6 +354,10 @@ export default function Home() {
       },
     ]);
   }, []);
+
+  // One page-lifetime instance; created lazily so renders do not construct it.
+  audioSessionRef.current ??= new AudioSession(addDebugMessage);
+  const audioSession = audioSessionRef.current;
 
   useEffect(() => installTestObservabilityBridge(() => {
     const state = lessonStateRef.current;
@@ -437,7 +435,7 @@ export default function Home() {
     if (!active) return;
     active.cancelled = true;
     activeTeachingBeatRef.current = null;
-    playerRef.current?.cancelBatch(active.generationEpoch);
+    audioSession.player?.cancelBatch(active.generationEpoch);
     generationEpochRef.current += 1;
     emitTestEvent("audio.epoch-invalidated", {
       reason,
@@ -465,7 +463,7 @@ export default function Home() {
     const presentation = createPresentationBeat(resolved, concept.id);
     presentationBeatRef.current = presentation;
     setPresentationBeat(presentation);
-    playerRef.current?.beginBatch(generationEpoch, (epoch) => {
+    audioSession.player?.beginBatch(generationEpoch, (epoch) => {
       const current = activeTeachingBeatRef.current;
       if (!current || current.generationEpoch !== epoch) {
         addDebugMessage(`Teaching beat stale event ignored: epoch=${epoch}`);
@@ -512,7 +510,7 @@ export default function Home() {
     const presentation = createPresentationBeat(resolved, concept.id);
     presentationBeatRef.current = presentation;
     setPresentationBeat(presentation);
-    playerRef.current?.beginBatch(generationEpoch, (epoch) => {
+    audioSession.player?.beginBatch(generationEpoch, (epoch) => {
       const current = activeTeachingBeatRef.current;
       if (!current || current.generationEpoch !== epoch) return;
       current.audioNaturallyDrained = true;
@@ -562,7 +560,7 @@ export default function Home() {
     reviewResumeGuardRef.current = plan.reviewResumeGuard;
     if (plan.invalidateReviewBeat) {
       invalidateActiveTeachingBeat(`node-review-${reason}`);
-      playerRef.current?.clear();
+      audioSession.player?.clear();
     }
     nodeReviewRef.current = null;
     setNodeReview(null);
@@ -585,7 +583,7 @@ export default function Home() {
     const generationEpoch = ++generationEpochRef.current;
     closingTurnRef.current = createFarewellTurn(conversationRunRef.current, generationEpoch);
     setFarewellFinishing(true);
-    playerRef.current?.beginBatch(generationEpoch, (epoch) => {
+    audioSession.player?.beginBatch(generationEpoch, (epoch) => {
       const farewell = closingTurnRef.current;
       if (!isFarewellDrainCurrent(farewell, conversationRunRef.current, epoch, generationEpochRef.current)) return;
       farewell.audioNaturallyDrained = true;
@@ -609,7 +607,7 @@ export default function Home() {
       nodeReviewRef.current = nextReview;
       setNodeReview(nextReview);
       activeTeachingBeatRef.current = null;
-      playerRef.current?.cancelBatch(epoch);
+      audioSession.player?.cancelBatch(epoch);
       addDebugMessage(`Node review beat committed: concept=${nextReview.nodeId}, next=${nextIndex}, complete=${complete}`);
       emitTestEvent("beat.commit", { mode: "review", conceptId: nextReview.nodeId, nextIndex });
       addReviewFlowDiagnostic(
@@ -633,7 +631,7 @@ export default function Home() {
     emitTestEvent("delivery.cursor-changed", { conceptId: active.conceptId, from: currentNext, to: nextIndex });
     emitTestEvent("coverage.changed", { conceptId: active.conceptId, status: committedState.nodes[active.conceptId]?.status });
     activeTeachingBeatRef.current = null;
-    playerRef.current?.cancelBatch(epoch);
+    audioSession.player?.cancelBatch(epoch);
     addDebugMessage(
       `Teaching beat committed: concept=${active.conceptId}, points=${active.teachingPointIndexes[0]}-${active.teachingPointIndexes.at(-1)}, nextTeachingPointIndex=${nextIndex}`,
     );
@@ -657,19 +655,14 @@ export default function Home() {
     tokenRequestRef.current?.abort();
     tokenRequestRef.current = null;
 
-    const microphoneStreamer = microphoneStreamerRef.current;
-    microphoneStreamerRef.current = null;
-    await microphoneStreamer?.stop();
+    await audioSession.stopStreamer();
 
     transportRef.current?.close(sendAudioStreamEnd);
     transportRef.current = null;
 
-    streamRef.current?.getAudioTracks().forEach((track) => track.stop());
-    streamRef.current = null;
+    audioSession.stopTracks();
 
-    const player = playerRef.current;
-    playerRef.current = null;
-    await player?.close();
+    await audioSession.closePlayer();
     assistantSpeakingRef.current = false;
     learnerActivityRunRef.current = null;
     typedInterruptionHandledRef.current = false;
@@ -690,8 +683,7 @@ export default function Home() {
     setShowLessonComplete(false);
     if (completionAnimationTimerRef.current) clearTimeout(completionAnimationTimerRef.current);
     completionAnimationTimerRef.current = null;
-    await wakeLockRef.current?.release().catch(() => undefined);
-    wakeLockRef.current = null;
+    await audioSession.releaseWakeLock();
     if (engagementTimerRef.current) clearInterval(engagementTimerRef.current);
     if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
     if (quickResponseTimerRef.current) clearTimeout(quickResponseTimerRef.current);
@@ -717,16 +709,6 @@ export default function Home() {
     meaningfulConfirmationSpeechRef.current = false;
     silentLessonRecoveryPendingRef.current = false;
     lastMeaningfulLearnerTranscriptRef.current = "";
-  };
-
-  const requestWakeLock = async () => {
-    if (!("wakeLock" in navigator) || document.visibilityState !== "visible") return;
-    try {
-      wakeLockRef.current = await navigator.wakeLock.request("screen");
-      addDebugMessage("Screen wake lock active");
-    } catch {
-      addDebugMessage("Screen wake lock unavailable");
-    }
   };
 
   const updateEngagementState = (state: EngagementState) => {
@@ -1125,7 +1107,7 @@ export default function Home() {
     if (nodeReviewRef.current) exitNodeReview();
     if (node.id === lessonStateRef.current.currentNodeId || node.childrenIds.length) return;
     invalidateActiveTeachingBeat("roadmap-navigation");
-    playerRef.current?.clear();
+    audioSession.player?.clear();
     assistantSpeakingRef.current = false;
     transportRef.current?.setAssistantSpeaking(false);
     const path = [node.title];
@@ -1203,7 +1185,7 @@ export default function Home() {
       if (muted && transportRef.current?.getInterruptionContinuity().learnerUtteranceOpen) {
         // Keep forwarding enabled until the worklet confirms every PCM sample
         // produced before the explicit mute boundary has reached the transport.
-        await microphoneStreamerRef.current?.flushPendingAudio();
+        await audioSession.flushPendingMicrophoneAudio();
       }
       microphoneMutedRef.current = muted;
       transportRef.current?.setMicrophoneForwardingEnabled(!muted);
@@ -1451,9 +1433,9 @@ export default function Home() {
 
     const onVisibilityChange = () => {
       if (document.visibilityState === "visible" && lessonActiveRef.current) {
-        void requestWakeLock();
+        void audioSession.requestWakeLock();
         transportRef.current?.ensureHealthy();
-        void playerRef.current?.prepare().catch(() => {
+        void audioSession.player?.prepare().catch(() => {
           setUserError("Audio was suspended. End the lesson, then start again.");
           addDebugMessage("Audio context could not resume after backgrounding");
         });
@@ -1476,7 +1458,7 @@ export default function Home() {
     // Gemini cuts playback immediately. Smoothing a mid-phoneme cutoff is a
     // later UX refinement; yielding to the learner remains the priority.
     invalidateActiveTeachingBeat("barge-in");
-    playerRef.current?.clear();
+    audioSession.player?.clear();
     assistantSpeakingRef.current = false;
     typedInterruptionHandledRef.current = false;
     const interruption = transportRef.current?.registerInterruption(
@@ -1743,7 +1725,7 @@ export default function Home() {
             }
             addDebugMessage("Assistant response started");
           }
-          playerRef.current?.play(event.data);
+          audioSession.player?.play(event.data);
           break;
         }
 
@@ -1757,13 +1739,13 @@ export default function Home() {
             active.generationComplete = true;
             if (active.mode === "review") addReviewFlowDiagnostic("review-generation-complete");
             addDebugMessage(`Teaching generation complete: epoch=${active.generationEpoch}`);
-            playerRef.current?.completeBatch(active.generationEpoch);
+            audioSession.player?.completeBatch(active.generationEpoch);
           }
           if (closing) {
             if (!isCurrentFarewell(closing, conversationRunRef.current, generationEpochRef.current)) return;
             closing.generationComplete = true;
             addDebugMessage("FAREWELL_FLOW generation-complete");
-            playerRef.current?.completeBatch(closing.generationEpoch);
+            audioSession.player?.completeBatch(closing.generationEpoch);
             maybeFinishFarewell();
           }
           if (!active && !closing) assistantSpeakingRef.current = false;
@@ -1988,7 +1970,7 @@ export default function Home() {
       } else if (lessonCall?.kind === "transition") {
         const moveAction = lessonCall.action;
         invalidateActiveTeachingBeat(`lesson-${moveAction}`);
-        playerRef.current?.clear();
+        audioSession.player?.clear();
         const transition = moveAction === "navigate"
           ? navigateLessonState(lessonStateRef.current, lessonCall.conceptId)
           : skipLessonNode(lessonStateRef.current, lessonCall.conceptId);
@@ -2084,7 +2066,7 @@ export default function Home() {
     const plan = planExitNodeReview(nodeReviewRef.current);
     if (!plan) return;
     invalidateActiveTeachingBeat("node-review-exited");
-    playerRef.current?.clear();
+    audioSession.player?.clear();
     nodeReviewRef.current = null;
     reviewResumeGuardRef.current = plan.reviewResumeGuard;
     setNodeReview(null);
@@ -2100,7 +2082,7 @@ export default function Home() {
       closingActive: Boolean(closingTurnRef.current),
     })) return;
     invalidateActiveTeachingBeat("node-review-started");
-    playerRef.current?.clear();
+    audioSession.player?.clear();
     const review = createNodeReview(node.id, presentationBeatRef.current);
     nodeReviewRef.current = review;
     reviewResumeGuardRef.current = false;
@@ -2224,36 +2206,28 @@ export default function Home() {
     setAiConnectionStatus("Not connected");
     addDebugMessage("Microphone permission requested");
 
-    const player = new PcmAudioPlayer();
-    playerRef.current = player;
-    const playerReady = player.prepare();
+    // Synchronous inside the click: prepare() resumes playback for iOS, then
+    // getUserMedia starts in the same tick. Permission is awaited before playerReady.
+    const { player, ready: playerReady } = audioSession.createPlayer();
 
     try {
-      if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error("Microphone access is not supported by this browser");
-      }
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await audioSession.requestMicrophone();
       if (!isMountedRef.current || run !== conversationRunRef.current) {
         stream.getAudioTracks().forEach((track) => track.stop());
         await player.close();
         return;
       }
 
-      streamRef.current = stream;
-      const audioTrack = stream.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.addEventListener("ended", () => {
-          if (!isMountedRef.current || run !== conversationRunRef.current) return;
-          setUserError("The microphone stopped unexpectedly. Start the lesson again.");
-          addDebugMessage("Microphone stream ended unexpectedly");
-          conversationRunRef.current += 1;
-          setMicrophoneStatus("Not active");
-          setAiConnectionStatus("Not connected");
-          updateLessonState((current) => ({ ...current, status: "idle" }));
-          void disposeResources(false);
-        }, { once: true });
-      }
+      audioSession.attachStream(stream, () => {
+        if (!isMountedRef.current || run !== conversationRunRef.current) return;
+        setUserError("The microphone stopped unexpectedly. Start the lesson again.");
+        addDebugMessage("Microphone stream ended unexpectedly");
+        conversationRunRef.current += 1;
+        setMicrophoneStatus("Not active");
+        setAiConnectionStatus("Not connected");
+        updateLessonState((current) => ({ ...current, status: "idle" }));
+        void disposeResources(false);
+      });
       setMicrophoneStatus("Active");
       addDebugMessage("Microphone active");
       await playerReady;
@@ -2295,7 +2269,7 @@ export default function Home() {
             );
             reviewRecoveryPendingRef.current = true;
             invalidateActiveTeachingBeat("transport-recovery");
-            playerRef.current?.clear();
+            audioSession.player?.clear();
           } else if (state === "active" && reviewRecoveryPendingRef.current) {
             reviewRecoveryPendingRef.current = false;
             addReviewFlowDiagnostic("recovery-complete", "recoveryIncludesReview=false");
@@ -2379,7 +2353,7 @@ export default function Home() {
       addDebugMessage("Source seeded into Live context");
       addDebugMessage("Source grounding ready");
 
-      const microphoneStreamer = new MicrophonePcmStreamer(stream, (chunk) => {
+      const microphoneStreamer = audioSession.createStreamer(stream, (chunk) => {
         if (run !== conversationRunRef.current || transportRef.current !== transport) return;
         const rms = pcm16Rms(chunk);
         noiseFloorRef.current += (rms - noiseFloorRef.current) * NOISE_FLOOR_SMOOTHING;
@@ -2391,7 +2365,6 @@ export default function Home() {
         }
         if (!microphoneMutedRef.current && !closingTurnRef.current) transport.sendAudio(chunk);
       });
-      microphoneStreamerRef.current = microphoneStreamer;
       await microphoneStreamer.start();
 
       if (!isMountedRef.current || run !== conversationRunRef.current) {
@@ -2410,7 +2383,7 @@ export default function Home() {
       lessonActiveRef.current = true;
       lessonStartupPendingRef.current = false;
       beginIdleMonitoring();
-      void requestWakeLock();
+      void audioSession.requestWakeLock();
       if (lessonWrapUpRef.current) {
         addDebugMessage("Completed lesson restored in wrap-up");
         transportRef.current?.sendRealtimeInput({ text: LESSON_WRAP_UP_CONTROL });
@@ -2453,7 +2426,7 @@ export default function Home() {
         return;
       }
 
-      if (streamRef.current) {
+      if (audioSession.hasMicrophoneStream) {
         setAiConnectionStatus("Error");
         const message = getRealtimeErrorMessage(error);
         if (message.toLowerCase().includes("source")) {
@@ -2480,8 +2453,8 @@ export default function Home() {
   const stopConversation = async (reason?: "inactivity" | "confirmed") => {
     conversationRunRef.current += 1;
     invalidateActiveTeachingBeat("lesson-ended");
-    playerRef.current?.clear();
-    const hadMicrophone = Boolean(streamRef.current);
+    audioSession.player?.clear();
+    const hadMicrophone = audioSession.hasMicrophoneStream;
     const hadSession = Boolean(transportRef.current);
     const currentBeforeStop = getCurrentConcept(lessonStateRef.current);
     const checkpoint = deriveResumePoint(assistantTranscriptRef.current, "");
