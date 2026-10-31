@@ -43,6 +43,7 @@ export async function installFakeLive(page: Page, options: {
   holdFirstPlayerReady?: boolean;
   holdFirstTokenResponse?: boolean;
   holdFirstStreamerClose?: boolean;
+  failTokenRequest?: number;
 } = {}) {
   await page.route("**/auth/v1/**", (route) => route.fulfill({
     status: 401, contentType: "application/json", body: JSON.stringify({ message: "Not signed in" }),
@@ -58,12 +59,37 @@ export async function installFakeLive(page: Page, options: {
     if (firstTokenResponseReady && (tokenRequests.get(page) ?? 0) === 1) {
       await firstTokenResponseReady;
     }
+    if ((tokenRequests.get(page) ?? 0) === options.failTokenRequest) {
+      return route.fulfill({
+        status: 503, contentType: "application/json",
+        body: JSON.stringify({ error: "QA token request failed" }),
+      });
+    }
     return route.fulfill({
       status: 200, contentType: "application/json",
       body: JSON.stringify({ token: "local-test-token", source: { name: "plc-notes.txt", mimeType: "text/plain" } }),
     });
   });
   await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences, schemaVersion, cloudOwnerId, secondLesson, holdFirstPlayerReady, holdFirstStreamerClose }) => {
+    let wakeLockCount = 0;
+    const releasedWakeLocks = new Set<number>();
+    Object.defineProperty(navigator, "wakeLock", {
+      configurable: true,
+      value: {
+        request: async () => {
+          const wakeLockIndex = wakeLockCount++;
+          return {
+            release: async () => { releasedWakeLocks.add(wakeLockIndex); },
+          };
+        },
+      },
+    });
+    Reflect.set(window, "__QA_WAKE_LOCK__", {
+      requestCount: () => wakeLockCount,
+      releaseCount: () => releasedWakeLocks.size,
+      isReleased: (index: number) => releasedWakeLocks.has(index),
+    });
+
     if (holdFirstStreamerClose) {
       const NativeAudioContext = window.AudioContext;
       let playerCount = 0;
@@ -74,8 +100,6 @@ export async function installFakeLive(page: Page, options: {
         releaseFirstStreamerClose = resolve;
       });
       const closedPlayers = new Set<number>();
-      let wakeLockCount = 0;
-      const releasedWakeLocks = new Set<number>();
       class DisposalGatedAudioContext {
         constructor(options?: AudioContextOptions) {
           const context = new NativeAudioContext(options);
@@ -99,17 +123,6 @@ export async function installFakeLive(page: Page, options: {
       Object.defineProperty(window, "AudioContext", {
         configurable: true,
         value: DisposalGatedAudioContext,
-      });
-      Object.defineProperty(navigator, "wakeLock", {
-        configurable: true,
-        value: {
-          request: async () => {
-            const wakeLockIndex = wakeLockCount++;
-            return {
-              release: async () => { releasedWakeLocks.add(wakeLockIndex); },
-            };
-          },
-        },
       });
       Reflect.set(window, "__QA_DISPOSAL__", {
         isHeld: () => firstStreamerCloseStarted,
@@ -214,6 +227,7 @@ export async function installFakeLive(page: Page, options: {
       };
       Reflect.set(window, "__QA_MICROPHONE__", {
         hasStream: () => Boolean(microphoneStream),
+        trackState: () => microphoneStream?.getAudioTracks()[0]?.readyState ?? null,
         endTrack: () => microphoneStream?.getAudioTracks()[0]?.dispatchEvent(new Event("ended")),
       });
     }
