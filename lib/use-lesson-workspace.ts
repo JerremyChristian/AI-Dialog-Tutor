@@ -350,7 +350,8 @@ export function useLessonWorkspace(input: LessonWorkspaceInput) {
       }
       await deleteSavedLesson(saved.id);
       setSavedLessons((current) => current.filter((lesson) => lesson.id !== saved.id));
-      if (savedLessonIdRef.current === saved.id) {
+      if (savedLessonIdRef.current === saved.id &&
+          !lessonActiveRef.current && !lessonStartupPendingRef.current) {
         resetIdleLessonWorkspace();
         onCurrentLessonDeleted();
       }
