@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import {
   deliverLive, endMicrophoneTrack, getExternalRequests, getLiveSends, installFakeLive,
   getTokenRequestCount, installNoExternalNetworkGuard, openLessonAndStart, QA_LESSON_ID,
-  readTestState, releaseFirstPlayerReady, releaseFirstTokenResponse,
+  readTestState, releaseFirstPlayerReady, releaseFirstStreamerClose, releaseFirstTokenResponse,
 } from "../helpers/fake-live";
 
 const learnerAudioCount = async (page: Parameters<typeof getLiveSends>[0]) =>
@@ -87,6 +87,36 @@ test("a stale startup cannot clear startupPending owned by a newer startup", asy
   await expect.poll(async () => (await readTestState(page)).snapshot.lessonActive).toBe(true);
 
   expect(startupPendingWhileRunBIsHeld).toBe(true);
+});
+
+test("stale disposal cannot close the newer run's playback player", async ({ page }) => {
+  await installNoExternalNetworkGuard(page);
+  await installFakeLive(page, { persisted: true, holdFirstStreamerClose: true });
+  await openLessonAndStart(page, true);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.playerCount())).toBe(1);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.wakeLockCount())).toBe(1);
+
+  await endMicrophoneTrack(page);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.isHeld())).toBe(true);
+
+  await page.getByRole("button", { name: "Continue Lesson", exact: true }).click();
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.playerCount())).toBe(2);
+  await expect.poll(async () => (await readTestState(page)).snapshot.lessonActive).toBe(true);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.wakeLockCount())).toBe(2);
+
+  await releaseFirstStreamerClose(page);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.wakeLockReleaseCount())).toBe(1);
+
+  const newerPlayerClosed = await page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__").isPlayerClosed(1) as boolean);
+  expect(getExternalRequests(page)).toEqual([]);
+  expect(newerPlayerClosed).toBe(false);
 });
 
 test("fake microphone starts and mute gates learner PCM until unmuted", async ({ page }) => {

@@ -42,6 +42,7 @@ export async function installFakeLive(page: Page, options: {
   secondLesson?: boolean;
   holdFirstPlayerReady?: boolean;
   holdFirstTokenResponse?: boolean;
+  holdFirstStreamerClose?: boolean;
 } = {}) {
   await page.route("**/auth/v1/**", (route) => route.fulfill({
     status: 401, contentType: "application/json", body: JSON.stringify({ message: "Not signed in" }),
@@ -62,7 +63,64 @@ export async function installFakeLive(page: Page, options: {
       body: JSON.stringify({ token: "local-test-token", source: { name: "plc-notes.txt", mimeType: "text/plain" } }),
     });
   });
-  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences, schemaVersion, cloudOwnerId, secondLesson, holdFirstPlayerReady }) => {
+  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences, schemaVersion, cloudOwnerId, secondLesson, holdFirstPlayerReady, holdFirstStreamerClose }) => {
+    if (holdFirstStreamerClose) {
+      const NativeAudioContext = window.AudioContext;
+      let playerCount = 0;
+      let streamerCount = 0;
+      let firstStreamerCloseStarted = false;
+      let releaseFirstStreamerClose: (() => void) | null = null;
+      const firstStreamerCloseReady = new Promise<void>((resolve) => {
+        releaseFirstStreamerClose = resolve;
+      });
+      const closedPlayers = new Set<number>();
+      let wakeLockCount = 0;
+      const releasedWakeLocks = new Set<number>();
+      class DisposalGatedAudioContext {
+        constructor(options?: AudioContextOptions) {
+          const context = new NativeAudioContext(options);
+          const playerIndex = options?.sampleRate === 24_000 ? playerCount++ : -1;
+          const streamerIndex = playerIndex === -1 ? streamerCount++ : -1;
+          const nativeClose = context.close.bind(context);
+          Object.defineProperty(context, "close", {
+            configurable: true,
+            value: async () => {
+              if (playerIndex >= 0) closedPlayers.add(playerIndex);
+              if (streamerIndex === 0) {
+                firstStreamerCloseStarted = true;
+                await firstStreamerCloseReady;
+              }
+              if (context.state !== "closed") await nativeClose();
+            },
+          });
+          return context;
+        }
+      }
+      Object.defineProperty(window, "AudioContext", {
+        configurable: true,
+        value: DisposalGatedAudioContext,
+      });
+      Object.defineProperty(navigator, "wakeLock", {
+        configurable: true,
+        value: {
+          request: async () => {
+            const wakeLockIndex = wakeLockCount++;
+            return {
+              release: async () => { releasedWakeLocks.add(wakeLockIndex); },
+            };
+          },
+        },
+      });
+      Reflect.set(window, "__QA_DISPOSAL__", {
+        isHeld: () => firstStreamerCloseStarted,
+        release: () => releaseFirstStreamerClose?.(),
+        playerCount: () => playerCount,
+        isPlayerClosed: (index: number) => closedPlayers.has(index),
+        wakeLockCount: () => wakeLockCount,
+        wakeLockReleaseCount: () => releasedWakeLocks.size,
+      });
+    }
+
     if (holdFirstPlayerReady) {
       const NativeAudioContext = window.AudioContext;
       let firstPlayerContext = true;
@@ -235,6 +293,7 @@ export async function installFakeLive(page: Page, options: {
     cloudOwnerId: options.cloudOwnerId ?? null,
     secondLesson: options.secondLesson ?? false,
     holdFirstPlayerReady: options.holdFirstPlayerReady ?? false,
+    holdFirstStreamerClose: options.holdFirstStreamerClose ?? false,
   });
 }
 
@@ -252,6 +311,14 @@ export async function releaseFirstPlayerReady(page: Page) {
   await page.evaluate(() => {
     const gate = Reflect.get(window, "__QA_PLAYER_READY__") as { release?: () => void } | undefined;
     if (!gate?.release) throw new Error("Player-ready gate was not installed");
+    gate.release();
+  });
+}
+
+export async function releaseFirstStreamerClose(page: Page) {
+  await page.evaluate(() => {
+    const gate = Reflect.get(window, "__QA_DISPOSAL__") as { release?: () => void } | undefined;
+    if (!gate?.release) throw new Error("Streamer-close gate was not installed");
     gate.release();
   });
 }
