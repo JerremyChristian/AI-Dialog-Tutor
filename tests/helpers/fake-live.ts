@@ -9,6 +9,11 @@ export async function installFakeLive(page: Page, options: {
   reviewReady?: boolean;
   completed?: boolean;
   microphoneFailure?: string;
+  persistedCursor?: number;
+  persistedStatus?: "idle" | "teaching" | "interrupted";
+  resumePoint?: string;
+  recentTeachingContext?: Array<{ conceptId: string; excerpt: string }>;
+  teachingPreferences?: { explanationDepth: "brief" | "normal" | "detailed"; speakingSpeed: "slow" | "normal" | "fast" };
 } = {}) {
   await page.route("**/auth/v1/**", (route) => route.fulfill({
     status: 401, contentType: "application/json", body: JSON.stringify({ message: "Not signed in" }),
@@ -17,7 +22,7 @@ export async function installFakeLive(page: Page, options: {
     status: 200, contentType: "application/json",
     body: JSON.stringify({ token: "local-test-token", source: { name: "plc-notes.txt", mimeType: "text/plain" } }),
   }));
-  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure }) => {
+  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences }) => {
     const NativeWebSocket = window.WebSocket;
     const sockets: FakeLiveWebSocket[] = [];
     const sends: Array<{ socketId: number; message: Record<string, unknown> }> = [];
@@ -103,12 +108,15 @@ export async function installFakeLive(page: Page, options: {
           objective: "Define a programmable logic controller.", teachingPoints: ["PLC means programmable logic controller.", "PLCs coordinate industrial inputs and outputs."],
           completionCriteria: ["Explain the role of a PLC."], deliveryUnits: [{ objective: "Introduce the PLC definition and role.", teachingPointIndexes: [0, 1], completionCriteriaIndexes: [0], presentationBeats: [{ teachingPointIndexes: [0] }, { teachingPointIndexes: [1] }] }], type: "definition", importance: "core",
         } }, ...(reviewReady ? [{ id: "plc-scan-cycle", title: "PLC scan cycle", parentId: null, order: 1, teaching: secondNode.teaching }] : [])] } },
-      lessonState: { topic: "PLC fundamentals", objective: "Understand PLC fundamentals.", status: "idle", currentNodeId: reviewReady ? "plc-scan-cycle" : "what-is-a-plc", rootNodeIds: reviewReady ? ["what-is-a-plc", "plc-scan-cycle"] : ["what-is-a-plc"], nodes: {
+      lessonState: { topic: "PLC fundamentals", objective: "Understand PLC fundamentals.", status: persistedStatus, currentNodeId: reviewReady ? "plc-scan-cycle" : "what-is-a-plc", rootNodeIds: reviewReady ? ["what-is-a-plc", "plc-scan-cycle"] : ["what-is-a-plc"], nodes: {
         "what-is-a-plc": firstNode,
         ...(reviewReady ? { "plc-scan-cycle": secondNode } : {}),
-      }, teachingContractProgress: { "what-is-a-plc": { nextTeachingPointIndex: reviewReady || completed ? 2 : 0 }, ...(reviewReady ? { "plc-scan-cycle": { nextTeachingPointIndex: 0 } } : {}) }, resumePoint: persisted || completed ? "after introducing the PLC definition" : "", interruptionCount: 0, lastUserTranscript: "", lastAssistantTranscript: persisted || completed ? "A PLC is a rugged industrial computer." : "" },
-      recentTeachingContext: persisted ? [{ conceptId: "what-is-a-plc", excerpt: "A PLC is a rugged industrial computer." }] : [], teachingPreferences: { explanationDepth: "normal", speakingSpeed: "normal" }, createdAt: now, updatedAt: now,
+      }, teachingContractProgress: { "what-is-a-plc": { nextTeachingPointIndex: persistedCursor }, ...(reviewReady ? { "plc-scan-cycle": { nextTeachingPointIndex: 0 } } : {}) }, resumePoint, interruptionCount: persistedStatus === "interrupted" ? 1 : 0, lastUserTranscript: "not persisted by snapshots", lastAssistantTranscript: "not persisted by snapshots" },
+      recentTeachingContext, teachingPreferences, createdAt: now, updatedAt: now,
     };
+    const seedMarker = `__qa_lesson_seeded__:${lessonId}`;
+    if (sessionStorage.getItem(seedMarker)) return;
+    sessionStorage.setItem(seedMarker, "true");
     const request = indexedDB.open("ai-dialog-tutor", 2);
     request.onupgradeneeded = () => { const db = request.result;
       if (!db.objectStoreNames.contains("savedLessons")) db.createObjectStore("savedLessons", { keyPath: "id" }).createIndex("updatedAt", "updatedAt");
@@ -122,6 +130,11 @@ export async function installFakeLive(page: Page, options: {
     reviewReady: options.reviewReady ?? false,
     completed: options.completed ?? false,
     microphoneFailure: options.microphoneFailure ?? "",
+    persistedCursor: options.persistedCursor ?? (options.reviewReady || options.completed ? 2 : 0),
+    persistedStatus: options.persistedStatus ?? "idle",
+    resumePoint: options.resumePoint ?? (options.persisted || options.completed ? "after introducing the PLC definition" : ""),
+    recentTeachingContext: options.recentTeachingContext ?? (options.persisted ? [{ conceptId: "what-is-a-plc", excerpt: "A PLC is a rugged industrial computer." }] : []),
+    teachingPreferences: options.teachingPreferences ?? { explanationDepth: "normal", speakingSpeed: "normal" },
   });
 }
 
@@ -152,4 +165,16 @@ export async function endMicrophoneTrack(page: Page) {
 }
 export async function failActiveSocket(page: Page) { await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").failActive()); }
 export async function readTestState(page: Page) { return page.evaluate(() => ({ snapshot: window.__AI_TEACHER_TEST__!.getSnapshot(), events: window.__AI_TEACHER_TEST__!.getEvents() })); }
+export async function readSavedLesson<T = Record<string, unknown>>(page: Page, id = QA_LESSON_ID): Promise<T | undefined> {
+  return page.evaluate((lessonId) => new Promise<T | undefined>((resolve, reject) => {
+    const request = indexedDB.open("ai-dialog-tutor", 2);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      const get = db.transaction("savedLessons", "readonly").objectStore("savedLessons").get(lessonId);
+      get.onerror = () => { db.close(); reject(get.error); };
+      get.onsuccess = () => { db.close(); resolve(get.result as T | undefined); };
+    };
+  }), id);
+}
 export function textOf(message: Record<string, unknown>) { return JSON.stringify(message); }
