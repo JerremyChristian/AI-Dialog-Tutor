@@ -6,6 +6,7 @@ export type LiveSend = { socketId: number; message: Record<string, unknown> };
 
 const externalRequests = new WeakMap<Page, string[]>();
 const tokenRequests = new WeakMap<Page, number>();
+const tokenResponseReleases = new WeakMap<Page, () => void>();
 
 export async function installNoExternalNetworkGuard(page: Page) {
   const blocked: string[] = [];
@@ -40,13 +41,22 @@ export async function installFakeLive(page: Page, options: {
   cloudOwnerId?: string | null;
   secondLesson?: boolean;
   holdFirstPlayerReady?: boolean;
+  holdFirstTokenResponse?: boolean;
 } = {}) {
   await page.route("**/auth/v1/**", (route) => route.fulfill({
     status: 401, contentType: "application/json", body: JSON.stringify({ message: "Not signed in" }),
   }));
   tokenRequests.set(page, 0);
-  await page.route("**/api/gemini-token", (route) => {
+  let releaseFirstTokenResponse: (() => void) | undefined;
+  const firstTokenResponseReady = options.holdFirstTokenResponse
+    ? new Promise<void>((resolve) => { releaseFirstTokenResponse = resolve; })
+    : undefined;
+  if (releaseFirstTokenResponse) tokenResponseReleases.set(page, releaseFirstTokenResponse);
+  await page.route("**/api/gemini-token", async (route) => {
     tokenRequests.set(page, (tokenRequests.get(page) ?? 0) + 1);
+    if (firstTokenResponseReady && (tokenRequests.get(page) ?? 0) === 1) {
+      await firstTokenResponseReady;
+    }
     return route.fulfill({
       status: 200, contentType: "application/json",
       body: JSON.stringify({ token: "local-test-token", source: { name: "plc-notes.txt", mimeType: "text/plain" } }),
@@ -230,6 +240,12 @@ export async function installFakeLive(page: Page, options: {
 
 export function getTokenRequestCount(page: Page) {
   return tokenRequests.get(page) ?? 0;
+}
+
+export function releaseFirstTokenResponse(page: Page) {
+  const release = tokenResponseReleases.get(page);
+  if (!release) throw new Error("Token-response gate was not installed");
+  release();
 }
 
 export async function releaseFirstPlayerReady(page: Page) {

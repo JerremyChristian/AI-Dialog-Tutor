@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import {
   deliverLive, endMicrophoneTrack, getExternalRequests, getLiveSends, installFakeLive,
   getTokenRequestCount, installNoExternalNetworkGuard, openLessonAndStart, QA_LESSON_ID,
-  readTestState, releaseFirstPlayerReady,
+  readTestState, releaseFirstPlayerReady, releaseFirstTokenResponse,
 } from "../helpers/fake-live";
 
 const learnerAudioCount = async (page: Parameters<typeof getLiveSends>[0]) =>
@@ -43,6 +43,50 @@ test("a startup made stale while playerReady is pending cannot request a token",
     tokenRequests: getTokenRequestCount(page),
     socketCount: await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").socketCount()),
   })).toEqual({ tokenRequests: 1, socketCount: 1 });
+});
+
+test("a stale startup cannot clear startupPending owned by a newer startup", async ({ page }) => {
+  await installNoExternalNetworkGuard(page);
+  await installFakeLive(page, {
+    persisted: true,
+    holdFirstPlayerReady: true,
+    holdFirstTokenResponse: true,
+  });
+  await page.goto("/");
+  await page.waitForFunction((id) => new Promise<boolean>((resolve) => {
+    const request = indexedDB.open("ai-dialog-tutor", 2);
+    request.onsuccess = () => {
+      const db = request.result;
+      const lookup = db.transaction("savedLessons", "readonly").objectStore("savedLessons").get(id);
+      lookup.onsuccess = () => { db.close(); resolve(Boolean(lookup.result)); };
+    };
+  }), QA_LESSON_ID);
+  await page.reload();
+  await expect.poll(() => page.evaluate(() =>
+    window.__AI_TEACHER_TEST__?.getSnapshot().persistenceHydrated)).toBe(true);
+  await page.locator(".continue-card").getByRole("button", { name: "Continue" }).click();
+
+  await page.getByRole("button", { name: "Continue Lesson", exact: true }).click();
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_PLAYER_READY__")?.isHeld())).toBe(true);
+
+  await page.getByRole("button", { name: "Restart Lesson" }).click();
+  await page.getByRole("alertdialog", { name: "Restart this lesson?" })
+    .getByRole("button", { name: "Restart", exact: true }).click();
+  await expect.poll(() => getTokenRequestCount(page)).toBe(1);
+
+  await releaseFirstPlayerReady(page);
+  await page.waitForTimeout(50);
+
+  const startupPendingWhileRunBIsHeld = (await readTestState(page)).snapshot.startupPending;
+  expect(getExternalRequests(page)).toEqual([]);
+
+  releaseFirstTokenResponse(page);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_LIVE__").socketCount())).toBe(1);
+  await expect.poll(async () => (await readTestState(page)).snapshot.lessonActive).toBe(true);
+
+  expect(startupPendingWhileRunBIsHeld).toBe(true);
 });
 
 test("fake microphone starts and mute gates learner PCM until unmuted", async ({ page }) => {
