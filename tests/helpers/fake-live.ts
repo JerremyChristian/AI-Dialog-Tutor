@@ -4,7 +4,7 @@ export const QA_LESSON_ID = "qa-session-lifecycle-001";
 
 export type LiveSend = { socketId: number; message: Record<string, unknown> };
 
-export async function installFakeLive(page: Page, options: { persisted?: boolean; reviewReady?: boolean } = {}) {
+export async function installFakeLive(page: Page, options: { persisted?: boolean; reviewReady?: boolean; completed?: boolean } = {}) {
   await page.route("**/auth/v1/**", (route) => route.fulfill({
     status: 401, contentType: "application/json", body: JSON.stringify({ message: "Not signed in" }),
   }));
@@ -12,7 +12,7 @@ export async function installFakeLive(page: Page, options: { persisted?: boolean
     status: 200, contentType: "application/json",
     body: JSON.stringify({ token: "local-test-token", source: { name: "plc-notes.txt", mimeType: "text/plain" } }),
   }));
-  await page.addInitScript(({ lessonId, persisted, reviewReady }) => {
+  await page.addInitScript(({ lessonId, persisted, reviewReady, completed }) => {
     const NativeWebSocket = window.WebSocket;
     const sockets: FakeLiveWebSocket[] = [];
     const sends: Array<{ socketId: number; message: Record<string, unknown> }> = [];
@@ -45,7 +45,11 @@ export async function installFakeLive(page: Page, options: { persisted?: boolean
       }
       deliver(body: Record<string, unknown>) {
         return new Promise<void>((resolve) => setTimeout(() => {
-          this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(body) })); resolve();
+          try {
+            this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(body) }));
+          } finally {
+            resolve();
+          }
         }, 0));
       }
     }
@@ -61,7 +65,7 @@ export async function installFakeLive(page: Page, options: { persisted?: boolean
     const now = new Date().toISOString();
     const firstNode = {
       id: "what-is-a-plc", title: "What is a PLC?", parentId: null, order: 0, childrenIds: [],
-      status: reviewReady ? "taught" : "teaching", teaching: {
+      status: reviewReady || completed ? "taught" : "teaching", teaching: {
         objective: "Define a programmable logic controller.", teachingPoints: ["PLC means programmable logic controller.", "PLCs coordinate industrial inputs and outputs."],
         completionCriteria: ["Explain the role of a PLC."], deliveryUnits: [{ objective: "Introduce the PLC definition and role.", teachingPointIndexes: [0, 1], completionCriteriaIndexes: [0], presentationBeats: [{ teachingPointIndexes: [0] }, { teachingPointIndexes: [1] }] }], type: "definition", importance: "core",
       },
@@ -73,7 +77,7 @@ export async function installFakeLive(page: Page, options: { persisted?: boolean
       },
     };
     const lesson = {
-      schemaVersion: 1, id: lessonId, title: "PLC Fundamentals", lessonFocus: "PLC fundamentals", hasStarted: persisted,
+      schemaVersion: 1, id: lessonId, title: "PLC Fundamentals", lessonFocus: "PLC fundamentals", hasStarted: persisted || completed,
       source: { metadata: { name: "plc-notes.txt", mimeType: "text/plain", sizeBytes: 128, status: "ready" }, prepared: {
         name: "plc-notes.txt", mimeType: "text/plain", text: "A PLC is a rugged industrial computer used to control machines and processes.",
         lessonTree: [{ id: "what-is-a-plc", title: "What is a PLC?", parentId: null, order: 0, teaching: {
@@ -83,7 +87,7 @@ export async function installFakeLive(page: Page, options: { persisted?: boolean
       lessonState: { topic: "PLC fundamentals", objective: "Understand PLC fundamentals.", status: "idle", currentNodeId: reviewReady ? "plc-scan-cycle" : "what-is-a-plc", rootNodeIds: reviewReady ? ["what-is-a-plc", "plc-scan-cycle"] : ["what-is-a-plc"], nodes: {
         "what-is-a-plc": firstNode,
         ...(reviewReady ? { "plc-scan-cycle": secondNode } : {}),
-      }, teachingContractProgress: { "what-is-a-plc": { nextTeachingPointIndex: reviewReady ? 2 : 0 }, ...(reviewReady ? { "plc-scan-cycle": { nextTeachingPointIndex: 0 } } : {}) }, resumePoint: persisted ? "after introducing the PLC definition" : "", interruptionCount: 0, lastUserTranscript: "", lastAssistantTranscript: persisted ? "A PLC is a rugged industrial computer." : "" },
+      }, teachingContractProgress: { "what-is-a-plc": { nextTeachingPointIndex: reviewReady || completed ? 2 : 0 }, ...(reviewReady ? { "plc-scan-cycle": { nextTeachingPointIndex: 0 } } : {}) }, resumePoint: persisted || completed ? "after introducing the PLC definition" : "", interruptionCount: 0, lastUserTranscript: "", lastAssistantTranscript: persisted || completed ? "A PLC is a rugged industrial computer." : "" },
       recentTeachingContext: persisted ? [{ conceptId: "what-is-a-plc", excerpt: "A PLC is a rugged industrial computer." }] : [], teachingPreferences: { explanationDepth: "normal", speakingSpeed: "normal" }, createdAt: now, updatedAt: now,
     };
     const request = indexedDB.open("ai-dialog-tutor", 2);
@@ -93,7 +97,7 @@ export async function installFakeLive(page: Page, options: { persisted?: boolean
       if (!db.objectStoreNames.contains("processingJobs")) db.createObjectStore("processingJobs", { keyPath: "id" }).createIndex("createdAt", "createdAt");
     };
     request.onsuccess = () => { const db = request.result; const tx = db.transaction(["savedLessons", "appState"], "readwrite"); tx.objectStore("savedLessons").put(lesson); tx.objectStore("appState").put({ key: "activeLessonId:anonymous", value: lessonId }); tx.oncomplete = () => db.close(); };
-  }, { lessonId: QA_LESSON_ID, persisted: options.persisted ?? false, reviewReady: options.reviewReady ?? false });
+  }, { lessonId: QA_LESSON_ID, persisted: options.persisted ?? false, reviewReady: options.reviewReady ?? false, completed: options.completed ?? false });
 }
 
 export async function openLessonAndStart(page: Page, persisted = false) {
