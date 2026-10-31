@@ -603,15 +603,18 @@ export default function Home() {
     invalidateActiveTeachingBeat("resources-disposed");
     tokenRequestRef.current?.abort();
     tokenRequestRef.current = null;
+    // Captured before the first await: a newer run may install its own audio
+    // resources while this disposal is suspended, and those are not ours to release.
+    const owned = audioSession.captureResources();
 
     await audioSession.stopStreamer();
 
     transportRef.current?.close(sendAudioStreamEnd);
     transportRef.current = null;
 
-    audioSession.stopTracks();
+    audioSession.stopTracks(owned.stream);
 
-    await audioSession.closePlayer();
+    await audioSession.closePlayer(owned.player);
     assistantSpeakingRef.current = false;
     learnerActivityRunRef.current = null;
     typedInterruptionHandledRef.current = false;
@@ -632,7 +635,7 @@ export default function Home() {
     setShowLessonComplete(false);
     if (completionAnimationTimerRef.current) clearTimeout(completionAnimationTimerRef.current);
     completionAnimationTimerRef.current = null;
-    await audioSession.releaseWakeLock();
+    await audioSession.releaseWakeLock(owned.wakeLock);
     if (engagementTimerRef.current) clearInterval(engagementTimerRef.current);
     if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
     if (quickResponseTimerRef.current) clearTimeout(quickResponseTimerRef.current);

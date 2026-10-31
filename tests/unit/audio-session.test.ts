@@ -175,6 +175,51 @@ describe("AudioSession", () => {
     });
   });
 
+  it("a captured teardown releases only its own resources after newer ones are installed", async () => {
+    const release = vi.fn(async () => undefined);
+    vi.stubGlobal("navigator", { wakeLock: { request: vi.fn(async () => ({ release })) } });
+    vi.stubGlobal("document", { visibilityState: "visible" });
+    const oldTrack = new FakeTrack();
+    const old = session.createPlayer();
+    await old.ready;
+    session.attachStream(fakeStream(oldTrack), vi.fn());
+    await session.requestWakeLock();
+    const owned = session.captureResources();
+
+    const newerRelease = vi.fn(async () => undefined);
+    vi.stubGlobal("navigator", { wakeLock: { request: vi.fn(async () => ({ release: newerRelease })) } });
+    const newerTrack = new FakeTrack();
+    const newer = session.createPlayer();
+    await newer.ready;
+    session.attachStream(fakeStream(newerTrack), vi.fn());
+    await session.requestWakeLock();
+
+    session.stopTracks(owned.stream);
+    await session.closePlayer(owned.player);
+    await session.releaseWakeLock(owned.wakeLock);
+
+    expect(oldTrack.stop).toHaveBeenCalledOnce();
+    expect(FakeAudioContext.instances[0].close).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledOnce();
+    expect(newerTrack.stop).not.toHaveBeenCalled();
+    expect(FakeAudioContext.instances[1].close).not.toHaveBeenCalled();
+    expect(newerRelease).not.toHaveBeenCalled();
+    expect(session.player).toBe(newer.player);
+    expect(session.hasMicrophoneStream).toBe(true);
+    await session.releaseWakeLock();
+    expect(newerRelease).toHaveBeenCalledOnce();
+  });
+
+  it("a captured teardown with nothing captured leaves newer resources alone", async () => {
+    const owned = session.captureResources();
+    const newer = session.createPlayer();
+    await newer.ready;
+    session.stopTracks(owned.stream);
+    await session.closePlayer(owned.player);
+    expect(FakeAudioContext.instances[0].close).not.toHaveBeenCalled();
+    expect(session.player).toBe(newer.player);
+  });
+
   it("stays reusable after a full teardown (no terminal disposed state)", async () => {
     const first = session.createPlayer();
     await first.ready;

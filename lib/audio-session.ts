@@ -10,7 +10,10 @@ import { MicrophonePcmStreamer, PcmAudioPlayer } from "./realtime-audio";
 // (React StrictMode re-mounts and every new lesson reuse it), and teardown is
 // deliberately split into separate steps so disposeResources keeps its order:
 // streamer stop, transport close, track stop, player close, then the wake lock
-// after the synchronous resets. Each slot is read at the moment its step runs.
+// after the synchronous resets. disposeResources captures the stream, player and
+// wake lock before its first await and passes them to each step, so a disposal
+// that resumes after a newer run installed its own resources only releases the
+// ones it captured and clears a slot only while it still holds that resource.
 export class AudioSession {
   private stream: MediaStream | null = null;
   private streamer: MicrophonePcmStreamer | null = null;
@@ -81,21 +84,24 @@ export class AudioSession {
     await streamer?.stop();
   }
 
-  stopTracks() {
-    this.stream?.getAudioTracks().forEach((track) => track.stop());
-    this.stream = null;
+  captureResources() {
+    return { stream: this.stream, player: this.currentPlayer, wakeLock: this.wakeLock };
+  }
+
+  stopTracks(stream = this.stream) {
+    stream?.getAudioTracks().forEach((track) => track.stop());
+    if (this.stream === stream) this.stream = null;
   }
 
   // The slot is cleared before awaiting close(), so a visibility resume can
   // never prepare() (and so re-create) a context that is being closed.
-  async closePlayer() {
-    const player = this.currentPlayer;
-    this.currentPlayer = null;
+  async closePlayer(player = this.currentPlayer) {
+    if (this.currentPlayer === player) this.currentPlayer = null;
     await player?.close();
   }
 
-  async releaseWakeLock() {
-    await this.wakeLock?.release().catch(() => undefined);
-    this.wakeLock = null;
+  async releaseWakeLock(wakeLock = this.wakeLock) {
+    await wakeLock?.release().catch(() => undefined);
+    if (this.wakeLock === wakeLock) this.wakeLock = null;
   }
 }
