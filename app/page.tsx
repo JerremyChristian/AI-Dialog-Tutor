@@ -42,6 +42,20 @@ import {
   type LiveToolCall,
 } from "../lib/live-message-events";
 import {
+  buildLessonQueryResult,
+  classifyLessonStateCall,
+  decideQueryContinuation,
+  decideSessionControl,
+  decideSilentRecoveryFollowUp,
+  decorateLessonStateResult,
+  invalidLessonStateResult,
+  planLessonTransitionEffects,
+  reviewActiveRejection,
+  routeToolCall,
+  unknownToolResult,
+  wrapUpEndResult,
+} from "../lib/lesson-tool-decisions";
+import {
   buildLessonInstruction,
   createLessonState,
   deriveResumePoint,
@@ -1932,8 +1946,12 @@ export default function Home() {
       let result;
       let events: string[] = [];
       let assignmentControl = "";
+      const route = routeToolCall(call.name);
+      const lessonCall = route === "lesson_state"
+        ? classifyLessonStateCall(action, conceptId, Boolean(nodeReviewRef.current))
+        : null;
 
-      if (call.name === "update_teaching_preferences") {
+      if (route === "update_teaching_preferences") {
         const next = applyTeachingPreferenceUpdate(
           teachingPreferencesRef.current,
           args as Record<string, unknown>,
@@ -1959,72 +1977,53 @@ export default function Home() {
             teachingPreferences: teachingPreferencesRef.current,
           };
         }
-      } else if (call.name === "session_control") {
-        if (action === "restart_request") {
-          if (!resumeExistingLessonRef.current) {
-            result = { ok: false, action, message: "The lesson has not started and does not need restarting" };
-          } else {
+      } else if (route === "session_control") {
+        const decision = decideSessionControl(action, {
+          lessonStarted: resumeExistingLessonRef.current,
+          restartConfirmationPending: conversationalRestartConfirmationRef.current,
+          wrapUpActive: lessonWrapUpRef.current,
+          idleConfirmationActive: engagementStateRef.current === "confirming",
+        });
+        switch (decision.kind) {
+          case "restart-request":
             conversationalRestartConfirmationRef.current = true;
             addDebugMessage("Conversational lesson restart confirmation requested");
-            result = {
-              ok: true,
-              action,
-              message: "Ask the learner to confirm that teaching progress will be cleared while lesson materials and content are preserved",
-            };
-          }
-        } else if (action === "restart_confirm") {
-          if (!conversationalRestartConfirmationRef.current) {
-            result = { ok: false, action, message: "No lesson restart confirmation is pending" };
-          } else {
+            break;
+          case "restart-confirm":
             conversationalRestartConfirmationRef.current = false;
             restartAfterResponse = true;
-            result = { ok: true, action, message: "Restart the completed lesson from the beginning" };
+            break;
+          case "restart-cancel":
+            conversationalRestartConfirmationRef.current = false;
+            break;
+          case "wrap-up-end": {
+            const closingStarted = beginClosingFarewell();
+            if (closingStarted) addDebugMessage("Final questions completed; graceful closing started");
+            result = wrapUpEndResult(closingStarted);
+            break;
           }
-        } else if (action === "restart_cancel") {
-          conversationalRestartConfirmationRef.current = false;
-          result = { ok: true, action, message: "Keep the completed lesson unchanged" };
-        } else if (lessonWrapUpRef.current && action === "end") {
-          if (beginClosingFarewell()) {
-            addDebugMessage("Final questions completed; graceful closing started");
-            result = {
-              ok: true,
-              action: "end",
-              message: "The learner has no more questions. Give exactly one brief, warm, natural closing sentence. Do not teach new material and do not ask another question.",
-            };
-          } else {
-            result = { ok: true, action: "end", message: "Lesson closing is already in progress" };
-          }
-        } else if (lessonWrapUpRef.current) {
-          result = {
-            ok: true,
-            action: action === "continue" ? "continue" : "unclear",
-            message: "Remain in final-question wrap-up",
-          };
-        } else if (engagementStateRef.current !== "confirming" && action === "continue") {
-          result = { ok: true, action: "continue", message: "Session is already active" };
-        } else if (engagementStateRef.current !== "confirming") {
-          result = { ok: false, message: "No idle confirmation is active" };
-        } else if (action === "continue") {
-          if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
-          confirmationTimerRef.current = null;
-          updateEngagementState("active");
-          if (meaningfulConfirmationSpeechRef.current) markMeaningfulActivity();
-          meaningfulConfirmationSpeechRef.current = false;
-          addDebugMessage("Continue confirmed");
-          result = { ok: true, action: "continue", message: "Continue the current lesson" };
-        } else if (action === "end") {
-          meaningfulConfirmationSpeechRef.current = false;
-          addDebugMessage("End confirmed");
-          result = { ok: true, action: "end", message: "End the lesson" };
-          endAfterResponse = true;
-        } else {
-          meaningfulConfirmationSpeechRef.current = false;
-          addDebugMessage("Idle confirmation unclear");
-          result = { ok: true, action: "unclear", message: "Remain in confirmation" };
+          case "confirm-continue":
+            if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
+            confirmationTimerRef.current = null;
+            updateEngagementState("active");
+            if (meaningfulConfirmationSpeechRef.current) markMeaningfulActivity();
+            meaningfulConfirmationSpeechRef.current = false;
+            addDebugMessage("Continue confirmed");
+            break;
+          case "confirm-end":
+            meaningfulConfirmationSpeechRef.current = false;
+            addDebugMessage("End confirmed");
+            endAfterResponse = true;
+            break;
+          case "confirm-unclear":
+            meaningfulConfirmationSpeechRef.current = false;
+            addDebugMessage("Idle confirmation unclear");
+            break;
         }
-      } else if (call.name !== "lesson_state") {
-        result = { ok: false, error: `Unknown function: ${call.name || "missing"}` };
-      } else if (action === "query") {
+        if (decision.kind !== "wrap-up-end") result = decision.result;
+      } else if (route !== "lesson_state") {
+        result = unknownToolResult(call.name);
+      } else if (lessonCall?.kind === "query") {
         const state = lessonStateRef.current;
         const continuity: ConversationContinuity = {
           lastMeaningfulLearnerTranscript:
@@ -2043,61 +2042,54 @@ export default function Home() {
             interruptionAlreadyRegistered: false,
           }),
         };
-        result = {
-          ...queryLessonState(state),
-          ...(postResumeQueryReceived
-            ? {
-                continuity,
-                teachingPreferences: teachingPreferencesRef.current,
-              }
-            : {}),
-        };
-        if (queryPurpose === "continue" && !postResumeQueryReceived &&
-            !silentLessonRecoveryPendingRef.current) {
-          const review = nodeReviewRef.current;
-          let assignment: ActiveTeachingBeat | null = null;
-          if (review?.complete) {
-            finishNodeReviewAndResume("completed");
-          } else if (review) {
-            assignment = assignNextReviewBeat("", false);
-          } else if (!reviewResumeGuardRef.current && !isLessonPlanComplete(lessonStateRef.current)) {
-            assignment = assignNextTeachingBeat("", false);
-          }
-          if (assignment) assignmentControl = buildTeachingBeatControl(lessonStateRef.current, assignment);
+        result = buildLessonQueryResult(
+          queryLessonState(state),
+          postResumeQueryReceived,
+          continuity,
+          teachingPreferencesRef.current,
+        );
+        const review = nodeReviewRef.current;
+        const continuation = decideQueryContinuation({
+          purpose: queryPurpose,
+          postResumeQueryReceived,
+          silentRecoveryPending: silentLessonRecoveryPendingRef.current,
+          review,
+          reviewResumeGuard: reviewResumeGuardRef.current,
+          lessonPlanComplete: isLessonPlanComplete(lessonStateRef.current),
+        });
+        let assignment: ActiveTeachingBeat | null = null;
+        if (continuation === "finish-review") {
+          finishNodeReviewAndResume("completed");
+        } else if (continuation === "assign-review-beat") {
+          assignment = assignNextReviewBeat("", false);
+        } else if (continuation === "assign-teaching-beat") {
+          assignment = assignNextTeachingBeat("", false);
         }
+        if (assignment) assignmentControl = buildTeachingBeatControl(lessonStateRef.current, assignment);
         if (postResumeQueryReceived) {
           addDebugMessage("Post-resume continuity snapshot prepared");
           addDebugMessage("Teaching preferences included in post-resume state");
         }
         addDebugMessage("Lesson state queried");
-      } else if (
-        (action === "navigate" || action === "skip") &&
-        nodeReviewRef.current
-      ) {
+      } else if (lessonCall?.kind === "review-rejected") {
         addReviewFlowDiagnostic("navigation-rejected-during-review");
-        result = {
-          ok: false,
-          action,
-          error: "review_active",
-          message: "Review is active. Continue the current Review or wait for the learner to explicitly exit Review.",
-        };
-      } else if (
-        (action === "navigate" || action === "skip") &&
-        typeof conceptId === "string" && conceptId
-      ) {
-        invalidateActiveTeachingBeat(`lesson-${action}`);
+        result = reviewActiveRejection(action);
+      } else if (lessonCall?.kind === "transition") {
+        const moveAction = lessonCall.action;
+        invalidateActiveTeachingBeat(`lesson-${moveAction}`);
         playerRef.current?.clear();
-        const transition = action === "navigate"
-          ? navigateLessonState(lessonStateRef.current, conceptId)
-          : skipLessonNode(lessonStateRef.current, conceptId);
+        const transition = moveAction === "navigate"
+          ? navigateLessonState(lessonStateRef.current, lessonCall.conceptId)
+          : skipLessonNode(lessonStateRef.current, lessonCall.conceptId);
+        const effects = planLessonTransitionEffects(moveAction, transition.result);
         result = transition.result;
         events = transition.events;
         if (transition.state !== lessonStateRef.current) {
-          if (action === "navigate" && transition.result.ok) lessonWrapUpRef.current = false;
+          if (effects.clearWrapUp) lessonWrapUpRef.current = false;
           lessonStateRef.current = transition.state;
           setLessonState(transition.state);
         }
-        if (transition.result.ok && action === "navigate") {
+        if (effects.logContractProgress) {
           const active = getCurrentConcept(transition.state);
           if (active?.teaching) {
             addDebugMessage(
@@ -2107,11 +2099,11 @@ export default function Home() {
             );
           }
         }
-        if (transition.result.ok) {
+        if (effects.assignNextBeat) {
           const assignment = assignNextTeachingBeat("", false);
           if (assignment) assignmentControl = buildTeachingBeatControl(lessonStateRef.current, assignment);
         }
-        if (action === "navigate") {
+        if (effects.clearRoadmapPending) {
           if (isRoadmapNavigation) {
             const preferences = teachingPreferencesRef.current;
             addDebugMessage("lesson_state.navigate completed");
@@ -2125,22 +2117,13 @@ export default function Home() {
           setRoadmapNavigationPending(false);
           roadmapNavigationPendingRef.current = false;
         }
-        if (transition.result.recoveryRequired && !silentLessonRecoveryPendingRef.current) {
+        if (effects.recoveryRequired && !silentLessonRecoveryPendingRef.current) {
           silentLessonRecoveryPendingRef.current = true;
           requestSilentRecovery = true;
         }
       } else {
-        const snapshot = queryLessonState(lessonStateRef.current);
-        const missingConcept = action === "navigate" || action === "skip";
-        result = {
-          ...snapshot,
-          ok: false,
-          message: missingConcept
-            ? "A concept is required for this operation"
-            : "Unsupported lesson-state action",
-          error: missingConcept ? "missing_concept_id" : "invalid_action",
-          recoveryRequired: missingConcept,
-        };
+        const missingConcept = lessonCall?.kind === "invalid" && lessonCall.missingConcept;
+        result = invalidLessonStateResult(queryLessonState(lessonStateRef.current), missingConcept);
         if (missingConcept && !silentLessonRecoveryPendingRef.current) {
           silentLessonRecoveryPendingRef.current = true;
           requestSilentRecovery = true;
@@ -2148,11 +2131,7 @@ export default function Home() {
       }
 
       if (call.name === "lesson_state" && result && typeof result === "object") {
-        result = {
-          ...result,
-          teachingPreferences: teachingPreferencesRef.current,
-          ...(assignmentControl ? { teachingAssignment: assignmentControl } : {}),
-        };
+        result = decorateLessonStateResult(result, teachingPreferencesRef.current, assignmentControl);
         if (isRoadmapNavigation) {
           addDebugMessage("Teaching preferences included in lesson_state.navigate response");
         }
@@ -2170,10 +2149,11 @@ export default function Home() {
         addDebugMessage("Post-resume state response sent");
         transportRef.current.completePostResumeSynchronization();
       }
-      if (recoveryQueryReceived) {
+      const recoveryFollowUp = decideSilentRecoveryFollowUp(recoveryQueryReceived, requestSilentRecovery);
+      if (recoveryFollowUp === "complete") {
         silentLessonRecoveryPendingRef.current = false;
         addDebugMessage("Silent lesson-state recovery complete");
-      } else if (requestSilentRecovery) {
+      } else if (recoveryFollowUp === "start") {
         addDebugMessage("Silent lesson-state recovery started");
         transportRef.current?.sendRealtimeInput({
           text: "[[APP_CONTROL:LESSON_STATE_RECOVERY]]",
