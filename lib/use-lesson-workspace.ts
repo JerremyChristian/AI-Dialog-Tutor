@@ -124,6 +124,8 @@ export function useLessonWorkspace(input: LessonWorkspaceInput) {
   const lessonHydrationGenerationRef = useRef(0);
   const workspaceLoadedRef = useRef(false);
   const persistenceSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Lesson ids whose delete has begun or succeeded; persisting them would resurrect the record.
+  const persistenceSuppressedIdsRef = useRef(new Set<string>());
 
   const applySyncedLessonMetadata = (synced: SavedLesson) => {
     setSavedLessons((current) => current.map((lesson) =>
@@ -198,6 +200,7 @@ export function useLessonWorkspace(input: LessonWorkspaceInput) {
   };
 
   const persistLessonSnapshot = async (snapshot: SavedLesson) => {
+    if (persistenceSuppressedIdsRef.current.has(snapshot.id)) return;
     try {
       await saveActiveLesson(snapshot);
       if (savedLessonIdRef.current === snapshot.id) {
@@ -336,6 +339,8 @@ export function useLessonWorkspace(input: LessonWorkspaceInput) {
       return;
     }
     setLessonLibraryBusyId(saved.id);
+    // Suppress before any await so saves issued during the delete cannot queue behind it.
+    persistenceSuppressedIdsRef.current.add(saved.id);
     try {
       if (savedLessonIdRef.current === saved.id && persistenceSaveTimerRef.current) {
         clearTimeout(persistenceSaveTimerRef.current);
@@ -357,6 +362,7 @@ export function useLessonWorkspace(input: LessonWorkspaceInput) {
       }
       addDebugMessage(`Saved lesson deleted: ${saved.id}`);
     } catch {
+      persistenceSuppressedIdsRef.current.delete(saved.id);
       setPersistenceNotice(saved.cloudOwnerId
         ? "That lesson could not be deleted from the cloud. Its local copy was kept."
         : "That saved lesson could not be deleted on this device.");
