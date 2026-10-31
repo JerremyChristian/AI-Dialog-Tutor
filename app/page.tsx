@@ -26,14 +26,9 @@ import {
 import { TeachingStyleControls } from "../components/teaching-style-controls";
 import { AudioSession } from "../lib/audio-session";
 import {
-  ACOUSTIC_ACTIVITY_MULTIPLIER,
-  ACOUSTIC_LOG_COOLDOWN_MS,
   ENGAGEMENT_CHECK_INTERVAL_MS,
   IDLE_CONFIRMATION_MS,
-  MIN_ACOUSTIC_RMS,
-  NOISE_FLOOR_SMOOTHING,
   isMeaningfulLearnerTranscript,
-  pcm16Rms,
   type EngagementState,
 } from "../lib/engagement";
 import {
@@ -82,17 +77,13 @@ import {
   buildLessonInstruction,
   createLessonState,
   deriveResumePoint,
-  GEMINI_LIVE_MODEL,
   getCurrentConcept,
   isLessonPlanComplete,
-  LESSON_WRAP_UP_CONTROL,
   mergeTranscript,
   navigateLessonState,
   pauseLessonState,
-  PERSISTED_LESSON_RESUME_CONTROL,
   queryLessonState,
   skipLessonNode,
-  type LessonSessionStartMode,
   type LessonState,
 } from "../lib/lesson-state";
 import {
@@ -118,12 +109,8 @@ import {
 } from "../lib/teaching-beat-runtime";
 import {
   aiConnectionStatusForTransportState,
-  buildNewLessonStartPrefix,
-  getMicrophoneErrorMessage,
-  getRealtimeErrorMessage,
-  isMicrophonePermissionDenied,
-  planStartupImperative,
   type AiConnectionStatus,
+  type MicrophoneStatus,
 } from "../lib/teaching-session";
 import {
   DEFAULT_TEACHING_PREFERENCES,
@@ -131,10 +118,7 @@ import {
   type TeachingPreferences,
 } from "../lib/teaching-preferences";
 import type { RecentTeachingContextEntry } from "../lib/local-persistence";
-import {
-  appendRecentTeachingContext,
-  getPersistedResumeContext,
-} from "../lib/lesson-snapshot";
+import { appendRecentTeachingContext } from "../lib/lesson-snapshot";
 import { isSupabaseConfigured } from "../lib/supabase/config";
 import { sanitizeLearnerVisibleTutorTranscript } from "../lib/transcript-visibility";
 import { mergeLearnerTranscript } from "../lib/learner-transcript";
@@ -145,14 +129,8 @@ import {
 import { useAppearance } from "../lib/use-appearance";
 import { useLessonProcessingQueue } from "../lib/use-lesson-processing-queue";
 import { useLessonWorkspace } from "../lib/use-lesson-workspace";
+import { useTeachingSession } from "../lib/use-teaching-session";
 import { usePwaInstall } from "../lib/use-pwa-install";
-
-type MicrophoneStatus =
-  | "Not active"
-  | "Requesting permission"
-  | "Active"
-  | "Permission denied"
-  | "Error";
 
 type TeachingPreferenceUpdate = Partial<TeachingPreferences>;
 type PendingTeachingPreferences = Partial<TeachingPreferences>;
@@ -208,7 +186,6 @@ export default function Home() {
   );
   const [presentationBeat, setPresentationBeat] = useState<PresentationBeat | null>(null);
   const [restartConfirmationOpen, setRestartConfirmationOpen] = useState(false);
-  const [restartPending, setRestartPending] = useState(false);
   const [nodeReview, setNodeReview] = useState<NodeReviewState | null>(null);
   const [showLessonComplete, setShowLessonComplete] = useState(false);
   const cloudAuthReadyRef = useRef(cloudAuthReady);
@@ -217,7 +194,6 @@ export default function Home() {
 
   const transportRef = useRef<LiveTransportManager | null>(null);
   const audioSessionRef = useRef<AudioSession | null>(null);
-  const tokenRequestRef = useRef<AbortController | null>(null);
   const isMountedRef = useRef(true);
   const conversationRunRef = useRef(0);
   const assistantSpeakingRef = useRef(false);
@@ -242,12 +218,8 @@ export default function Home() {
   const nextMessageIdRef = useRef(0);
   const lessonActiveRef = useRef(false);
   const lessonStartupPendingRef = useRef(false);
-  // Run that set lessonStartupPendingRef; only that run may clear it in finally.
-  const lessonStartupRunRef = useRef(0);
   const engagementStateRef = useRef<EngagementState>("ended");
   const lastMeaningfulLearnerActivityAtRef = useRef<number | null>(null);
-  const noiseFloorRef = useRef(0.004);
-  const lastAcousticLogAtRef = useRef(0);
   const engagementTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const confirmationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const microphoneMutedRef = useRef(false);
@@ -265,8 +237,6 @@ export default function Home() {
   const generationEpochRef = useRef(0);
   const lessonWrapUpRef = useRef(false);
   const conversationalRestartConfirmationRef = useRef(false);
-  const restartPendingRef = useRef(false);
-  const restartActiveLessonRef = useRef<() => Promise<void>>(async () => undefined);
   const nodeReviewRef = useRef<NodeReviewState | null>(null);
   const reviewResumeGuardRef = useRef(false);
   const reviewRecoveryPendingRef = useRef(false);
@@ -582,40 +552,6 @@ export default function Home() {
       addDebugMessage(`Teaching unit waiting for learner: unit=${active.deliveryUnitIndex}`);
     }
   }
-
-  // Captured before the first await: a newer run may install its own audio
-  // resources while this disposal is suspended, and those are not ours to release.
-  // Every caller bumps the run before capturing; only a newer startConversation
-  // changes it again, so a mismatch after an await means this session was replaced
-  // and the shared page/session state now belongs to the newer run.
-  const captureDisposalOwnership = () => ({
-    ...audioSession.captureResources(),
-    run: conversationRunRef.current,
-    transport: transportRef.current,
-  });
-
-  // Callers that await before disposing (stopConversation) capture first and pass it in.
-  const disposeResources = async (
-    sendAudioStreamEnd: boolean,
-    owned = captureDisposalOwnership(),
-  ) => {
-    const { run } = owned;
-    if (run === conversationRunRef.current) invalidateActiveTeachingBeat("resources-disposed");
-    tokenRequestRef.current?.abort();
-    tokenRequestRef.current = null;
-
-    await audioSession.stopStreamer(owned.streamer);
-
-    owned.transport?.close(sendAudioStreamEnd);
-    if (transportRef.current === owned.transport) transportRef.current = null;
-
-    audioSession.stopTracks(owned.stream);
-
-    await audioSession.closePlayer(owned.player);
-    if (run === conversationRunRef.current) resetSessionState();
-    await audioSession.releaseWakeLock(owned.wakeLock);
-    if (run === conversationRunRef.current) resetSessionTimersAndControls();
-  };
 
   // Shared page/session resets, split around the wake-lock release so the
   // original disposal order is unchanged.
@@ -976,30 +912,51 @@ export default function Home() {
 
   const { installPrompt, showIosInstallHint, requestInstall } = usePwaInstall();
 
-  useEffect(() => {
-    isMountedRef.current = true;
-
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible" && lessonActiveRef.current) {
-        void audioSession.requestWakeLock();
-        transportRef.current?.ensureHealthy();
-        void audioSession.player?.prepare().catch(() => {
-          setUserError("Audio was suspended. End the lesson, then start again.");
-          addDebugMessage("Audio context could not resume after backgrounding");
-        });
-      } else if (document.visibilityState === "hidden" && lessonActiveRef.current) {
-        addDebugMessage("App backgrounded; mobile audio or connection may be suspended");
-      }
-    };
-    document.addEventListener("visibilitychange", onVisibilityChange);
-
-    return () => {
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-      isMountedRef.current = false;
-      conversationRunRef.current += 1;
-      void disposeResources(false);
-    };
-  }, []);
+  // Called where the mount/visibility effect used to be declared, so effect order
+  // (after the workspace and PWA hooks) is unchanged. Handlers declared further down
+  // are passed as forwarding arrows: they are still in their temporal dead zone
+  // here, and each arrow reads the same render's handler that the inline lifecycle
+  // code used to capture.
+  const {
+    startConversation,
+    stopConversation,
+    restartLesson,
+    restartPending,
+    restartPendingRef,
+    restartActiveLessonRef,
+  } = useTeachingSession({
+    isMountedRef,
+    conversationRunRef,
+    transportRef,
+    lessonActiveRef,
+    lessonStartupPendingRef,
+    lessonStateRef,
+    lessonWrapUpRef,
+    teachingPreferencesRef,
+    recentTeachingContextRef,
+    persistedResumeBriefingPendingRef,
+    persistedResumeFirstResponseLoggedRef,
+    audioSession,
+    workspace,
+    setLessonState,
+    updateLessonState,
+    setMicrophoneStatus,
+    setAiConnectionStatus,
+    setUserError,
+    setRestartConfirmationOpen,
+    addDebugMessage,
+    handleLiveMessage: (message) => handleLiveMessage(message),
+    onTransportStateChange: (state) => onTransportStateChange(state),
+    canForwardMicrophone: () => canForwardMicrophone(),
+    resetConversationForStart: () => resetConversationForStart(),
+    pauseLessonForStop: () => pauseLessonForStop(),
+    invalidateActiveTeachingBeat,
+    assignNextTeachingBeat,
+    beginIdleMonitoring,
+    resetSessionState,
+    resetSessionTimersAndControls,
+    resetCurrentLessonProgress,
+  });
 
   const handleLearnerInterruption = (discreteTextTurn = false) => {
     if (isCurrentFarewell(closingTurnRef.current, conversationRunRef.current, generationEpochRef.current)) return;
@@ -1701,380 +1658,6 @@ export default function Home() {
         : undefined,
     );
   };
-
-  const startConversation = async () => {
-    emitTestEvent("lesson.start-requested", { lessonId: workspace.savedLessonIdRef.current });
-    setUserError("");
-    workspace.setPersistenceNotice("");
-    if (
-      workspace.learningSource?.status !== "ready" ||
-      !workspace.preparedSourceRef.current
-    ) {
-      addDebugMessage("Source grounding failed: a ready learning source is required");
-      return;
-    }
-
-    lessonStartupPendingRef.current = true;
-    workspace.invalidatePendingHydration();
-
-    const activeSource = workspace.learningSource;
-    const preparedSource = workspace.preparedSourceRef.current;
-    const lessonFocus = workspace.topicInput.trim();
-    const lessonTopic = lessonFocus || `Main topics in ${activeSource.name}`;
-    const continuingSavedLesson = workspace.resumeExistingLessonRef.current;
-    const sessionStartMode: LessonSessionStartMode = continuingSavedLesson
-      ? "persisted-resume"
-      : "new";
-    const persistedResumeContext = continuingSavedLesson
-      ? getPersistedResumeContext(
-          lessonStateRef.current,
-          recentTeachingContextRef.current,
-        )
-      : null;
-    const sessionInitialTeachingPreferences = { ...teachingPreferencesRef.current };
-    const requestFreshToken = async () => {
-      addDebugMessage("Gemini token requested");
-      const controller = new AbortController();
-      tokenRequestRef.current = controller;
-      const response = await fetch("/api/gemini-token", {
-        method: "POST",
-        cache: "no-store",
-        signal: controller.signal,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          topic: lessonFocus,
-          source: { name: activeSource.name, mimeType: activeSource.mimeType },
-          teachingPreferences: teachingPreferencesRef.current,
-        }),
-      });
-      const body = (await response.json()) as {
-        token?: string;
-        newSessionExpiresAt?: number;
-        error?: string;
-        source?: { name: string; mimeType: string };
-      };
-      if (!response.ok || !body.token || !body.source) {
-        throw new Error(body.error || "Gemini token request failed");
-      }
-      if (tokenRequestRef.current === controller) tokenRequestRef.current = null;
-      addDebugMessage("Gemini token received");
-      return {
-        token: body.token,
-        source: body.source,
-        newSessionExpiresAt: body.newSessionExpiresAt,
-      };
-    };
-    const initialLessonState = continuingSavedLesson
-      ? lessonStateRef.current
-      : createLessonState(lessonTopic, preparedSource.lessonTree);
-    lessonWrapUpRef.current = isLessonPlanComplete(initialLessonState);
-    if (!continuingSavedLesson) {
-      lessonStateRef.current = initialLessonState;
-      setLessonState(initialLessonState);
-    }
-    const startingConcept = getCurrentConcept(initialLessonState);
-    if (startingConcept?.teaching) {
-      addDebugMessage(
-        `Teaching contract progress: concept=${startingConcept.title}, ` +
-        `next=${initialLessonState.teachingContractProgress[startingConcept.id]
-          ?.nextTeachingPointIndex ?? 0}, total=${startingConcept.teaching.teachingPoints.length}`,
-      );
-    }
-    workspace.setTopicInput(lessonFocus);
-    resetConversationForStart();
-    addDebugMessage(
-      continuingSavedLesson
-        ? `Saved lesson continuation initialized: ${activeSource.name}`
-        : `Lesson initialized from source: ${activeSource.name}`,
-    );
-    addDebugMessage(continuingSavedLesson ? "Saved lesson tree restored" : "Lesson tree initialized");
-    addDebugMessage(
-      `Teaching preferences initialized: depth=${sessionInitialTeachingPreferences.explanationDepth}, ` +
-      `speakingSpeed=${sessionInitialTeachingPreferences.speakingSpeed}`,
-    );
-    const firstConcept = getCurrentConcept(initialLessonState);
-    if (firstConcept) {
-      if (firstConcept.teaching) {
-        addDebugMessage(`Teaching contract loaded: ${firstConcept.title}`);
-      }
-      addDebugMessage(`Atomic concept started: ${firstConcept.title}`);
-    }
-
-    const run = ++conversationRunRef.current;
-    lessonStartupRunRef.current = run;
-    setMicrophoneStatus("Requesting permission");
-    setAiConnectionStatus("Not connected");
-    addDebugMessage("Microphone permission requested");
-
-    // Synchronous inside the click: prepare() resumes playback for iOS, then
-    // getUserMedia starts in the same tick. Permission is awaited before playerReady.
-    const { player, ready: playerReady } = audioSession.createPlayer();
-
-    try {
-      const stream = await audioSession.requestMicrophone();
-      if (!isMountedRef.current || run !== conversationRunRef.current) {
-        stream.getAudioTracks().forEach((track) => track.stop());
-        await player.close();
-        return;
-      }
-
-      audioSession.attachStream(stream, () => {
-        if (!isMountedRef.current || run !== conversationRunRef.current) return;
-        setUserError("The microphone stopped unexpectedly. Start the lesson again.");
-        addDebugMessage("Microphone stream ended unexpectedly");
-        conversationRunRef.current += 1;
-        setMicrophoneStatus("Not active");
-        setAiConnectionStatus("Not connected");
-        updateLessonState((current) => ({ ...current, status: "idle" }));
-        void disposeResources(false);
-      });
-      setMicrophoneStatus("Active");
-      addDebugMessage("Microphone active");
-      await playerReady;
-      if (!isMountedRef.current || run !== conversationRunRef.current) return;
-
-      setAiConnectionStatus("Connecting");
-      const tokenBody = await requestFreshToken();
-      if (!isMountedRef.current || run !== conversationRunRef.current) return;
-
-      addDebugMessage("Live connection opening");
-      const systemInstruction = buildLessonInstruction(
-        lessonFocus,
-        tokenBody.source.name,
-        sessionInitialTeachingPreferences,
-        sessionStartMode,
-      );
-
-      const transport = new LiveTransportManager({
-        model: GEMINI_LIVE_MODEL,
-        systemInstruction,
-        requestToken: requestFreshToken,
-        onMessage: (message) => {
-          if (isMountedRef.current && run === conversationRunRef.current) {
-            handleLiveMessage(message);
-          }
-        },
-        onDebug: addDebugMessage,
-        onStateChange: (state) => {
-          if (!isMountedRef.current || run !== conversationRunRef.current) return;
-          onTransportStateChange(state);
-        },
-        seedFreshRecovery: (socket) => {
-          const coverage = queryLessonState(lessonStateRef.current);
-          socket.seedRecoveryContext({ ...preparedSource, focus: lessonFocus }, {
-            coverage,
-            currentTeachingContract: getCurrentConcept(lessonStateRef.current)?.teaching,
-            contractProgress: coverage.currentTeachingProgress,
-            resumePoint: lessonStateRef.current.resumePoint,
-            teachingPreferences: teachingPreferencesRef.current,
-          });
-        },
-        onFatalError: (message) => {
-          if (!isMountedRef.current || run !== conversationRunRef.current) return;
-          setUserError(`The realtime lesson could not recover: ${message}`);
-          setAiConnectionStatus("Error");
-          setMicrophoneStatus("Not active");
-          updateLessonState((current) => ({ ...current, status: "idle" }));
-          conversationRunRef.current += 1;
-          void disposeResources(false);
-        },
-      });
-      transportRef.current = transport;
-      const session = await transport.connectInitial(tokenBody.token);
-
-      if (!isMountedRef.current || run !== conversationRunRef.current) {
-        transport.close(false);
-        return;
-      }
-
-      setAiConnectionStatus("Connected");
-      emitTestEvent("live.setup-complete");
-      addDebugMessage("Live connection established");
-      addDebugMessage("Source seeding started");
-      if (continuingSavedLesson) {
-        const current = getCurrentConcept(lessonStateRef.current);
-        const contractNext = current?.teaching
-          ? lessonStateRef.current.teachingContractProgress[current.id]?.nextTeachingPointIndex ?? 0
-          : 0;
-        const coverage = queryLessonState(lessonStateRef.current);
-        session.seedRecoveryContext({ ...preparedSource, focus: lessonFocus }, {
-          coverage,
-          currentTeachingContract: getCurrentConcept(lessonStateRef.current)?.teaching,
-          contractProgress: coverage.currentTeachingProgress,
-          persistedResumeContext,
-          resumePoint: lessonStateRef.current.resumePoint,
-          teachingPreferences: teachingPreferencesRef.current,
-        });
-        addDebugMessage(
-          `Persisted resume seed: concept=${persistedResumeContext?.currentConceptTitle || "current lesson topic"}, ` +
-          `status=${persistedResumeContext?.currentConceptStatus || "unknown"}, ` +
-          `resumePointAvailable=${persistedResumeContext?.resumePointAvailable ? "yes" : "no"}, ` +
-          `recentContextEntries=${persistedResumeContext?.recentTeachingContext.length ?? 0}`,
-        );
-        addDebugMessage(
-          `Persisted contract resume: concept=${current?.title || "current lesson topic"}, ` +
-          `next=${contractNext}, total=${current?.teaching?.teachingPoints.length ?? 0}`,
-        );
-        addDebugMessage(
-          `Persisted resume context delivered: ` +
-          `recentContextEntries=${persistedResumeContext?.recentTeachingContext.length ?? 0}, ` +
-          `resumePointAvailable=${persistedResumeContext?.resumePointAvailable ? "yes" : "no"}`,
-        );
-      } else {
-        session.seedInitialSource({
-          ...preparedSource,
-          focus: lessonFocus,
-        });
-      }
-      addDebugMessage("Source seeded into Live context");
-      addDebugMessage("Source grounding ready");
-
-      const microphoneStreamer = audioSession.createStreamer(stream, (chunk) => {
-        if (run !== conversationRunRef.current || transportRef.current !== transport) return;
-        const rms = pcm16Rms(chunk);
-        noiseFloorRef.current += (rms - noiseFloorRef.current) * NOISE_FLOOR_SMOOTHING;
-        if (rms >= Math.max(MIN_ACOUSTIC_RMS, noiseFloorRef.current * ACOUSTIC_ACTIVITY_MULTIPLIER)) {
-          if (Date.now() - lastAcousticLogAtRef.current >= ACOUSTIC_LOG_COOLDOWN_MS) {
-            lastAcousticLogAtRef.current = Date.now();
-            addDebugMessage("Acoustic activity detected");
-          }
-        }
-        if (canForwardMicrophone()) transport.sendAudio(chunk);
-      });
-      await microphoneStreamer.start();
-
-      if (!isMountedRef.current || run !== conversationRunRef.current) {
-        await microphoneStreamer.stop();
-        return;
-      }
-
-      addDebugMessage("Microphone streaming started");
-      updateLessonState((current) => ({
-        ...current,
-        status: "teaching",
-      }));
-      workspace.markLessonStarted();
-      addDebugMessage("Lesson started");
-      lessonActiveRef.current = true;
-      lessonStartupPendingRef.current = false;
-      beginIdleMonitoring();
-      void audioSession.requestWakeLock();
-      const startupImperative = planStartupImperative({
-        wrapUp: lessonWrapUpRef.current,
-        sessionStartMode,
-      });
-      if (startupImperative === "wrap-up") {
-        addDebugMessage("Completed lesson restored in wrap-up");
-        transportRef.current?.sendRealtimeInput({ text: LESSON_WRAP_UP_CONTROL });
-      } else if (startupImperative === "persisted-resume") {
-        const current = getCurrentConcept(lessonStateRef.current);
-        const resumePoint = lessonStateRef.current.resumePoint.trim();
-        addDebugMessage("Persisted lesson continuation started");
-        addDebugMessage(`Resume briefing requested: concept=${current?.title || "current lesson topic"}`);
-        addDebugMessage(`Resume point available: ${resumePoint ? "yes" : "no"}`);
-        addDebugMessage(
-          `Teaching preferences on resume: depth=${sessionInitialTeachingPreferences.explanationDepth}, ` +
-          `speakingSpeed=${sessionInitialTeachingPreferences.speakingSpeed}`,
-        );
-        persistedResumeFirstResponseLoggedRef.current = false;
-        persistedResumeBriefingPendingRef.current = Boolean(assignNextTeachingBeat(
-          PERSISTED_LESSON_RESUME_CONTROL,
-        ));
-        if (persistedResumeBriefingPendingRef.current) {
-          addDebugMessage("Resume briefing control sent");
-        }
-      } else {
-        assignNextTeachingBeat(buildNewLessonStartPrefix(tokenBody.source.name, lessonFocus));
-      }
-    } catch (error) {
-      if (!isMountedRef.current || run !== conversationRunRef.current) return;
-
-      if (isMicrophonePermissionDenied(error)) {
-        setMicrophoneStatus("Permission denied");
-        setUserError("Microphone permission was denied. Allow access in browser settings and try again.");
-        addDebugMessage("Microphone permission denied");
-        await disposeResources(false);
-        return;
-      }
-
-      if (audioSession.hasMicrophoneStream) {
-        setAiConnectionStatus("Error");
-        const message = getRealtimeErrorMessage(error);
-        if (message.toLowerCase().includes("source")) {
-          addDebugMessage(`Source grounding failed: ${message}`);
-        }
-        addDebugMessage(`Realtime error: ${message}`);
-        setUserError(`The realtime lesson could not start: ${message}`);
-        await disposeResources(false);
-        setMicrophoneStatus("Not active");
-        updateLessonState((current) => ({ ...current, status: "idle" }));
-        addDebugMessage("Microphone stopped");
-      } else {
-        setMicrophoneStatus("Error");
-        const message = getMicrophoneErrorMessage(error);
-        setUserError(message);
-        addDebugMessage(`Microphone error: ${message}`);
-        await player.close();
-      }
-    } finally {
-      if (lessonStartupRunRef.current === run) lessonStartupPendingRef.current = false;
-    }
-  };
-
-  const stopConversation = async (reason?: "inactivity" | "confirmed") => {
-    conversationRunRef.current += 1;
-    const ownedDisposal = captureDisposalOwnership();
-    invalidateActiveTeachingBeat("lesson-ended");
-    audioSession.player?.clear();
-    const hadMicrophone = audioSession.hasMicrophoneStream;
-    const hadSession = Boolean(transportRef.current);
-    const stoppedLessonState = pauseLessonForStop();
-    const persistedCurrent = getCurrentConcept(stoppedLessonState);
-    setMicrophoneStatus("Not active");
-    setAiConnectionStatus("Not connected");
-    lessonStateRef.current = stoppedLessonState;
-    setLessonState(stoppedLessonState);
-    addDebugMessage(
-      `Persisting resume state: concept=${persistedCurrent
-        ? `${persistedCurrent.id}/${persistedCurrent.title}`
-        : "none"}, status=${persistedCurrent?.status || "none"}, ` +
-      `resumePointAvailable=${stoppedLessonState.resumePoint ? "yes" : "no"}, ` +
-      `recentContextEntries=${recentTeachingContextRef.current.length}`,
-    );
-    if (persistedCurrent?.teaching) {
-      addDebugMessage(
-        `Persisting teaching progress: concept=${persistedCurrent.id}/${persistedCurrent.title}, ` +
-        `next=${stoppedLessonState.teachingContractProgress[persistedCurrent.id]
-          ?.nextTeachingPointIndex ?? 0}, total=${persistedCurrent.teaching.teachingPoints.length}`,
-      );
-    }
-    await workspace.persistCurrentLesson(stoppedLessonState);
-    await disposeResources(true, ownedDisposal);
-
-    if (reason === "inactivity") {
-      setUserError("The lesson ended after no response to the inactivity check.");
-    } else if (reason === "confirmed") {
-      setUserError("The lesson has ended.");
-    }
-
-    if (hadMicrophone) addDebugMessage("Microphone stopped");
-    if (hadSession) addDebugMessage("Live connection closed");
-  };
-
-  const restartLesson = async () => {
-    if (restartPendingRef.current || !workspace.resumeExistingLessonRef.current) return;
-    restartPendingRef.current = true;
-    setRestartPending(true);
-    setRestartConfirmationOpen(false);
-    try {
-      if (lessonActiveRef.current) await stopConversation();
-      if (await resetCurrentLessonProgress()) await startConversation();
-    } finally {
-      restartPendingRef.current = false;
-      setRestartPending(false);
-    }
-  };
-  restartActiveLessonRef.current = restartLesson;
 
   const microphoneActive = microphoneStatus === "Active";
   const aiConnected = aiConnectionStatus === "Connected";

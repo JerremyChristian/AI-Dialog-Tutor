@@ -4,6 +4,13 @@ import type { LiveTransportState } from "./live-transport-manager";
 // Pure decisions used by the realtime teaching session lifecycle in the page.
 // No sends, refs or React state: callers keep every side effect and its order.
 
+export type MicrophoneStatus =
+  | "Not active"
+  | "Requesting permission"
+  | "Active"
+  | "Permission denied"
+  | "Error";
+
 export type AiConnectionStatus = "Not connected" | "Connecting" | "Connected" | "Error";
 
 export type StartupImperative = "wrap-up" | "persisted-resume" | "new";
