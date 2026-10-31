@@ -261,7 +261,11 @@ test("generation completion commits only after natural audio drain", async ({ pa
   expect(afterGenerationComplete.snapshot.deliveryCursor).toBe(0);
   expect(afterGenerationComplete.events.map(({ name }) => name)).not.toContain("beat.commit");
   await expect.poll(async () => (await readTestState(page)).snapshot.deliveryCursor).toBe(1);
-  expect((await readTestState(page)).events.map(({ name }) => name)).toContain("tutor.audio-ended");
+  await page.waitForTimeout(100);
+  const afterNaturalDrain = await readTestState(page);
+  expect(afterNaturalDrain.snapshot.deliveryCursor).toBe(1);
+  expect(afterNaturalDrain.events.map(({ name }) => name)).toContain("tutor.audio-ended");
+  expect(afterNaturalDrain.events.filter(({ name }) => name === "beat.commit")).toHaveLength(1);
 });
 
 test("track ending disposes the run and stale old-socket audio cannot mutate it", async ({ page }) => {
