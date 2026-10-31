@@ -240,4 +240,34 @@ export async function readAppState<T = unknown>(page: Page, key = "activeLessonI
     };
   }), key);
 }
+export async function holdSavedLessonWrites(page: Page) {
+  await page.evaluate((lessonId) => new Promise<void>((resolve, reject) => {
+    const open = indexedDB.open("ai-dialog-tutor", 2);
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const transaction = db.transaction("savedLessons", "readwrite");
+      const store = transaction.objectStore("savedLessons");
+      let held = true;
+      const keepAlive = () => {
+        if (!held) return;
+        const request = store.get(lessonId);
+        request.onsuccess = keepAlive;
+        request.onerror = () => reject(request.error);
+      };
+      Reflect.set(window, "__QA_RELEASE_SAVED_LESSON_WRITES__", () => { held = false; });
+      transaction.oncomplete = () => db.close();
+      transaction.onerror = () => reject(transaction.error);
+      keepAlive();
+      resolve();
+    };
+  }), QA_LESSON_ID);
+}
+export async function releaseSavedLessonWrites(page: Page) {
+  await page.evaluate(() => {
+    const release = Reflect.get(window, "__QA_RELEASE_SAVED_LESSON_WRITES__") as (() => void) | undefined;
+    if (!release) throw new Error("Saved-lesson write gate was not installed");
+    release();
+  });
+}
 export function textOf(message: Record<string, unknown>) { return JSON.stringify(message); }

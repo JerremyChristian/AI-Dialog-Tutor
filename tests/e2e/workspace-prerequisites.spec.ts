@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import {
   deliverLive,
   getExternalRequests,
+  holdSavedLessonWrites,
   installFakeLive,
   installNoExternalNetworkGuard,
   openLessonAndStart,
@@ -9,6 +10,7 @@ import {
   readAppState,
   readSavedLesson,
   readTestState,
+  releaseSavedLessonWrites,
 } from "../helpers/fake-live";
 
 type StoredLesson = {
@@ -126,6 +128,38 @@ test("deleting the current lesson removes its record and pointer and returns to 
   expect((await readTestState(page)).snapshot.lessonId).toBeNull();
   await expect(page.getByRole("heading", { name: "Library" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "No lessons yet" })).toBeVisible();
+});
+
+test("stale current-lesson delete completion does not reset a lesson started while deletion is in flight", async ({ page }) => {
+  await installFakeLive(page, { persisted: true, persistedCursor: 1 });
+  await openSeededWorkspace(page);
+  await page.locator(".continue-card").getByRole("button", { name: "Continue" }).click();
+  const before = await readTestState(page);
+  expect(before.snapshot.deliveryCursor).toBe(1);
+
+  await holdSavedLessonWrites(page);
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete Lesson" }).click();
+  await expect(page.getByRole("button", { name: "Delete Lesson" })).toBeDisabled();
+
+  await page.getByRole("button", { name: "Continue Lesson", exact: true }).click();
+  await expect.poll(async () => (await readTestState(page)).snapshot.lessonActive).toBe(true);
+  expect((await readTestState(page)).snapshot.deliveryCursor).toBe(1);
+
+  await releaseSavedLessonWrites(page);
+  await expect.poll(() => readSavedLesson(page)).toBeUndefined();
+  await expect.poll(() => readAppState(page)).toBeUndefined();
+
+  const afterDelete = await readTestState(page);
+  expect(afterDelete.snapshot.lessonActive).toBe(true);
+  expect.soft({
+    lessonId: afterDelete.snapshot.lessonId,
+    deliveryCursor: afterDelete.snapshot.deliveryCursor,
+  }, "stale delete completion must preserve the active workspace and its canonical progress").toEqual({
+    lessonId: QA_LESSON_ID,
+    deliveryCursor: 1,
+  });
+  await page.close();
 });
 
 test("hydration-triggered identical autosave keeps updatedAt stable", async ({ page }) => {
