@@ -4,6 +4,27 @@ export const QA_LESSON_ID = "qa-session-lifecycle-001";
 
 export type LiveSend = { socketId: number; message: Record<string, unknown> };
 
+const externalRequests = new WeakMap<Page, string[]>();
+
+export async function installNoExternalNetworkGuard(page: Page) {
+  const blocked: string[] = [];
+  externalRequests.set(page, blocked);
+  await page.route("**/*", async (route) => {
+    const url = new URL(route.request().url());
+    if ((url.protocol === "http:" || url.protocol === "https:") &&
+        url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
+      blocked.push(url.href);
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.continue();
+  });
+}
+
+export function getExternalRequests(page: Page) {
+  return [...(externalRequests.get(page) ?? [])];
+}
+
 export async function installFakeLive(page: Page, options: {
   persisted?: boolean;
   reviewReady?: boolean;
@@ -14,6 +35,9 @@ export async function installFakeLive(page: Page, options: {
   resumePoint?: string;
   recentTeachingContext?: Array<{ conceptId: string; excerpt: string }>;
   teachingPreferences?: { explanationDepth: "brief" | "normal" | "detailed"; speakingSpeed: "slow" | "normal" | "fast" };
+  schemaVersion?: number;
+  cloudOwnerId?: string | null;
+  secondLesson?: boolean;
 } = {}) {
   await page.route("**/auth/v1/**", (route) => route.fulfill({
     status: 401, contentType: "application/json", body: JSON.stringify({ message: "Not signed in" }),
@@ -22,7 +46,7 @@ export async function installFakeLive(page: Page, options: {
     status: 200, contentType: "application/json",
     body: JSON.stringify({ token: "local-test-token", source: { name: "plc-notes.txt", mimeType: "text/plain" } }),
   }));
-  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences }) => {
+  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences, schemaVersion, cloudOwnerId, secondLesson }) => {
     const NativeWebSocket = window.WebSocket;
     const sockets: FakeLiveWebSocket[] = [];
     const sends: Array<{ socketId: number; message: Record<string, unknown> }> = [];
@@ -101,7 +125,7 @@ export async function installFakeLive(page: Page, options: {
       },
     };
     const lesson = {
-      schemaVersion: 1, id: lessonId, title: "PLC Fundamentals", lessonFocus: "PLC fundamentals", hasStarted: persisted || completed,
+      schemaVersion, id: lessonId, title: "PLC Fundamentals", lessonFocus: "PLC fundamentals", hasStarted: persisted || completed,
       source: { metadata: { name: "plc-notes.txt", mimeType: "text/plain", sizeBytes: 128, status: "ready" }, prepared: {
         name: "plc-notes.txt", mimeType: "text/plain", text: "A PLC is a rugged industrial computer used to control machines and processes.",
         lessonTree: [{ id: "what-is-a-plc", title: "What is a PLC?", parentId: null, order: 0, teaching: {
@@ -112,7 +136,7 @@ export async function installFakeLive(page: Page, options: {
         "what-is-a-plc": firstNode,
         ...(reviewReady ? { "plc-scan-cycle": secondNode } : {}),
       }, teachingContractProgress: { "what-is-a-plc": { nextTeachingPointIndex: persistedCursor }, ...(reviewReady ? { "plc-scan-cycle": { nextTeachingPointIndex: 0 } } : {}) }, resumePoint, interruptionCount: persistedStatus === "interrupted" ? 1 : 0, lastUserTranscript: "not persisted by snapshots", lastAssistantTranscript: "not persisted by snapshots" },
-      recentTeachingContext, teachingPreferences, createdAt: now, updatedAt: now,
+      recentTeachingContext, teachingPreferences, createdAt: now, updatedAt: now, cloudOwnerId,
     };
     const seedMarker = `__qa_lesson_seeded__:${lessonId}`;
     if (sessionStorage.getItem(seedMarker)) return;
@@ -123,7 +147,31 @@ export async function installFakeLive(page: Page, options: {
       if (!db.objectStoreNames.contains("appState")) db.createObjectStore("appState", { keyPath: "key" });
       if (!db.objectStoreNames.contains("processingJobs")) db.createObjectStore("processingJobs", { keyPath: "id" }).createIndex("createdAt", "createdAt");
     };
-    request.onsuccess = () => { const db = request.result; const tx = db.transaction(["savedLessons", "appState"], "readwrite"); tx.objectStore("savedLessons").put(lesson); tx.objectStore("appState").put({ key: "activeLessonId:anonymous", value: lessonId }); tx.oncomplete = () => db.close(); };
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction(["savedLessons", "appState"], "readwrite");
+      const lessons = tx.objectStore("savedLessons");
+      lessons.put(lesson);
+      if (secondLesson) {
+        const second = structuredClone(lesson);
+        second.schemaVersion = 1;
+        second.id = "qa-hydraulics-002";
+        second.title = "Hydraulics Basics";
+        second.lessonFocus = "hydraulic systems";
+        second.source.metadata.name = "hydraulics.txt";
+        second.source.prepared.name = "hydraulics.txt";
+        second.source.prepared.text = "Hydraulic pressure transmits force through fluid.";
+        second.lessonState.topic = "Hydraulic systems";
+        second.lessonState.teachingContractProgress["what-is-a-plc"].nextTeachingPointIndex = 0;
+        second.lessonState.resumePoint = "hydraulic-only resume point";
+        second.recentTeachingContext = [{ conceptId: "what-is-a-plc", excerpt: "Hydraulic-only context" }];
+        second.createdAt = new Date(Date.parse(now) - 1_000).toISOString();
+        second.updatedAt = second.createdAt;
+        lessons.put(second);
+      }
+      tx.objectStore("appState").put({ key: "activeLessonId:anonymous", value: lessonId });
+      tx.oncomplete = () => db.close();
+    };
   }, {
     lessonId: QA_LESSON_ID,
     persisted: options.persisted ?? false,
@@ -135,6 +183,9 @@ export async function installFakeLive(page: Page, options: {
     resumePoint: options.resumePoint ?? (options.persisted || options.completed ? "after introducing the PLC definition" : ""),
     recentTeachingContext: options.recentTeachingContext ?? (options.persisted ? [{ conceptId: "what-is-a-plc", excerpt: "A PLC is a rugged industrial computer." }] : []),
     teachingPreferences: options.teachingPreferences ?? { explanationDepth: "normal", speakingSpeed: "normal" },
+    schemaVersion: options.schemaVersion ?? 1,
+    cloudOwnerId: options.cloudOwnerId ?? null,
+    secondLesson: options.secondLesson ?? false,
   });
 }
 
@@ -147,7 +198,7 @@ export async function openLessonAndStart(page: Page, persisted = false) {
     await page.locator(".continue-card").getByRole("button", { name: "Continue" }).click();
   } else {
     await page.getByRole("button", { name: "Library" }).click();
-    const card = page.locator(".lesson-card").filter({ hasText: "PLC Fundamentals" });
+    const card = page.locator(".lesson-card").filter({ hasText: /PLC Fundamentals|plc-notes\.txt/ });
     await card.getByRole("button", { name: "Start" }).click();
   }
   await page.getByRole("button", { name: persisted ? "Continue Lesson" : "Start Lesson", exact: true }).click();
@@ -176,5 +227,17 @@ export async function readSavedLesson<T = Record<string, unknown>>(page: Page, i
       get.onsuccess = () => { db.close(); resolve(get.result as T | undefined); };
     };
   }), id);
+}
+export async function readAppState<T = unknown>(page: Page, key = "activeLessonId:anonymous"): Promise<T | undefined> {
+  return page.evaluate((stateKey) => new Promise<T | undefined>((resolve, reject) => {
+    const request = indexedDB.open("ai-dialog-tutor", 2);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      const get = db.transaction("appState", "readonly").objectStore("appState").get(stateKey);
+      get.onerror = () => { db.close(); reject(get.error); };
+      get.onsuccess = () => { db.close(); resolve(get.result?.value as T | undefined); };
+    };
+  }), key);
 }
 export function textOf(message: Record<string, unknown>) { return JSON.stringify(message); }

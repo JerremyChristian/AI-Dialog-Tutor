@@ -52,8 +52,9 @@ test("generation completion commits only after natural audio drain", async ({ pa
   await deliverLive(page, { serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] } } });
   await deliverLive(page, { serverContent: { generationComplete: true } });
 
-  expect((await readTestState(page)).snapshot.deliveryCursor).toBe(0);
-  expect((await readTestState(page)).events.map(({ name }) => name)).not.toContain("beat.commit");
+  const afterGenerationComplete = await readTestState(page);
+  expect(afterGenerationComplete.snapshot.deliveryCursor).toBe(0);
+  expect(afterGenerationComplete.events.map(({ name }) => name)).not.toContain("beat.commit");
   await expect.poll(async () => (await readTestState(page)).snapshot.deliveryCursor).toBe(1);
   expect((await readTestState(page)).events.map(({ name }) => name)).toContain("tutor.audio-ended");
 });

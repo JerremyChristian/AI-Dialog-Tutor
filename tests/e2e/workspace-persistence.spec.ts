@@ -1,14 +1,24 @@
 import { expect, test } from "@playwright/test";
 import {
   deliverLive,
+  getExternalRequests,
   getLiveSends,
   installFakeLive,
+  installNoExternalNetworkGuard,
   openLessonAndStart,
   QA_LESSON_ID,
   readSavedLesson,
   readTestState,
   textOf,
 } from "../helpers/fake-live";
+
+test.beforeEach(async ({ page }) => {
+  await installNoExternalNetworkGuard(page);
+});
+
+test.afterEach(async ({ page }) => {
+  expect(getExternalRequests(page), "workspace QA must not contact external providers").toEqual([]);
+});
 
 type StoredLesson = {
   id: string;
