@@ -338,6 +338,7 @@ export default function Home() {
         ? "learner"
         : state.lastAssistantTranscript ? "tutor" : null,
       lessonActive: lessonActiveRef.current,
+      startupPending: lessonStartupPendingRef.current,
       persistenceHydrated: workspace.persistenceHydratedRef.current,
       cloudAuthReady: cloudAuthReadyRef.current,
       cloudUserId: cloudUserIdTestRef.current,
