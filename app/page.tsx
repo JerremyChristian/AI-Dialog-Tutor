@@ -38,9 +38,7 @@ import {
   type LiveTransportState,
 } from "../lib/live-transport-manager";
 import {
-  activateNextSequentialConcept,
   buildLessonInstruction,
-  commitDeliveredTeachingBeat,
   createLessonState,
   deriveResumePoint,
   GEMINI_LIVE_MODEL,
@@ -58,11 +56,17 @@ import {
   type LessonState,
 } from "../lib/lesson-state";
 import {
-  computeNextTeachingPointIndexAfterBeat,
-  isBeatCommitValid,
-  resolveNextPresentationBeat,
-  type ResolvedTeachingBeat,
-} from "../lib/teaching-delivery";
+  buildTeachingBeatControl,
+  createActiveBeat,
+  createPresentationBeat,
+  evaluateLessonBeatCommit,
+  evaluateReviewBeatCommit,
+  planLessonBeatAssignment,
+  planReviewBeatAssignment,
+  type ActiveTeachingBeat,
+  type NodeReviewState,
+  type PresentationBeat,
+} from "../lib/teaching-beat-runtime";
 import {
   DEFAULT_TEACHING_PREFERENCES,
   EXPLANATION_DEPTHS,
@@ -128,24 +132,6 @@ type TeachingPreferenceUpdate = Partial<TeachingPreferences>;
 type PendingTeachingPreferences = Partial<TeachingPreferences>;
 type LibraryView = "index" | "lesson" | "new";
 type AppearancePreference = "system" | "light" | "dark";
-
-type ActiveTeachingBeat = ResolvedTeachingBeat & {
-  conceptId: string;
-  mode: "lesson" | "review";
-  generationEpoch: number;
-  generationComplete: boolean;
-  audioNaturallyDrained: boolean;
-  cancelled: boolean;
-};
-
-type PresentationBeat = ResolvedTeachingBeat & { conceptId: string };
-
-type NodeReviewState = {
-  nodeId: string;
-  nextTeachingPointIndex: number;
-  returnPresentationBeat: PresentationBeat | null;
-  complete: boolean;
-};
 
 type FarewellTurn = {
   conversationRun: number;
@@ -551,78 +537,14 @@ export default function Home() {
     addDebugMessage(`Teaching beat interrupted: epoch=${active.generationEpoch}, commit=no, reason=${reason}`);
   }
 
-  function buildTeachingBeatControl(active: ActiveTeachingBeat, prefix = "") {
-    const state = lessonStateRef.current;
-    const concept = state.nodes[active.conceptId];
-    const contract = concept?.teaching;
-    if (!contract) return "";
-    const points = active.teachingPointIndexes.map((index) => ({
-      index,
-      content: contract.teachingPoints[index],
-      sourceReferences: contract.teachingPointSourceReferences?.[index] ?? [],
-    }));
-    const criteria = active.unit.completionCriteriaIndexes.map((index) => ({
-      index,
-      content: contract.completionCriteria[index],
-    }));
-    const position = active.isFirstBeatInUnit
-      ? active.isFinalBeatInUnit ? "only" : "first"
-      : active.isFinalBeatInUnit ? "final" : "middle";
-    const otherOutstandingConcept = Object.values(state.nodes).some((candidate) =>
-      candidate.id !== active.conceptId && candidate.childrenIds.length === 0 &&
-      Boolean(candidate.teaching) && candidate.status !== "taught" &&
-      candidate.status !== "skipped",
-    );
-    const completesPlannedLesson = active.mode === "lesson" && active.teachingPointIndexes.at(-1) ===
-      contract.teachingPoints.length - 1 && !otherOutstandingConcept;
-    const completesReview = active.mode === "review" && active.teachingPointIndexes.at(-1) ===
-      contract.teachingPoints.length - 1;
-    return `${prefix}\n[[APP_CONTROL:TEACH_PRESENTATION_BEAT]]
-Teach exactly this application-assigned presentation beat as one natural source-grounded spoken explanation. Do not call progress or complete.
-CONCEPT: ${concept.title}
-DELIVERY_UNIT_OBJECTIVE: ${active.unit.objective}
-BEAT_POSITION: ${position}
-ASSIGNED_TEACHING_POINTS: ${JSON.stringify(points)}
-RELEVANT_COMPLETION_CRITERIA: ${JSON.stringify(criteria)}
-${active.isFirstBeatInUnit ? "Establish the unit naturally." : "Continue directly from the preceding explanation without greeting, praise, announcing a new section, or unnecessary recap."}
-${active.mode === "review"
-  ? completesReview
-    ? "This is the final beat of a bounded node review. Briefly check whether the learner has questions or is ready to return to the main lesson. Do not continue into another concept and do not describe this review as new canonical progress."
-    : "This review continues after this beat. Do not ask a question, invite learner interaction, or create a check-in merely because a delivery unit ended; finish with natural continuity because the application will immediately assign the next review beat."
-  : completesPlannedLesson
-  ? `All planned lesson content will be covered after this beat. ${LESSON_WRAP_UP_CONTROL} Ask naturally whether the learner has any final questions. Do not restart or revisit content unless they ask. If they clearly have no more questions, call session_control with action end.`
-  : active.isFinalBeatInUnit
-    ? "Briefly synthesize if useful, then create a natural learner interaction boundary; vary the check-in and do not use a fixed script."
-    : "Do not ask a question or invite learner interaction at the end; finish with natural continuity because the application will immediately assign the next beat."}`.trim();
-  }
-
   function assignNextTeachingBeat(prefix = "", sendInstruction = true): ActiveTeachingBeat | null {
     if (!lessonActiveRef.current || activeTeachingBeatRef.current ||
         closingTurnRef.current || nodeReviewRef.current) return null;
-    let state = lessonStateRef.current;
-    let concept = getCurrentConcept(state);
-    let activatedState: LessonState | null = null;
-    if (concept?.status === "taught" && !lessonWrapUpRef.current) {
-      const activated = activateNextSequentialConcept(state);
-      if (!activated) return null;
-      state = activated;
-      activatedState = activated;
-      concept = getCurrentConcept(activated);
-    }
-    if (!concept?.teaching) return null;
-    const nextIndex = state.teachingContractProgress[concept.id]?.nextTeachingPointIndex ?? 0;
-    const resolved = resolveNextPresentationBeat(concept.teaching, nextIndex);
-    if (!resolved) return null;
+    const plan = planLessonBeatAssignment(lessonStateRef.current, { wrapUp: lessonWrapUpRef.current });
+    if (!plan) return null;
+    const { concept, resolved, activatedState } = plan;
     const generationEpoch = ++generationEpochRef.current;
-    const active: ActiveTeachingBeat = {
-      ...resolved,
-      conceptId: concept.id,
-      mode: "lesson",
-      generationEpoch,
-      generationComplete: false,
-      audioNaturallyDrained: false,
-      cancelled: false,
-    };
+    const active = createActiveBeat(resolved, concept.id, "lesson", generationEpoch);
     activeTeachingBeatRef.current = active;
     emitTestEvent("lesson.generation-started", {
       conceptId: concept.id,
@@ -630,7 +552,7 @@ ${active.mode === "review"
       deliveryUnitIndex: resolved.deliveryUnitIndex,
       beatIndex: resolved.beatIndex,
     });
-    const presentation = { ...resolved, conceptId: concept.id };
+    const presentation = createPresentationBeat(resolved, concept.id);
     presentationBeatRef.current = presentation;
     setPresentationBeat(presentation);
     playerRef.current?.beginBatch(generationEpoch, (epoch) => {
@@ -653,7 +575,8 @@ ${active.mode === "review"
     addDebugMessage(
       `Presentation beat changed: concept=${concept.id}, unit=${resolved.deliveryUnitIndex}, beat=${resolved.beatIndex}`,
     );
-    const instruction = buildTeachingBeatControl(active, prefix);
+    // Built from the pre-activation ref state: activation is applied only after the send below.
+    const instruction = buildTeachingBeatControl(lessonStateRef.current, active, prefix);
     if (sendInstruction && (!instruction || !transportRef.current?.sendRealtimeInput({ text: instruction }))) {
       invalidateActiveTeachingBeat("send-failed");
       return null;
@@ -668,23 +591,15 @@ ${active.mode === "review"
 
   function assignNextReviewBeat(prefix = "", sendInstruction = true): ActiveTeachingBeat | null {
     const review = nodeReviewRef.current;
-    const concept = review ? lessonStateRef.current.nodes[review.nodeId] : undefined;
-    if (!lessonActiveRef.current || !review || review.complete || !concept?.teaching ||
+    if (!lessonActiveRef.current || !review ||
         activeTeachingBeatRef.current || closingTurnRef.current) return null;
-    const resolved = resolveNextPresentationBeat(concept.teaching, review.nextTeachingPointIndex);
-    if (!resolved) return null;
+    const plan = planReviewBeatAssignment(lessonStateRef.current, review);
+    if (!plan) return null;
+    const { concept, resolved } = plan;
     const generationEpoch = ++generationEpochRef.current;
-    const active: ActiveTeachingBeat = {
-      ...resolved,
-      conceptId: concept.id,
-      mode: "review",
-      generationEpoch,
-      generationComplete: false,
-      audioNaturallyDrained: false,
-      cancelled: false,
-    };
+    const active = createActiveBeat(resolved, concept.id, "review", generationEpoch);
     activeTeachingBeatRef.current = active;
-    const presentation = { ...resolved, conceptId: concept.id };
+    const presentation = createPresentationBeat(resolved, concept.id);
     presentationBeatRef.current = presentation;
     setPresentationBeat(presentation);
     playerRef.current?.beginBatch(generationEpoch, (epoch) => {
@@ -702,7 +617,7 @@ ${active.mode === "review"
       `wholeNodeFinal=${resolved.teachingPointIndexes.at(-1) === concept.teaching.teachingPoints.length - 1} ` +
       `unitFinal=${resolved.isFinalBeatInUnit}`,
     );
-    const instruction = buildTeachingBeatControl(active, prefix ||
+    const instruction = buildTeachingBeatControl(lessonStateRef.current, active, prefix ||
       "Review this concept from its beginning using the existing lesson contract. This is a bounded review and must not alter canonical lesson coverage.");
     if (sendInstruction && (!instruction || !transportRef.current?.sendRealtimeInput({ text: instruction }))) {
       invalidateActiveTeachingBeat("review-send-failed");
@@ -786,22 +701,15 @@ ${active.mode === "review"
     }
     const state = lessonStateRef.current;
     if (active.mode === "review") {
-      const review = nodeReviewRef.current;
-      if (!review || review.nodeId !== active.conceptId || active.cancelled ||
-          !active.generationComplete || !active.audioNaturallyDrained ||
-          active.generationEpoch !== generationEpochRef.current ||
-          active.teachingPointIndexes[0] !== review.nextTeachingPointIndex) return;
-      const concept = state.nodes[review.nodeId];
-      if (!concept?.teaching) return;
-      const nextIndex = computeNextTeachingPointIndexAfterBeat(active.teachingPointIndexes);
-      const complete = nextIndex >= concept.teaching.teachingPoints.length;
-      const nextReview = { ...review, nextTeachingPointIndex: nextIndex, complete };
+      const evaluation = evaluateReviewBeatCommit(state, nodeReviewRef.current, active, generationEpochRef.current);
+      if (evaluation.kind !== "committed") return;
+      const { review: nextReview, nextIndex, complete } = evaluation;
       nodeReviewRef.current = nextReview;
       setNodeReview(nextReview);
       activeTeachingBeatRef.current = null;
       playerRef.current?.cancelBatch(epoch);
-      addDebugMessage(`Node review beat committed: concept=${review.nodeId}, next=${nextIndex}, complete=${complete}`);
-      emitTestEvent("beat.commit", { mode: "review", conceptId: review.nodeId, nextIndex });
+      addDebugMessage(`Node review beat committed: concept=${nextReview.nodeId}, next=${nextIndex}, complete=${complete}`);
+      emitTestEvent("beat.commit", { mode: "review", conceptId: nextReview.nodeId, nextIndex });
       addReviewFlowDiagnostic(
         "review-beat-committed",
         `nextReviewCursor=${nextIndex} nodeComplete=${complete} ` +
@@ -810,40 +718,28 @@ ${active.mode === "review"
       if (!complete) assignNextReviewBeat();
       return;
     }
-    const currentNext = state.teachingContractProgress[active.conceptId]?.nextTeachingPointIndex ?? 0;
-    if (!isBeatCommitValid({
-      expectedConceptId: active.conceptId,
-      currentConceptId: state.currentNodeId,
-      expectedEpoch: active.generationEpoch,
-      currentEpoch: activeTeachingBeatRef.current?.generationEpoch ?? null,
-      expectedStartIndex: active.teachingPointIndexes[0],
-      currentNextTeachingPointIndex: currentNext,
-      generationComplete: active.generationComplete,
-      audioNaturallyDrained: active.audioNaturallyDrained,
-      cancelled: active.cancelled,
-      lessonActive: lessonActiveRef.current,
-    })) return;
-    const transition = commitDeliveredTeachingBeat(state, active.conceptId, active.teachingPointIndexes);
-    if (!transition.result.ok) {
+    const evaluation = evaluateLessonBeatCommit(state, active, lessonActiveRef.current);
+    if (evaluation.kind === "not-ready") return;
+    if (evaluation.kind === "rejected") {
       invalidateActiveTeachingBeat("commit-rejected");
       return;
     }
-    const nextIndex = computeNextTeachingPointIndexAfterBeat(active.teachingPointIndexes);
-    lessonStateRef.current = transition.state;
-    setLessonState(transition.state);
+    const { state: committedState, previousIndex: currentNext, nextIndex } = evaluation;
+    lessonStateRef.current = committedState;
+    setLessonState(committedState);
     emitTestEvent("beat.commit", { mode: "lesson", conceptId: active.conceptId, nextIndex });
     emitTestEvent("delivery.cursor-changed", { conceptId: active.conceptId, from: currentNext, to: nextIndex });
-    emitTestEvent("coverage.changed", { conceptId: active.conceptId, status: transition.state.nodes[active.conceptId]?.status });
+    emitTestEvent("coverage.changed", { conceptId: active.conceptId, status: committedState.nodes[active.conceptId]?.status });
     activeTeachingBeatRef.current = null;
     playerRef.current?.cancelBatch(epoch);
     addDebugMessage(
       `Teaching beat committed: concept=${active.conceptId}, points=${active.teachingPointIndexes[0]}-${active.teachingPointIndexes.at(-1)}, nextTeachingPointIndex=${nextIndex}`,
     );
-    if (transition.state.status === "completed") {
+    if (evaluation.wrapUp) {
       lessonWrapUpRef.current = true;
       addDebugMessage(`Lesson wrap-up entered: finalConcept=${active.conceptId}`);
     }
-    if (!active.isFinalBeatInUnit) {
+    if (evaluation.autoChain) {
       addDebugMessage(
         `Teaching beat auto-chain: from=${active.deliveryUnitIndex}/${active.beatIndex} ` +
         `to=${active.deliveryUnitIndex}/${active.beatIndex + 1}`,
@@ -2214,7 +2110,7 @@ ${active.mode === "review"
           } else if (!reviewResumeGuardRef.current && !isLessonPlanComplete(lessonStateRef.current)) {
             assignment = assignNextTeachingBeat("", false);
           }
-          if (assignment) assignmentControl = buildTeachingBeatControl(assignment);
+          if (assignment) assignmentControl = buildTeachingBeatControl(lessonStateRef.current, assignment);
         }
         if (postResumeQueryReceived) {
           addDebugMessage("Post-resume continuity snapshot prepared");
@@ -2260,7 +2156,7 @@ ${active.mode === "review"
         }
         if (transition.result.ok) {
           const assignment = assignNextTeachingBeat("", false);
-          if (assignment) assignmentControl = buildTeachingBeatControl(assignment);
+          if (assignment) assignmentControl = buildTeachingBeatControl(lessonStateRef.current, assignment);
         }
         if (action === "navigate") {
           if (isRoadmapNavigation) {
