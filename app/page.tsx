@@ -24,7 +24,6 @@ import {
   ACOUSTIC_ACTIVITY_MULTIPLIER,
   ACOUSTIC_LOG_COOLDOWN_MS,
   ENGAGEMENT_CHECK_INTERVAL_MS,
-  IDLE_AFTER_MS,
   IDLE_CONFIRMATION_MS,
   MIN_ACOUSTIC_RMS,
   NOISE_FLOOR_SMOOTHING,
@@ -32,6 +31,25 @@ import {
   pcm16Rms,
   type EngagementState,
 } from "../lib/engagement";
+import {
+  createFarewellTurn,
+  farewellCompletionDiagnostic,
+  isCurrentFarewell,
+  isFarewellDrainCurrent,
+  isFarewellReadyToFinish,
+  type FarewellTurn,
+} from "../lib/farewell-controller";
+import {
+  canRequestIdleConfirmation,
+  classifyMeaningfulSpeech,
+  IDLE_CONFIRMATION_CONTROL_TEXT,
+  planIdleConfirmationResolution,
+  planQuickResponse,
+  shouldEndForInactivity,
+  shouldLogMeaningfulActivity,
+  shouldRequestIdleConfirmation,
+  type QuickResponse,
+} from "../lib/idle-engagement";
 import {
   LiveTransportManager,
   type LiveTransportState,
@@ -156,20 +174,10 @@ type InstallPromptEvent = Event & {
   userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
 };
 
-type QuickResponse = "Yes" | "Repeat" | "Continue";
 type TeachingPreferenceUpdate = Partial<TeachingPreferences>;
 type PendingTeachingPreferences = Partial<TeachingPreferences>;
 type LibraryView = "index" | "lesson" | "new";
 type AppearancePreference = "system" | "light" | "dark";
-
-type FarewellTurn = {
-  conversationRun: number;
-  generationEpoch: number;
-  generationComplete: boolean;
-  audioReceived: boolean;
-  audioNaturallyDrained: boolean;
-  completionStarted: boolean;
-};
 
 type ConversationContinuity = {
   lastMeaningfulLearnerTranscript?: string;
@@ -618,18 +626,12 @@ export default function Home() {
 
   function maybeFinishFarewell() {
     const farewell = closingTurnRef.current;
-    if (!farewell || farewell.completionStarted ||
-        farewell.conversationRun !== conversationRunRef.current ||
-        farewell.generationEpoch !== generationEpochRef.current ||
-        !farewell.generationComplete ||
-        (farewell.audioReceived && !farewell.audioNaturallyDrained)) return;
+    if (!isFarewellReadyToFinish(farewell, conversationRunRef.current, generationEpochRef.current)) return;
     farewell.completionStarted = true;
     assistantSpeakingRef.current = false;
     transportRef.current?.setAssistantSpeaking(false);
     setShowLessonComplete(true);
-    addDebugMessage(farewell.audioReceived
-      ? "FAREWELL_FLOW audio-drained"
-      : "FAREWELL_FLOW zero-audio");
+    addDebugMessage(farewellCompletionDiagnostic(farewell));
     addDebugMessage("FAREWELL_FLOW completion-animation");
     completionAnimationTimerRef.current = setTimeout(() => {
       completionAnimationTimerRef.current = null;
@@ -669,19 +671,11 @@ export default function Home() {
     if (closingTurnRef.current || restartPendingRef.current) return false;
     invalidateActiveTeachingBeat("lesson-closing");
     const generationEpoch = ++generationEpochRef.current;
-    closingTurnRef.current = {
-      conversationRun: conversationRunRef.current,
-      generationEpoch,
-      generationComplete: false,
-      audioReceived: false,
-      audioNaturallyDrained: false,
-      completionStarted: false,
-    };
+    closingTurnRef.current = createFarewellTurn(conversationRunRef.current, generationEpoch);
     setFarewellFinishing(true);
     playerRef.current?.beginBatch(generationEpoch, (epoch) => {
       const farewell = closingTurnRef.current;
-      if (!farewell || farewell.conversationRun !== conversationRunRef.current ||
-          farewell.generationEpoch !== epoch || epoch !== generationEpochRef.current) return;
+      if (!isFarewellDrainCurrent(farewell, conversationRunRef.current, epoch, generationEpochRef.current)) return;
       farewell.audioNaturallyDrained = true;
       maybeFinishFarewell();
     });
@@ -831,7 +825,7 @@ export default function Home() {
   const markMeaningfulActivity = () => {
     const now = Date.now();
     lastMeaningfulLearnerActivityAtRef.current = now;
-    if (engagementStateRef.current === "active") {
+    if (shouldLogMeaningfulActivity(engagementStateRef.current)) {
       addDebugMessage("Meaningful learner activity");
     }
   };
@@ -1256,20 +1250,20 @@ export default function Home() {
   const scheduleIdleEnd = () => {
     if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
     confirmationTimerRef.current = setTimeout(() => {
-      if (engagementStateRef.current !== "confirming") return;
+      if (!shouldEndForInactivity(engagementStateRef.current)) return;
       addDebugMessage("Session ended due to inactivity");
       void stopConversation("inactivity");
     }, IDLE_CONFIRMATION_MS);
   };
 
   const requestIdleConfirmation = () => {
-    if (!lessonActiveRef.current || engagementStateRef.current === "confirming") return;
+    if (!canRequestIdleConfirmation(lessonActiveRef.current, engagementStateRef.current)) return;
     updateEngagementState("possibly-idle");
     addDebugMessage("Possible inactivity");
     updateEngagementState("confirming");
     addDebugMessage("Idle confirmation requested");
     transportRef.current?.sendRealtimeInput({
-      text: "[[APP_CONTROL:IDLE_CONFIRMATION]]",
+      text: IDLE_CONFIRMATION_CONTROL_TEXT,
     });
     scheduleIdleEnd();
   };
@@ -1279,9 +1273,12 @@ export default function Home() {
     lastMeaningfulLearnerActivityAtRef.current = now;
     updateEngagementState("active");
     engagementTimerRef.current = setInterval(() => {
-      if (!lessonActiveRef.current || engagementStateRef.current !== "active") return;
-      const lastMeaningful = lastMeaningfulLearnerActivityAtRef.current ?? Date.now();
-      if (Date.now() - lastMeaningful < IDLE_AFTER_MS) return;
+      if (!shouldRequestIdleConfirmation(
+        lessonActiveRef.current,
+        engagementStateRef.current,
+        lastMeaningfulLearnerActivityAtRef.current,
+        Date.now(),
+      )) return;
       requestIdleConfirmation();
     }, ENGAGEMENT_CHECK_INTERVAL_MS);
   };
@@ -1312,15 +1309,7 @@ export default function Home() {
     if (closingTurnRef.current) return;
     reviewResumeGuardRef.current = false;
     const confirming = engagementStateRef.current === "confirming";
-    let text = response === "Yes"
-      ? "Yes."
-      : response === "Repeat"
-        ? "Please repeat or re-explain the last explanation."
-        : "Continue with the lesson.";
-
-    if (confirming && response === "Repeat") {
-      text = "Please repeat the question asking whether I want to continue.";
-    }
+    const { text, idleEffect } = planQuickResponse(response, confirming);
 
     if (!transportRef.current?.sendLearnerText(text)) {
       setUserError("The quick response could not be sent while reconnecting. Try again.");
@@ -1333,12 +1322,12 @@ export default function Home() {
     setLatestLearnerReply(response);
     markMeaningfulActivity();
     addDebugMessage(`Quick response sent: ${response}`);
-    if (confirming && (response === "Yes" || response === "Continue")) {
+    if (idleEffect === "resume-active") {
       if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
       confirmationTimerRef.current = null;
       updateEngagementState("active");
       addDebugMessage("Quick response confirmed session continuation");
-    } else if (confirming && response === "Repeat") {
+    } else if (idleEffect === "restart-confirmation-timer") {
       scheduleIdleEnd();
     }
 
@@ -1578,9 +1567,7 @@ export default function Home() {
   }, []);
 
   const handleLearnerInterruption = (discreteTextTurn = false) => {
-    const farewell = closingTurnRef.current;
-    if (farewell && farewell.conversationRun === conversationRunRef.current &&
-        farewell.generationEpoch === generationEpochRef.current) return;
+    if (isCurrentFarewell(closingTurnRef.current, conversationRunRef.current, generationEpochRef.current)) return;
     // Gemini cuts playback immediately. Smoothing a mid-phoneme cutoff is a
     // later UX refinement; yielding to the learner remains the priority.
     invalidateActiveTeachingBeat("barge-in");
@@ -1700,8 +1687,9 @@ export default function Home() {
               transcriptFragment,
             );
             transportRef.current?.noteLearnerTurnReceived();
-            if (engagementStateRef.current === "active") markMeaningfulActivity();
-            else if (engagementStateRef.current === "confirming") {
+            const speechEffect = classifyMeaningfulSpeech(engagementStateRef.current);
+            if (speechEffect === "mark-activity") markMeaningfulActivity();
+            else if (speechEffect === "note-confirmation-speech") {
               meaningfulConfirmationSpeechRef.current = true;
             }
           }
@@ -1811,8 +1799,7 @@ export default function Home() {
 
         case "audio-chunk": {
           const farewell = closingTurnRef.current;
-          if (farewell && farewell.conversationRun === conversationRunRef.current &&
-              farewell.generationEpoch === generationEpochRef.current) {
+          if (isCurrentFarewell(farewell, conversationRunRef.current, generationEpochRef.current)) {
             farewell.audioReceived = true;
           }
 
@@ -1868,8 +1855,7 @@ export default function Home() {
             playerRef.current?.completeBatch(active.generationEpoch);
           }
           if (closing) {
-            if (closing.conversationRun !== conversationRunRef.current ||
-                closing.generationEpoch !== generationEpochRef.current) return;
+            if (!isCurrentFarewell(closing, conversationRunRef.current, generationEpochRef.current)) return;
             closing.generationComplete = true;
             addDebugMessage("FAREWELL_FLOW generation-complete");
             playerRef.current?.completeBatch(closing.generationEpoch);
@@ -2022,22 +2008,23 @@ export default function Home() {
             break;
           }
           case "confirm-continue":
-            if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
-            confirmationTimerRef.current = null;
-            updateEngagementState("active");
-            if (meaningfulConfirmationSpeechRef.current) markMeaningfulActivity();
-            meaningfulConfirmationSpeechRef.current = false;
-            addDebugMessage("Continue confirmed");
-            break;
           case "confirm-end":
+          case "confirm-unclear": {
+            const plan = planIdleConfirmationResolution(
+              decision.kind,
+              meaningfulConfirmationSpeechRef.current,
+            );
+            if (plan.resumeActive) {
+              if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
+              confirmationTimerRef.current = null;
+              updateEngagementState("active");
+            }
+            if (plan.markMeaningfulActivity) markMeaningfulActivity();
             meaningfulConfirmationSpeechRef.current = false;
-            addDebugMessage("End confirmed");
-            endAfterResponse = true;
+            addDebugMessage(plan.debugMessage);
+            if (plan.endAfterResponse) endAfterResponse = true;
             break;
-          case "confirm-unclear":
-            meaningfulConfirmationSpeechRef.current = false;
-            addDebugMessage("Idle confirmation unclear");
-            break;
+          }
         }
         if (decision.kind !== "wrap-up-end") result = decision.result;
       } else if (route !== "lesson_state") {
