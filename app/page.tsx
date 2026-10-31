@@ -336,7 +336,6 @@ export default function Home() {
   const persistedResumeFirstResponseLoggedRef = useRef(false);
   const assistantCheckpointConceptIdRef = useRef<string | null>(null);
   const recentTeachingContextRef = useRef<RecentTeachingContextEntry[]>([]);
-  const sourceGroundingPendingRef = useRef(false);
   const toolResultsRef = useRef(new Map<string, Record<string, unknown>>());
   const cancelledToolCallIdsRef = useRef(new Set<string>());
   const nextMessageIdRef = useRef(0);
@@ -344,8 +343,6 @@ export default function Home() {
   const lessonActiveRef = useRef(false);
   const lessonStartupPendingRef = useRef(false);
   const engagementStateRef = useRef<EngagementState>("ended");
-  const lastAcousticActivityAtRef = useRef<number | null>(null);
-  const lastCandidateLearnerActivityAtRef = useRef<number | null>(null);
   const lastMeaningfulLearnerActivityAtRef = useRef<number | null>(null);
   const noiseFloorRef = useRef(0.004);
   const lastAcousticLogAtRef = useRef(0);
@@ -743,7 +740,6 @@ export default function Home() {
     persistedResumeBriefingPendingRef.current = false;
     persistedResumeFirstResponseLoggedRef.current = false;
     assistantCheckpointConceptIdRef.current = null;
-    sourceGroundingPendingRef.current = false;
     toolResultsRef.current.clear();
     cancelledToolCallIdsRef.current.clear();
     lessonActiveRef.current = false;
@@ -802,7 +798,6 @@ export default function Home() {
   const markMeaningfulActivity = () => {
     const now = Date.now();
     lastMeaningfulLearnerActivityAtRef.current = now;
-    lastCandidateLearnerActivityAtRef.current = now;
     if (engagementStateRef.current === "active") {
       addDebugMessage("Meaningful learner activity");
     }
@@ -1249,7 +1244,6 @@ export default function Home() {
   const beginIdleMonitoring = () => {
     const now = Date.now();
     lastMeaningfulLearnerActivityAtRef.current = now;
-    lastCandidateLearnerActivityAtRef.current = now;
     updateEngagementState("active");
     engagementTimerRef.current = setInterval(() => {
       if (!lessonActiveRef.current || engagementStateRef.current !== "active") return;
@@ -1655,7 +1649,6 @@ export default function Home() {
       voiceDraftOpenRef.current = true;
       lastMeaningfulLearnerTranscriptRef.current = "";
       setLatestLearnerReply("");
-      lastCandidateLearnerActivityAtRef.current = Date.now();
       addDebugMessage("User speech started");
     } else if (voiceActivity === "ACTIVITY_END") {
       transportRef.current?.setLearnerSpeaking(false);
@@ -1671,7 +1664,6 @@ export default function Home() {
           lastMeaningfulLearnerTranscriptRef.current,
           transcriptFragment,
         );
-        lastCandidateLearnerActivityAtRef.current = Date.now();
         transportRef.current?.noteLearnerTurnReceived();
         if (engagementStateRef.current === "active") markMeaningfulActivity();
         else if (engagementStateRef.current === "confirming") {
@@ -1794,7 +1786,6 @@ export default function Home() {
           generationEpoch: activeTeachingBeatRef.current?.generationEpoch ?? generationEpochRef.current,
         });
         transportRef.current?.setAssistantSpeaking(true);
-        sourceGroundingPendingRef.current = false;
         if (!assistantTurnActiveRef.current) {
           assistantTurnActiveRef.current = true;
           assistantTranscriptRef.current = "";
@@ -2447,7 +2438,6 @@ export default function Home() {
       setAiConnectionStatus("Connected");
       emitTestEvent("live.setup-complete");
       addDebugMessage("Live connection established");
-      sourceGroundingPendingRef.current = true;
       addDebugMessage("Source seeding started");
       if (continuingSavedLesson) {
         const current = getCurrentConcept(lessonStateRef.current);
@@ -2492,7 +2482,6 @@ export default function Home() {
         const rms = pcm16Rms(chunk);
         noiseFloorRef.current += (rms - noiseFloorRef.current) * NOISE_FLOOR_SMOOTHING;
         if (rms >= Math.max(MIN_ACOUSTIC_RMS, noiseFloorRef.current * ACOUSTIC_ACTIVITY_MULTIPLIER)) {
-          lastAcousticActivityAtRef.current = Date.now();
           if (Date.now() - lastAcousticLogAtRef.current >= ACOUSTIC_LOG_COOLDOWN_MS) {
             lastAcousticLogAtRef.current = Date.now();
             addDebugMessage("Acoustic activity detected");
