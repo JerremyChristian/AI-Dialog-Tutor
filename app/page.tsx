@@ -117,6 +117,15 @@ import {
   type PresentationBeat,
 } from "../lib/teaching-beat-runtime";
 import {
+  aiConnectionStatusForTransportState,
+  buildNewLessonStartPrefix,
+  getMicrophoneErrorMessage,
+  getRealtimeErrorMessage,
+  isMicrophonePermissionDenied,
+  planStartupImperative,
+  type AiConnectionStatus,
+} from "../lib/teaching-session";
+import {
   DEFAULT_TEACHING_PREFERENCES,
   applyTeachingPreferenceUpdate,
   type TeachingPreferences,
@@ -145,8 +154,6 @@ type MicrophoneStatus =
   | "Permission denied"
   | "Error";
 
-type AiConnectionStatus = "Not connected" | "Connecting" | "Connected" | "Error";
-
 type TeachingPreferenceUpdate = Partial<TeachingPreferences>;
 type PendingTeachingPreferences = Partial<TeachingPreferences>;
 type LibraryView = "index" | "lesson" | "new";
@@ -162,29 +169,6 @@ type ConversationContinuity = {
   interruptionAlreadyRegistered: boolean;
   interruptionEpoch?: string;
 };
-
-function getMicrophoneErrorMessage(error: unknown) {
-  if (!(error instanceof DOMException)) {
-    return error instanceof Error ? error.message : "Unknown microphone error";
-  }
-
-  switch (error.name) {
-    case "NotFoundError":
-      return "No microphone was found";
-    case "NotReadableError":
-      return "The microphone is unavailable or in use by another application";
-    case "OverconstrainedError":
-      return "No microphone matches the requested audio settings";
-    case "AbortError":
-      return "Microphone access was interrupted";
-    default:
-      return error.message || error.name;
-  }
-}
-
-function getRealtimeErrorMessage(error: unknown) {
-  return error instanceof Error ? error.message : "Unknown Gemini Live error";
-}
 
 function isRedundantPreparationNotice(value: string) {
   return /lesson is being prepared/i.test(value) &&
@@ -1840,13 +1824,7 @@ export default function Home() {
             addReviewFlowDiagnostic("recovery-complete", "recoveryIncludesReview=false");
           }
           setTransportState(state);
-          setAiConnectionStatus(
-            state === "active" || state === "rollover-ready"
-              ? "Connected"
-              : state === "closed"
-                ? "Not connected"
-                : "Connecting",
-          );
+          setAiConnectionStatus(aiConnectionStatusForTransportState(state));
         },
         seedFreshRecovery: (socket) => {
           const coverage = queryLessonState(lessonStateRef.current);
@@ -1948,10 +1926,14 @@ export default function Home() {
       lessonStartupPendingRef.current = false;
       beginIdleMonitoring();
       void audioSession.requestWakeLock();
-      if (lessonWrapUpRef.current) {
+      const startupImperative = planStartupImperative({
+        wrapUp: lessonWrapUpRef.current,
+        sessionStartMode,
+      });
+      if (startupImperative === "wrap-up") {
         addDebugMessage("Completed lesson restored in wrap-up");
         transportRef.current?.sendRealtimeInput({ text: LESSON_WRAP_UP_CONTROL });
-      } else if (sessionStartMode === "persisted-resume") {
+      } else if (startupImperative === "persisted-resume") {
         const current = getCurrentConcept(lessonStateRef.current);
         const resumePoint = lessonStateRef.current.resumePoint.trim();
         addDebugMessage("Persisted lesson continuation started");
@@ -1969,20 +1951,12 @@ export default function Home() {
           addDebugMessage("Resume briefing control sent");
         }
       } else {
-        assignNextTeachingBeat(
-          `Begin the source-grounded spoken lesson now. Identify the uploaded material as "${tokenBody.source.name}", briefly preview what you will cover, then teach the assigned first presentation beat${
-            lessonFocus ? ` related to ${lessonFocus}` : " from the source"
-          }.`,
-        );
+        assignNextTeachingBeat(buildNewLessonStartPrefix(tokenBody.source.name, lessonFocus));
       }
     } catch (error) {
       if (!isMountedRef.current || run !== conversationRunRef.current) return;
 
-      const permissionDenied =
-        error instanceof DOMException &&
-        (error.name === "NotAllowedError" || error.name === "SecurityError");
-
-      if (permissionDenied) {
+      if (isMicrophonePermissionDenied(error)) {
         setMicrophoneStatus("Permission denied");
         setUserError("Microphone permission was denied. Allow access in browser settings and try again.");
         addDebugMessage("Microphone permission denied");
