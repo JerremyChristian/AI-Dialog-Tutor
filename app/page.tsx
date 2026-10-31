@@ -1641,6 +1641,67 @@ export default function Home() {
     assignNextReviewBeat();
   };
 
+  // Page-owned session lifecycle callbacks, named for the session controller. The
+  // run/mounted guard on transport state changes stays at its startConversation call site.
+  const onTransportStateChange = (state: LiveTransportState) => {
+    if (state === "recovering") {
+      const review = nodeReviewRef.current;
+      const canonical = getCurrentConcept(lessonStateRef.current);
+      addReviewFlowDiagnostic(
+        "recovery-start",
+        `reviewedNodePresent=${Boolean(review && lessonStateRef.current.nodes[review.nodeId])} ` +
+        `canonicalNode=${canonical ? "present" : "none"} ` +
+        `canonicalCursor=${canonical
+          ? lessonStateRef.current.teachingContractProgress[canonical.id]?.nextTeachingPointIndex ?? 0
+          : "none"} recoveryIncludesReview=false`,
+      );
+      reviewRecoveryPendingRef.current = true;
+      invalidateActiveTeachingBeat("transport-recovery");
+      audioSession.player?.clear();
+    } else if (state === "active" && reviewRecoveryPendingRef.current) {
+      reviewRecoveryPendingRef.current = false;
+      addReviewFlowDiagnostic("recovery-complete", "recoveryIncludesReview=false");
+    }
+    setTransportState(state);
+    setAiConnectionStatus(aiConnectionStatusForTransportState(state));
+  };
+
+  const canForwardMicrophone = () => !microphoneMutedRef.current && !closingTurnRef.current;
+
+  const resetConversationForStart = () => {
+    userTranscriptRef.current = "";
+    voiceDraftRef.current = "";
+    voiceDraftOpenRef.current = false;
+    lastMeaningfulLearnerTranscriptRef.current = "";
+    assistantTranscriptRef.current = "";
+    visibleTutorTranscriptRawRef.current = "";
+    lastAssistantTurnCompleteRef.current = true;
+    setLatestLearnerReply("");
+    setVisibleTutorTranscript("");
+    resumptionPendingRef.current = false;
+  };
+
+  const pauseLessonForStop = () => {
+    const currentBeforeStop = getCurrentConcept(lessonStateRef.current);
+    const checkpoint = deriveResumePoint(assistantTranscriptRef.current, "");
+    const checkpointMatchesCurrent = Boolean(
+      checkpoint && currentBeforeStop &&
+      assistantCheckpointConceptIdRef.current === currentBeforeStop.id,
+    );
+    if (checkpointMatchesCurrent) {
+      updateRecentTeachingContext(
+        assistantCheckpointConceptIdRef.current,
+        assistantTranscriptRef.current,
+      );
+    }
+    return pauseLessonState(
+      lessonStateRef.current,
+      checkpointMatchesCurrent && currentBeforeStop
+        ? { conceptId: currentBeforeStop.id, resumePoint: checkpoint }
+        : undefined,
+    );
+  };
+
   const startConversation = async () => {
     emitTestEvent("lesson.start-requested", { lessonId: workspace.savedLessonIdRef.current });
     setUserError("");
@@ -1720,16 +1781,7 @@ export default function Home() {
       );
     }
     workspace.setTopicInput(lessonFocus);
-    userTranscriptRef.current = "";
-    voiceDraftRef.current = "";
-    voiceDraftOpenRef.current = false;
-    lastMeaningfulLearnerTranscriptRef.current = "";
-    assistantTranscriptRef.current = "";
-    visibleTutorTranscriptRawRef.current = "";
-    lastAssistantTurnCompleteRef.current = true;
-    setLatestLearnerReply("");
-    setVisibleTutorTranscript("");
-    resumptionPendingRef.current = false;
+    resetConversationForStart();
     addDebugMessage(
       continuingSavedLesson
         ? `Saved lesson continuation initialized: ${activeSource.name}`
@@ -1805,26 +1857,7 @@ export default function Home() {
         onDebug: addDebugMessage,
         onStateChange: (state) => {
           if (!isMountedRef.current || run !== conversationRunRef.current) return;
-          if (state === "recovering") {
-            const review = nodeReviewRef.current;
-            const canonical = getCurrentConcept(lessonStateRef.current);
-            addReviewFlowDiagnostic(
-              "recovery-start",
-              `reviewedNodePresent=${Boolean(review && lessonStateRef.current.nodes[review.nodeId])} ` +
-              `canonicalNode=${canonical ? "present" : "none"} ` +
-              `canonicalCursor=${canonical
-                ? lessonStateRef.current.teachingContractProgress[canonical.id]?.nextTeachingPointIndex ?? 0
-                : "none"} recoveryIncludesReview=false`,
-            );
-            reviewRecoveryPendingRef.current = true;
-            invalidateActiveTeachingBeat("transport-recovery");
-            audioSession.player?.clear();
-          } else if (state === "active" && reviewRecoveryPendingRef.current) {
-            reviewRecoveryPendingRef.current = false;
-            addReviewFlowDiagnostic("recovery-complete", "recoveryIncludesReview=false");
-          }
-          setTransportState(state);
-          setAiConnectionStatus(aiConnectionStatusForTransportState(state));
+          onTransportStateChange(state);
         },
         seedFreshRecovery: (socket) => {
           const coverage = queryLessonState(lessonStateRef.current);
@@ -1906,7 +1939,7 @@ export default function Home() {
             addDebugMessage("Acoustic activity detected");
           }
         }
-        if (!microphoneMutedRef.current && !closingTurnRef.current) transport.sendAudio(chunk);
+        if (canForwardMicrophone()) transport.sendAudio(chunk);
       });
       await microphoneStreamer.start();
 
@@ -1995,24 +2028,7 @@ export default function Home() {
     audioSession.player?.clear();
     const hadMicrophone = audioSession.hasMicrophoneStream;
     const hadSession = Boolean(transportRef.current);
-    const currentBeforeStop = getCurrentConcept(lessonStateRef.current);
-    const checkpoint = deriveResumePoint(assistantTranscriptRef.current, "");
-    const checkpointMatchesCurrent = Boolean(
-      checkpoint && currentBeforeStop &&
-      assistantCheckpointConceptIdRef.current === currentBeforeStop.id,
-    );
-    if (checkpointMatchesCurrent) {
-      updateRecentTeachingContext(
-        assistantCheckpointConceptIdRef.current,
-        assistantTranscriptRef.current,
-      );
-    }
-    const stoppedLessonState = pauseLessonState(
-      lessonStateRef.current,
-      checkpointMatchesCurrent && currentBeforeStop
-        ? { conceptId: currentBeforeStop.id, resumePoint: checkpoint }
-        : undefined,
-    );
+    const stoppedLessonState = pauseLessonForStop();
     const persistedCurrent = getCurrentConcept(stoppedLessonState);
     setMicrophoneStatus("Not active");
     setAiConnectionStatus("Not connected");
