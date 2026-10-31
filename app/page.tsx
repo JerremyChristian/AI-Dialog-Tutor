@@ -74,6 +74,15 @@ import {
   type LessonState,
 } from "../lib/lesson-state";
 import {
+  canStartNodeReview,
+  createNodeReview,
+  NODE_REVIEW_BEAT_PREFIX,
+  planExitNodeReview,
+  planFinishNodeReview,
+  resolveAssistantCheckpointConceptId,
+  shouldResumeTeachingAfterReview,
+} from "../lib/review-controller";
+import {
   buildTeachingBeatControl,
   createActiveBeat,
   createPresentationBeat,
@@ -598,8 +607,7 @@ export default function Home() {
       `wholeNodeFinal=${resolved.teachingPointIndexes.at(-1) === concept.teaching.teachingPoints.length - 1} ` +
       `unitFinal=${resolved.isFinalBeatInUnit}`,
     );
-    const instruction = buildTeachingBeatControl(lessonStateRef.current, active, prefix ||
-      "Review this concept from its beginning using the existing lesson contract. This is a bounded review and must not alter canonical lesson coverage.");
+    const instruction = buildTeachingBeatControl(lessonStateRef.current, active, prefix || NODE_REVIEW_BEAT_PREFIX);
     if (sendInstruction && (!instruction || !transportRef.current?.sendRealtimeInput({ text: instruction }))) {
       invalidateActiveTeachingBeat("review-send-failed");
       return null;
@@ -631,21 +639,28 @@ export default function Home() {
   }
 
   function finishNodeReviewAndResume(reason: "completed" | "manual") {
-    const review = nodeReviewRef.current;
-    if (!review || reviewResumeGuardRef.current) return false;
-    reviewResumeGuardRef.current = true;
-    const active = activeTeachingBeatRef.current;
-    if (active?.mode === "review") {
+    const plan = planFinishNodeReview(
+      nodeReviewRef.current,
+      reviewResumeGuardRef.current,
+      activeTeachingBeatRef.current,
+    );
+    if (!plan) return false;
+    reviewResumeGuardRef.current = plan.reviewResumeGuard;
+    if (plan.invalidateReviewBeat) {
       invalidateActiveTeachingBeat(`node-review-${reason}`);
       playerRef.current?.clear();
     }
     nodeReviewRef.current = null;
     setNodeReview(null);
-    emitTestEvent("review.ended", { nodeId: review.nodeId, reason });
-    presentationBeatRef.current = review.returnPresentationBeat;
-    setPresentationBeat(review.returnPresentationBeat);
+    emitTestEvent("review.ended", { nodeId: plan.review.nodeId, reason });
+    presentationBeatRef.current = plan.presentationBeat;
+    setPresentationBeat(plan.presentationBeat);
     addDebugMessage(`Node review exited: reason=${reason}`);
-    if (lessonWrapUpRef.current || isLessonPlanComplete(lessonStateRef.current)) return true;
+    if (!shouldResumeTeachingAfterReview(lessonWrapUpRef.current, isLessonPlanComplete(lessonStateRef.current))) {
+      return true;
+    }
+    // Sent as realtime text, even from inside a tool-call handler before that
+    // call's tool response (refactor-plan §6.6).
     assignNextTeachingBeat();
     return true;
   }
@@ -1740,9 +1755,11 @@ export default function Home() {
             assistantTranscriptRef.current = "";
             visibleTutorTranscriptRawRef.current = "";
             setVisibleTutorTranscript("");
-            assistantCheckpointConceptIdRef.current = nodeReviewRef.current || closingTurnRef.current
-              ? null
-              : lessonStateRef.current.currentNodeId;
+            assistantCheckpointConceptIdRef.current = resolveAssistantCheckpointConceptId(
+              nodeReviewRef.current,
+              Boolean(closingTurnRef.current),
+              lessonStateRef.current.currentNodeId,
+            );
           }
           if (persistedResumeBriefingPendingRef.current &&
               !persistedResumeFirstResponseLoggedRef.current) {
@@ -1811,9 +1828,11 @@ export default function Home() {
               assistantTranscriptRef.current = "";
               visibleTutorTranscriptRawRef.current = "";
               setVisibleTutorTranscript("");
-              assistantCheckpointConceptIdRef.current = nodeReviewRef.current || closingTurnRef.current
-                ? null
-                : lessonStateRef.current.currentNodeId;
+              assistantCheckpointConceptIdRef.current = resolveAssistantCheckpointConceptId(
+                nodeReviewRef.current,
+                Boolean(closingTurnRef.current),
+                lessonStateRef.current.currentNodeId,
+              );
             }
             if (persistedResumeBriefingPendingRef.current &&
                 !persistedResumeFirstResponseLoggedRef.current) {
@@ -2169,29 +2188,28 @@ export default function Home() {
   };
 
   const exitNodeReview = () => {
-    const review = nodeReviewRef.current;
-    if (!review) return;
+    // Does not resume teaching; see finishNodeReviewAndResume for that path.
+    const plan = planExitNodeReview(nodeReviewRef.current);
+    if (!plan) return;
     invalidateActiveTeachingBeat("node-review-exited");
     playerRef.current?.clear();
     nodeReviewRef.current = null;
-    reviewResumeGuardRef.current = false;
+    reviewResumeGuardRef.current = plan.reviewResumeGuard;
     setNodeReview(null);
-    presentationBeatRef.current = review.returnPresentationBeat;
-    setPresentationBeat(review.returnPresentationBeat);
-    addDebugMessage(`Node review exited: concept=${review.nodeId}`);
+    presentationBeatRef.current = plan.presentationBeat;
+    setPresentationBeat(plan.presentationBeat);
+    addDebugMessage(`Node review exited: concept=${plan.review.nodeId}`);
   };
 
   const startNodeReview = (node: LessonState["nodes"][string]) => {
-    if (!lessonActiveRef.current || !node.teaching || node.childrenIds.length ||
-        restartPendingRef.current || closingTurnRef.current) return;
+    if (!canStartNodeReview(node, {
+      lessonActive: lessonActiveRef.current,
+      restartPending: restartPendingRef.current,
+      closingActive: Boolean(closingTurnRef.current),
+    })) return;
     invalidateActiveTeachingBeat("node-review-started");
     playerRef.current?.clear();
-    const review: NodeReviewState = {
-      nodeId: node.id,
-      nextTeachingPointIndex: 0,
-      returnPresentationBeat: presentationBeatRef.current,
-      complete: false,
-    };
+    const review = createNodeReview(node.id, presentationBeatRef.current);
     nodeReviewRef.current = review;
     reviewResumeGuardRef.current = false;
     setNodeReview(review);
