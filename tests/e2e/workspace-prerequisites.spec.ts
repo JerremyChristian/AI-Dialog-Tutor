@@ -159,6 +159,25 @@ test("stale current-lesson delete completion does not reset a lesson started whi
     lessonId: QA_LESSON_ID,
     deliveryCursor: 1,
   });
+
+  const autosaveSettlementStartedAt = Date.now();
+  await expect.soft.poll(async () => {
+    const autosaveWindowElapsed = Date.now() - autosaveSettlementStartedAt >= 1_200;
+    return {
+      autosaveWindowElapsed,
+      savedLessonPresent: Boolean(await readSavedLesson(page)),
+      activeLessonId: await readAppState(page),
+    };
+  }, {
+    message: "a queued autosave must not resurrect a lesson after its delete completes",
+    timeout: 3_000,
+    intervals: [100, 200, 300],
+  }).toEqual({
+    autosaveWindowElapsed: true,
+    savedLessonPresent: false,
+    activeLessonId: undefined,
+  });
+  expect((await readTestState(page)).snapshot.deliveryCursor).toBe(1);
   await page.close();
 });
 
