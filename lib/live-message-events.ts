@@ -29,6 +29,10 @@ export type LiveEvent =
   // Lesson status/debug updates for voice activity; follows interruption handling.
   | { type: "voice-activity-status"; activity: LiveVoiceActivity }
   | { type: "audio-chunk"; data: string; mimeType: string }
+  // Follows the message's audio, so audio carried alongside turnComplete still
+  // belongs to the turn it closes. An interrupted turn ends interrupted >
+  // turnComplete without generationComplete.
+  | { type: "turn-complete" }
   // Always the final event, so an early return while handling it skips nothing.
   | { type: "generation-complete" };
 
@@ -91,6 +95,8 @@ export function normalizeLiveServerMessage(message: LiveServerMessage): LiveEven
     if (!audio?.data || !audio.mimeType?.startsWith("audio/")) continue;
     events.push({ type: "audio-chunk", data: audio.data, mimeType: audio.mimeType });
   }
+
+  if (serverContent.turnComplete) events.push({ type: "turn-complete" });
 
   if (serverContent.generationComplete) events.push({ type: "generation-complete" });
 

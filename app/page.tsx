@@ -235,6 +235,11 @@ export default function Home() {
   const activeTeachingBeatRef = useRef<ActiveTeachingBeat | null>(null);
   const presentationBeatRef = useRef<PresentationBeat | null>(null);
   const generationEpochRef = useRef(0);
+  // Live audio chunks carry no generation identity, so turn boundaries decide
+  // ownership: once an interruption is accepted while a provider generation is
+  // open, every chunk belongs to that interrupted turn until its turnComplete.
+  const providerGenerationOpenRef = useRef(false);
+  const interruptedTurnAudioGateRef = useRef<{ rejectedChunks: number } | null>(null);
   const lessonWrapUpRef = useRef(false);
   const conversationalRestartConfirmationRef = useRef(false);
   const nodeReviewRef = useRef<NodeReviewState | null>(null);
@@ -561,6 +566,8 @@ export default function Home() {
     typedInterruptionHandledRef.current = false;
     assistantTurnActiveRef.current = false;
     lastAssistantTurnCompleteRef.current = true;
+    providerGenerationOpenRef.current = false;
+    interruptedTurnAudioGateRef.current = null;
     resumptionPendingRef.current = false;
     persistedResumeBriefingPendingRef.current = false;
     persistedResumeFirstResponseLoggedRef.current = false;
@@ -962,6 +969,12 @@ export default function Home() {
     if (isCurrentFarewell(closingTurnRef.current, conversationRunRef.current, generationEpochRef.current)) return;
     // Gemini cuts playback immediately. Smoothing a mid-phoneme cutoff is a
     // later UX refinement; yielding to the learner remains the priority.
+    // Close admission before clearing playback, so no chunk still in flight
+    // from the interrupted turn (including before a typed interruption's
+    // provider acknowledgement) can be scheduled behind the cleared queue.
+    if (providerGenerationOpenRef.current && !interruptedTurnAudioGateRef.current) {
+      interruptedTurnAudioGateRef.current = { rejectedChunks: 0 };
+    }
     invalidateActiveTeachingBeat("barge-in");
     audioSession.player?.clear();
     assistantSpeakingRef.current = false;
@@ -1129,6 +1142,7 @@ export default function Home() {
           break;
 
         case "output-transcription":
+          providerGenerationOpenRef.current = true;
           lastAssistantTurnCompleteRef.current = false;
           if (!assistantTurnActiveRef.current) {
             assistantTurnActiveRef.current = true;
@@ -1190,6 +1204,12 @@ export default function Home() {
           break;
 
         case "audio-chunk": {
+          const interruptedTurnAudioGate = interruptedTurnAudioGateRef.current;
+          if (interruptedTurnAudioGate) {
+            interruptedTurnAudioGate.rejectedChunks += 1;
+            break;
+          }
+          providerGenerationOpenRef.current = true;
           const farewell = closingTurnRef.current;
           if (isCurrentFarewell(farewell, conversationRunRef.current, generationEpochRef.current)) {
             farewell.audioReceived = true;
@@ -1234,11 +1254,23 @@ export default function Home() {
           break;
         }
 
+        // The only signal that reopens tutor audio after an interruption.
+        case "turn-complete":
+          providerGenerationOpenRef.current = false;
+          if (interruptedTurnAudioGateRef.current) {
+            addDebugMessage(
+              `Interrupted turn audio gate reopened: rejectedChunks=${interruptedTurnAudioGateRef.current.rejectedChunks}`,
+            );
+            interruptedTurnAudioGateRef.current = null;
+          }
+          break;
+
         // Always the final event, so the stale-farewell `return` below skips only
         // the rest of this completion handling, exactly as before the extraction.
         case "generation-complete": {
           const active = activeTeachingBeatRef.current;
           const closing = closingTurnRef.current;
+          providerGenerationOpenRef.current = false;
           addReviewFlowDiagnostic("provider-generation-complete");
           if (active) {
             active.generationComplete = true;
@@ -1601,6 +1633,12 @@ export default function Home() {
   // Page-owned session lifecycle callbacks, named for the session controller. The
   // run/mounted guard on transport state changes stays at its startConversation call site.
   const onTransportStateChange = (state: LiveTransportState) => {
+    if (state === "handoff" || state === "recovering") {
+      // The retired socket's turn can no longer deliver audio or its
+      // turnComplete; the transport drops every message from it.
+      providerGenerationOpenRef.current = false;
+      interruptedTurnAudioGateRef.current = null;
+    }
     if (state === "recovering") {
       const review = nodeReviewRef.current;
       const canonical = getCurrentConcept(lessonStateRef.current);

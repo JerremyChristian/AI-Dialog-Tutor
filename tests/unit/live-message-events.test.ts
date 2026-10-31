@@ -146,14 +146,14 @@ describe("normalizeLiveServerMessage", () => {
       })))).toEqual(["learner-draft-closed"]);
       expect(types(normalizeLiveServerMessage(message({
         serverContent: { turnComplete: true },
-      })))).toEqual(["learner-draft-closed"]);
+      })))).toEqual(["learner-draft-closed", "turn-complete"]);
     });
 
     it("emits a single draft close when several close conditions coincide", () => {
       expect(types(normalizeLiveServerMessage(message({
         voiceActivity: { voiceActivityType: "ACTIVITY_END" },
         serverContent: { inputTranscription: { finished: true }, turnComplete: true },
-      })))).toEqual(["voice-activity-gate", "learner-draft-closed", "voice-activity-status"]);
+      })))).toEqual(["voice-activity-gate", "learner-draft-closed", "voice-activity-status", "turn-complete"]);
     });
   });
 
@@ -202,6 +202,16 @@ describe("normalizeLiveServerMessage", () => {
     })))).toEqual(["audio-chunk", "generation-complete"]);
   });
 
+  it("emits turnComplete after the audio it carries and before generationComplete", () => {
+    expect(types(normalizeLiveServerMessage(message({
+      serverContent: {
+        turnComplete: true,
+        interrupted: true,
+        modelTurn: { parts: [{ inlineData: { data: "x", mimeType: "audio/pcm" } }] },
+      },
+    })))).toEqual(["learner-draft-closed", "interrupted", "audio-chunk", "turn-complete"]);
+  });
+
   it("emits generationComplete alone without any commit-like event", () => {
     expect(normalizeLiveServerMessage(message({ serverContent: { generationComplete: true } })))
       .toEqual([{ type: "generation-complete" }]);
@@ -230,6 +240,7 @@ describe("normalizeLiveServerMessage", () => {
       "interrupted",
       "voice-activity-status",
       "audio-chunk",
+      "turn-complete",
       "generation-complete",
     ]);
   });
@@ -256,6 +267,7 @@ describe("normalizeLiveServerMessage", () => {
       "output-transcription",
       "voice-activity-status",
       "audio-chunk",
+      "turn-complete",
       "generation-complete",
     ]);
   });

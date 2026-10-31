@@ -56,16 +56,22 @@ test("Q1-A interruption cancels old playback before the new response becomes aud
   expect(afterCancellation.every(({ marker, stopped }) =>
     marker === OLD_AUDIO_MARKER && stopped)).toBe(true);
 
+  // A provider chunk already in flight from the cancelled response arrives late,
+  // while the interrupted provider turn is still open. Live audio carries no
+  // generation identity, so only a chunk before that turn's turnComplete can be
+  // classified as stale.
+  await deliverLive(page, { serverContent: { modelTurn: { parts: [
+    { inlineData: { mimeType: "audio/pcm;rate=24000", data: oldAudio } },
+  ] } } });
+  expect.soft((await playbackRecords(page)).length,
+    "stale old-response audio inside the interrupted turn must not be scheduled").toBe(2);
+
+  // Gemini ends an interrupted turn with interrupted > turnComplete; the first
+  // audio after it belongs to the interruption response.
   await deliverLive(page, { serverContent: {
     inputTranscription: { text: "Wait, what exactly is a PLC?", finished: true },
     turnComplete: true,
   } });
-
-  // A provider chunk already in flight from the cancelled response arrives late,
-  // followed by the first audio for the interruption response.
-  await deliverLive(page, { serverContent: { modelTurn: { parts: [
-    { inlineData: { mimeType: "audio/pcm;rate=24000", data: oldAudio } },
-  ] } } });
   await deliverLive(page, { serverContent: {
     outputTranscription: { text: "A PLC is an industrial computer." },
     modelTurn: { parts: [
