@@ -4,7 +4,12 @@ export const QA_LESSON_ID = "qa-session-lifecycle-001";
 
 export type LiveSend = { socketId: number; message: Record<string, unknown> };
 
-export async function installFakeLive(page: Page, options: { persisted?: boolean; reviewReady?: boolean; completed?: boolean } = {}) {
+export async function installFakeLive(page: Page, options: {
+  persisted?: boolean;
+  reviewReady?: boolean;
+  completed?: boolean;
+  microphoneFailure?: string;
+} = {}) {
   await page.route("**/auth/v1/**", (route) => route.fulfill({
     status: 401, contentType: "application/json", body: JSON.stringify({ message: "Not signed in" }),
   }));
@@ -12,7 +17,7 @@ export async function installFakeLive(page: Page, options: { persisted?: boolean
     status: 200, contentType: "application/json",
     body: JSON.stringify({ token: "local-test-token", source: { name: "plc-notes.txt", mimeType: "text/plain" } }),
   }));
-  await page.addInitScript(({ lessonId, persisted, reviewReady, completed }) => {
+  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure }) => {
     const NativeWebSocket = window.WebSocket;
     const sockets: FakeLiveWebSocket[] = [];
     const sends: Array<{ socketId: number; message: Record<string, unknown> }> = [];
@@ -62,6 +67,20 @@ export async function installFakeLive(page: Page, options: { persisted?: boolean
       pcm,
     });
 
+    const nativeGetUserMedia = navigator.mediaDevices?.getUserMedia.bind(navigator.mediaDevices);
+    if (navigator.mediaDevices && nativeGetUserMedia) {
+      let microphoneStream: MediaStream | null = null;
+      navigator.mediaDevices.getUserMedia = async (constraints) => {
+        if (microphoneFailure) throw new DOMException(microphoneFailure, "NotAllowedError");
+        microphoneStream = await nativeGetUserMedia(constraints);
+        return microphoneStream;
+      };
+      Reflect.set(window, "__QA_MICROPHONE__", {
+        hasStream: () => Boolean(microphoneStream),
+        endTrack: () => microphoneStream?.getAudioTracks()[0]?.dispatchEvent(new Event("ended")),
+      });
+    }
+
     const now = new Date().toISOString();
     const firstNode = {
       id: "what-is-a-plc", title: "What is a PLC?", parentId: null, order: 0, childrenIds: [],
@@ -97,7 +116,13 @@ export async function installFakeLive(page: Page, options: { persisted?: boolean
       if (!db.objectStoreNames.contains("processingJobs")) db.createObjectStore("processingJobs", { keyPath: "id" }).createIndex("createdAt", "createdAt");
     };
     request.onsuccess = () => { const db = request.result; const tx = db.transaction(["savedLessons", "appState"], "readwrite"); tx.objectStore("savedLessons").put(lesson); tx.objectStore("appState").put({ key: "activeLessonId:anonymous", value: lessonId }); tx.oncomplete = () => db.close(); };
-  }, { lessonId: QA_LESSON_ID, persisted: options.persisted ?? false, reviewReady: options.reviewReady ?? false, completed: options.completed ?? false });
+  }, {
+    lessonId: QA_LESSON_ID,
+    persisted: options.persisted ?? false,
+    reviewReady: options.reviewReady ?? false,
+    completed: options.completed ?? false,
+    microphoneFailure: options.microphoneFailure ?? "",
+  });
 }
 
 export async function openLessonAndStart(page: Page, persisted = false) {
@@ -117,7 +142,14 @@ export async function openLessonAndStart(page: Page, persisted = false) {
 }
 
 export async function getLiveSends(page: Page): Promise<LiveSend[]> { return page.evaluate(() => Reflect.get(window, "__QA_LIVE__").sends()); }
-export async function deliverLive(page: Page, body: Record<string, unknown>) { await page.evaluate((value) => Reflect.get(window, "__QA_LIVE__").deliver(value), body); }
+export async function deliverLive(page: Page, body: Record<string, unknown>, socketId?: number) {
+  await page.evaluate(({ value, targetSocket }) =>
+    Reflect.get(window, "__QA_LIVE__").deliver(value, targetSocket),
+  { value: body, targetSocket: socketId });
+}
+export async function endMicrophoneTrack(page: Page) {
+  await page.evaluate(() => Reflect.get(window, "__QA_MICROPHONE__")?.endTrack());
+}
 export async function failActiveSocket(page: Page) { await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").failActive()); }
 export async function readTestState(page: Page) { return page.evaluate(() => ({ snapshot: window.__AI_TEACHER_TEST__!.getSnapshot(), events: window.__AI_TEACHER_TEST__!.getEvents() })); }
 export function textOf(message: Record<string, unknown>) { return JSON.stringify(message); }
