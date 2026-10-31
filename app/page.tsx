@@ -605,16 +605,29 @@ export default function Home() {
     tokenRequestRef.current = null;
     // Captured before the first await: a newer run may install its own audio
     // resources while this disposal is suspended, and those are not ours to release.
+    // Every caller bumps the run before disposing; only a newer startConversation
+    // changes it again, so a mismatch after an await means this session was replaced
+    // and the shared page/session state now belongs to the newer run.
+    const run = conversationRunRef.current;
     const owned = audioSession.captureResources();
+    const ownedTransport = transportRef.current;
 
     await audioSession.stopStreamer();
 
-    transportRef.current?.close(sendAudioStreamEnd);
-    transportRef.current = null;
+    ownedTransport?.close(sendAudioStreamEnd);
+    if (transportRef.current === ownedTransport) transportRef.current = null;
 
     audioSession.stopTracks(owned.stream);
 
     await audioSession.closePlayer(owned.player);
+    if (run === conversationRunRef.current) resetSessionState();
+    await audioSession.releaseWakeLock(owned.wakeLock);
+    if (run === conversationRunRef.current) resetSessionTimersAndControls();
+  };
+
+  // Shared page/session resets, split around the wake-lock release so the
+  // original disposal order is unchanged.
+  const resetSessionState = () => {
     assistantSpeakingRef.current = false;
     learnerActivityRunRef.current = null;
     typedInterruptionHandledRef.current = false;
@@ -635,7 +648,9 @@ export default function Home() {
     setShowLessonComplete(false);
     if (completionAnimationTimerRef.current) clearTimeout(completionAnimationTimerRef.current);
     completionAnimationTimerRef.current = null;
-    await audioSession.releaseWakeLock(owned.wakeLock);
+  };
+
+  const resetSessionTimersAndControls = () => {
     if (engagementTimerRef.current) clearInterval(engagementTimerRef.current);
     if (confirmationTimerRef.current) clearTimeout(confirmationTimerRef.current);
     if (quickResponseTimerRef.current) clearTimeout(quickResponseTimerRef.current);
