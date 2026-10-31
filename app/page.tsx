@@ -1,6 +1,5 @@
 "use client";
 
-import type { FunctionCall, LiveServerMessage } from "@google/genai";
 import type { User } from "@supabase/supabase-js";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { LearningSourceUpload } from "../components/learning-source-upload";
@@ -37,6 +36,11 @@ import {
   LiveTransportManager,
   type LiveTransportState,
 } from "../lib/live-transport-manager";
+import {
+  normalizeLiveServerMessage,
+  type LiveProviderMessage,
+  type LiveToolCall,
+} from "../lib/live-message-events";
 import {
   buildLessonInstruction,
   createLessonState,
@@ -1622,261 +1626,269 @@ export default function Home() {
     window.requestAnimationFrame(() => typedReplyInputRef.current?.focus());
   };
 
-  const handleLiveMessage = (message: LiveServerMessage) => {
-    if (message.toolCallCancellation?.ids) {
-      for (const id of message.toolCallCancellation.ids) {
-        cancelledToolCallIdsRef.current.add(id);
-      }
-    }
+  const handleLiveMessage = (message: LiveProviderMessage) => {
+    for (const event of normalizeLiveServerMessage(message)) {
+      switch (event.type) {
+        case "tool-call-cancellation":
+          for (const id of event.ids) {
+            cancelledToolCallIdsRef.current.add(id);
+          }
+          break;
 
-    if (message.toolCall?.functionCalls?.length) {
-      handleLessonToolCalls(message.toolCall.functionCalls);
-      return;
-    }
+        case "tool-calls":
+          handleLessonToolCalls(event.calls);
+          return;
 
-    const serverContent = message.serverContent;
-    const voiceActivity = message.voiceActivity?.voiceActivityType;
-    // Update transport gating before interruption handling. Gemini can deliver
-    // ACTIVITY_START and interrupted together; ordering this first prevents a
-    // pending graceful rollover from retiring the socket between those events.
-    if (voiceActivity === "ACTIVITY_START") {
-      emitTestEvent("learner.activity-detected", { source: "voice" });
-      learnerActivityRunRef.current = conversationRunRef.current;
-      reviewResumeGuardRef.current = false;
-      transportRef.current?.setLearnerSpeaking(true);
-      userTranscriptRef.current = "";
-      voiceDraftRef.current = "";
-      voiceDraftOpenRef.current = true;
-      lastMeaningfulLearnerTranscriptRef.current = "";
-      setLatestLearnerReply("");
-      addDebugMessage("User speech started");
-    } else if (voiceActivity === "ACTIVITY_END") {
-      transportRef.current?.setLearnerSpeaking(false);
-    }
-    if (serverContent?.inputTranscription?.text) {
-      const transcriptFragment = serverContent.inputTranscription.text;
-      if (!voiceDraftOpenRef.current) {
-        voiceDraftRef.current = "";
-        voiceDraftOpenRef.current = true;
-      }
-      if (isMeaningfulLearnerTranscript(transcriptFragment)) {
-        lastMeaningfulLearnerTranscriptRef.current = mergeTranscript(
-          lastMeaningfulLearnerTranscriptRef.current,
-          transcriptFragment,
-        );
-        transportRef.current?.noteLearnerTurnReceived();
-        if (engagementStateRef.current === "active") markMeaningfulActivity();
-        else if (engagementStateRef.current === "confirming") {
-          meaningfulConfirmationSpeechRef.current = true;
-        }
-      }
-      const wasInterrupted = lessonStateRef.current.status === "interrupted";
-      userTranscriptRef.current = mergeTranscript(
-        userTranscriptRef.current,
-        serverContent.inputTranscription.text,
-      );
-      voiceDraftRef.current = mergeLearnerTranscript(
-        voiceDraftRef.current,
-        transcriptFragment,
-      );
-      setLatestLearnerReply(voiceDraftRef.current);
-      updateLessonState((current) => ({
-        ...current,
-        status:
-          current.status === "interrupted"
-            ? "resolving-interruption"
-            : current.status,
-        lastUserTranscript: userTranscriptRef.current,
-      }));
+        // Update transport gating before interruption handling. Gemini can deliver
+        // ACTIVITY_START and interrupted together; ordering this first prevents a
+        // pending graceful rollover from retiring the socket between those events.
+        case "voice-activity-gate":
+          if (event.activity === "start") {
+            emitTestEvent("learner.activity-detected", { source: "voice" });
+            learnerActivityRunRef.current = conversationRunRef.current;
+            reviewResumeGuardRef.current = false;
+            transportRef.current?.setLearnerSpeaking(true);
+            userTranscriptRef.current = "";
+            voiceDraftRef.current = "";
+            voiceDraftOpenRef.current = true;
+            lastMeaningfulLearnerTranscriptRef.current = "";
+            setLatestLearnerReply("");
+            addDebugMessage("User speech started");
+          } else {
+            transportRef.current?.setLearnerSpeaking(false);
+          }
+          break;
 
-      if (wasInterrupted) {
-        emitTestEvent("clarification.started", { source: "voice" });
-        addDebugMessage("Resolving learner interruption");
-      }
-    } else if (serverContent?.interimInputTranscription?.text) {
-      if (!voiceDraftOpenRef.current) {
-        voiceDraftRef.current = "";
-        voiceDraftOpenRef.current = true;
-      }
-      voiceDraftRef.current = mergeLearnerTranscript(
-        voiceDraftRef.current,
-        serverContent.interimInputTranscription.text,
-      );
-      setLatestLearnerReply(voiceDraftRef.current);
-    }
-    if (serverContent?.inputTranscription?.finished ||
-        voiceActivity === "ACTIVITY_END" || serverContent?.turnComplete) {
-      voiceDraftRef.current = "";
-      voiceDraftOpenRef.current = false;
-    }
-
-    if (serverContent?.outputTranscription?.text) {
-      lastAssistantTurnCompleteRef.current = false;
-      if (!assistantTurnActiveRef.current) {
-        assistantTurnActiveRef.current = true;
-        assistantTranscriptRef.current = "";
-        visibleTutorTranscriptRawRef.current = "";
-        setVisibleTutorTranscript("");
-        assistantCheckpointConceptIdRef.current = nodeReviewRef.current || closingTurnRef.current
-          ? null
-          : lessonStateRef.current.currentNodeId;
-      }
-      if (persistedResumeBriefingPendingRef.current &&
-          !persistedResumeFirstResponseLoggedRef.current) {
-        persistedResumeFirstResponseLoggedRef.current = true;
-        addDebugMessage("First persisted-resume response received");
-      }
-      if (engagementStateRef.current === "confirming" && !assistantSpeakingRef.current) {
-        addDebugMessage("Idle confirmation spoken");
-      }
-      visibleTutorTranscriptRawRef.current = mergeTranscript(
-        visibleTutorTranscriptRawRef.current,
-        serverContent.outputTranscription.text,
-      );
-      assistantTranscriptRef.current = sanitizeLearnerVisibleTutorTranscript(
-        visibleTutorTranscriptRawRef.current,
-      );
-      setVisibleTutorTranscript(assistantTranscriptRef.current);
-      updateLessonState((current) => ({
-        ...current,
-        lastAssistantTranscript: assistantTranscriptRef.current,
-      }));
-    }
-
-    if (serverContent?.interrupted) {
-      if (typedInterruptionHandledRef.current) {
-        typedInterruptionHandledRef.current = false;
-        addDebugMessage("Provider confirmed typed interruption");
-      } else if (hasCurrentLearnerActivity()) {
-        addReviewFlowDiagnostic("provider-interrupted-accepted", "reason=current-learner-activity");
-        handleLearnerInterruption();
-      } else {
-        addReviewFlowDiagnostic("provider-interrupted-ignored", "reason=no-learner-activity");
-      }
-    }
-
-    if (voiceActivity === "ACTIVITY_START") {
-      if (lessonStateRef.current.status === "interrupted") {
-        updateLessonState((current) => ({
-          ...current,
-          status: "resolving-interruption",
-        }));
-        addDebugMessage("Resolving learner interruption");
-      }
-    } else if (voiceActivity === "ACTIVITY_END") {
-      addDebugMessage("User speech ended");
-    }
-
-    if (!serverContent) return;
-
-    for (const part of serverContent.modelTurn?.parts ?? []) {
-      const audio = part.inlineData;
-      if (!audio?.data || !audio.mimeType?.startsWith("audio/")) continue;
-
-      const farewell = closingTurnRef.current;
-      if (farewell && farewell.conversationRun === conversationRunRef.current &&
-          farewell.generationEpoch === generationEpochRef.current) {
-        farewell.audioReceived = true;
-      }
-
-      if (!assistantSpeakingRef.current) {
-        typedInterruptionHandledRef.current = false;
-        assistantSpeakingRef.current = true;
-        emitTestEvent("tutor.audio-started", {
-          generationEpoch: activeTeachingBeatRef.current?.generationEpoch ?? generationEpochRef.current,
-        });
-        transportRef.current?.setAssistantSpeaking(true);
-        if (!assistantTurnActiveRef.current) {
-          assistantTurnActiveRef.current = true;
-          assistantTranscriptRef.current = "";
-          visibleTutorTranscriptRawRef.current = "";
-          setVisibleTutorTranscript("");
-          assistantCheckpointConceptIdRef.current = nodeReviewRef.current || closingTurnRef.current
-            ? null
-            : lessonStateRef.current.currentNodeId;
-        }
-        if (persistedResumeBriefingPendingRef.current &&
-            !persistedResumeFirstResponseLoggedRef.current) {
-          persistedResumeFirstResponseLoggedRef.current = true;
-          addDebugMessage("First persisted-resume response received");
-        }
-        if (resumptionPendingRef.current) {
-          emitTestEvent("canonical.resume-requested", {
-            conceptId: lessonStateRef.current.currentNodeId,
-          });
+        case "input-transcription": {
+          const transcriptFragment = event.text;
+          if (!voiceDraftOpenRef.current) {
+            voiceDraftRef.current = "";
+            voiceDraftOpenRef.current = true;
+          }
+          if (isMeaningfulLearnerTranscript(transcriptFragment)) {
+            lastMeaningfulLearnerTranscriptRef.current = mergeTranscript(
+              lastMeaningfulLearnerTranscriptRef.current,
+              transcriptFragment,
+            );
+            transportRef.current?.noteLearnerTurnReceived();
+            if (engagementStateRef.current === "active") markMeaningfulActivity();
+            else if (engagementStateRef.current === "confirming") {
+              meaningfulConfirmationSpeechRef.current = true;
+            }
+          }
+          const wasInterrupted = lessonStateRef.current.status === "interrupted";
+          userTranscriptRef.current = mergeTranscript(
+            userTranscriptRef.current,
+            transcriptFragment,
+          );
+          voiceDraftRef.current = mergeLearnerTranscript(
+            voiceDraftRef.current,
+            transcriptFragment,
+          );
+          setLatestLearnerReply(voiceDraftRef.current);
           updateLessonState((current) => ({
             ...current,
-            status: "resuming",
+            status:
+              current.status === "interrupted"
+                ? "resolving-interruption"
+                : current.status,
+            lastUserTranscript: userTranscriptRef.current,
           }));
-          addDebugMessage("Lesson resuming");
-        }
-        addDebugMessage("Assistant response started");
-      }
-      playerRef.current?.play(audio.data);
-    }
 
-    if (serverContent.generationComplete) {
-      const active = activeTeachingBeatRef.current;
-      const closing = closingTurnRef.current;
-      addReviewFlowDiagnostic("provider-generation-complete");
-      if (active) {
-        active.generationComplete = true;
-        if (active.mode === "review") addReviewFlowDiagnostic("review-generation-complete");
-        addDebugMessage(`Teaching generation complete: epoch=${active.generationEpoch}`);
-        playerRef.current?.completeBatch(active.generationEpoch);
+          if (wasInterrupted) {
+            emitTestEvent("clarification.started", { source: "voice" });
+            addDebugMessage("Resolving learner interruption");
+          }
+          break;
+        }
+
+        case "interim-input-transcription":
+          if (!voiceDraftOpenRef.current) {
+            voiceDraftRef.current = "";
+            voiceDraftOpenRef.current = true;
+          }
+          voiceDraftRef.current = mergeLearnerTranscript(
+            voiceDraftRef.current,
+            event.text,
+          );
+          setLatestLearnerReply(voiceDraftRef.current);
+          break;
+
+        case "learner-draft-closed":
+          voiceDraftRef.current = "";
+          voiceDraftOpenRef.current = false;
+          break;
+
+        case "output-transcription":
+          lastAssistantTurnCompleteRef.current = false;
+          if (!assistantTurnActiveRef.current) {
+            assistantTurnActiveRef.current = true;
+            assistantTranscriptRef.current = "";
+            visibleTutorTranscriptRawRef.current = "";
+            setVisibleTutorTranscript("");
+            assistantCheckpointConceptIdRef.current = nodeReviewRef.current || closingTurnRef.current
+              ? null
+              : lessonStateRef.current.currentNodeId;
+          }
+          if (persistedResumeBriefingPendingRef.current &&
+              !persistedResumeFirstResponseLoggedRef.current) {
+            persistedResumeFirstResponseLoggedRef.current = true;
+            addDebugMessage("First persisted-resume response received");
+          }
+          if (engagementStateRef.current === "confirming" && !assistantSpeakingRef.current) {
+            addDebugMessage("Idle confirmation spoken");
+          }
+          visibleTutorTranscriptRawRef.current = mergeTranscript(
+            visibleTutorTranscriptRawRef.current,
+            event.text,
+          );
+          assistantTranscriptRef.current = sanitizeLearnerVisibleTutorTranscript(
+            visibleTutorTranscriptRawRef.current,
+          );
+          setVisibleTutorTranscript(assistantTranscriptRef.current);
+          updateLessonState((current) => ({
+            ...current,
+            lastAssistantTranscript: assistantTranscriptRef.current,
+          }));
+          break;
+
+        case "interrupted":
+          if (typedInterruptionHandledRef.current) {
+            typedInterruptionHandledRef.current = false;
+            addDebugMessage("Provider confirmed typed interruption");
+          } else if (hasCurrentLearnerActivity()) {
+            addReviewFlowDiagnostic("provider-interrupted-accepted", "reason=current-learner-activity");
+            handleLearnerInterruption();
+          } else {
+            addReviewFlowDiagnostic("provider-interrupted-ignored", "reason=no-learner-activity");
+          }
+          break;
+
+        case "voice-activity-status":
+          if (event.activity === "start") {
+            if (lessonStateRef.current.status === "interrupted") {
+              updateLessonState((current) => ({
+                ...current,
+                status: "resolving-interruption",
+              }));
+              addDebugMessage("Resolving learner interruption");
+            }
+          } else {
+            addDebugMessage("User speech ended");
+          }
+          break;
+
+        case "audio-chunk": {
+          const farewell = closingTurnRef.current;
+          if (farewell && farewell.conversationRun === conversationRunRef.current &&
+              farewell.generationEpoch === generationEpochRef.current) {
+            farewell.audioReceived = true;
+          }
+
+          if (!assistantSpeakingRef.current) {
+            typedInterruptionHandledRef.current = false;
+            assistantSpeakingRef.current = true;
+            emitTestEvent("tutor.audio-started", {
+              generationEpoch: activeTeachingBeatRef.current?.generationEpoch ?? generationEpochRef.current,
+            });
+            transportRef.current?.setAssistantSpeaking(true);
+            if (!assistantTurnActiveRef.current) {
+              assistantTurnActiveRef.current = true;
+              assistantTranscriptRef.current = "";
+              visibleTutorTranscriptRawRef.current = "";
+              setVisibleTutorTranscript("");
+              assistantCheckpointConceptIdRef.current = nodeReviewRef.current || closingTurnRef.current
+                ? null
+                : lessonStateRef.current.currentNodeId;
+            }
+            if (persistedResumeBriefingPendingRef.current &&
+                !persistedResumeFirstResponseLoggedRef.current) {
+              persistedResumeFirstResponseLoggedRef.current = true;
+              addDebugMessage("First persisted-resume response received");
+            }
+            if (resumptionPendingRef.current) {
+              emitTestEvent("canonical.resume-requested", {
+                conceptId: lessonStateRef.current.currentNodeId,
+              });
+              updateLessonState((current) => ({
+                ...current,
+                status: "resuming",
+              }));
+              addDebugMessage("Lesson resuming");
+            }
+            addDebugMessage("Assistant response started");
+          }
+          playerRef.current?.play(event.data);
+          break;
+        }
+
+        // Always the final event, so the stale-farewell `return` below skips only
+        // the rest of this completion handling, exactly as before the extraction.
+        case "generation-complete": {
+          const active = activeTeachingBeatRef.current;
+          const closing = closingTurnRef.current;
+          addReviewFlowDiagnostic("provider-generation-complete");
+          if (active) {
+            active.generationComplete = true;
+            if (active.mode === "review") addReviewFlowDiagnostic("review-generation-complete");
+            addDebugMessage(`Teaching generation complete: epoch=${active.generationEpoch}`);
+            playerRef.current?.completeBatch(active.generationEpoch);
+          }
+          if (closing) {
+            if (closing.conversationRun !== conversationRunRef.current ||
+                closing.generationEpoch !== generationEpochRef.current) return;
+            closing.generationComplete = true;
+            addDebugMessage("FAREWELL_FLOW generation-complete");
+            playerRef.current?.completeBatch(closing.generationEpoch);
+            maybeFinishFarewell();
+          }
+          if (!active && !closing) assistantSpeakingRef.current = false;
+          assistantTurnActiveRef.current = false;
+          lastAssistantTurnCompleteRef.current = true;
+          if (!active && !closing) transportRef.current?.setAssistantSpeaking(false);
+          const completedAssistantTranscript =
+            assistantTranscriptRef.current || lessonStateRef.current.lastAssistantTranscript;
+          if (engagementStateRef.current !== "confirming") {
+            updateRecentTeachingContext(
+              assistantCheckpointConceptIdRef.current,
+              completedAssistantTranscript,
+            );
+          }
+          updateLessonState((state) => {
+            const assistantTranscript = completedAssistantTranscript || state.lastAssistantTranscript;
+            const checkpoint = deriveResumePoint(assistantTranscript, "");
+            const checkpointMatchesCurrent = Boolean(
+              checkpoint && state.currentNodeId &&
+              assistantCheckpointConceptIdRef.current === state.currentNodeId,
+            );
+            return {
+              ...state,
+              status: lessonWrapUpRef.current
+                ? "completed"
+                : state.status === "idle" ? "idle" : "teaching",
+              lastAssistantTranscript: assistantTranscript,
+              resumePoint: checkpointMatchesCurrent ? checkpoint : state.resumePoint,
+            };
+          });
+          resumptionPendingRef.current = false;
+          if (lessonStateRef.current.status === "resolving-interruption" ||
+              lessonStateRef.current.status === "resuming") {
+            emitTestEvent("clarification.completed", {
+              conceptId: lessonStateRef.current.currentNodeId,
+            });
+          }
+          if (persistedResumeBriefingPendingRef.current) {
+            persistedResumeBriefingPendingRef.current = false;
+            addDebugMessage("Resume briefing completed");
+          }
+          addDebugMessage("Assistant response completed");
+          break;
+        }
       }
-      if (closing) {
-        if (closing.conversationRun !== conversationRunRef.current ||
-            closing.generationEpoch !== generationEpochRef.current) return;
-        closing.generationComplete = true;
-        addDebugMessage("FAREWELL_FLOW generation-complete");
-        playerRef.current?.completeBatch(closing.generationEpoch);
-        maybeFinishFarewell();
-      }
-      if (!active && !closing) assistantSpeakingRef.current = false;
-      assistantTurnActiveRef.current = false;
-      lastAssistantTurnCompleteRef.current = true;
-      if (!active && !closing) transportRef.current?.setAssistantSpeaking(false);
-      const completedAssistantTranscript =
-        assistantTranscriptRef.current || lessonStateRef.current.lastAssistantTranscript;
-      if (engagementStateRef.current !== "confirming") {
-        updateRecentTeachingContext(
-          assistantCheckpointConceptIdRef.current,
-          completedAssistantTranscript,
-        );
-      }
-      updateLessonState((state) => {
-        const assistantTranscript = completedAssistantTranscript || state.lastAssistantTranscript;
-        const checkpoint = deriveResumePoint(assistantTranscript, "");
-        const checkpointMatchesCurrent = Boolean(
-          checkpoint && state.currentNodeId &&
-          assistantCheckpointConceptIdRef.current === state.currentNodeId,
-        );
-        return {
-          ...state,
-          status: lessonWrapUpRef.current
-            ? "completed"
-            : state.status === "idle" ? "idle" : "teaching",
-          lastAssistantTranscript: assistantTranscript,
-          resumePoint: checkpointMatchesCurrent ? checkpoint : state.resumePoint,
-        };
-      });
-      resumptionPendingRef.current = false;
-      if (lessonStateRef.current.status === "resolving-interruption" ||
-          lessonStateRef.current.status === "resuming") {
-        emitTestEvent("clarification.completed", {
-          conceptId: lessonStateRef.current.currentNodeId,
-        });
-      }
-      if (persistedResumeBriefingPendingRef.current) {
-        persistedResumeBriefingPendingRef.current = false;
-        addDebugMessage("Resume briefing completed");
-      }
-      addDebugMessage("Assistant response completed");
     }
   };
 
-  const handleLessonToolCalls = (calls: FunctionCall[]) => {
+  const handleLessonToolCalls = (calls: LiveToolCall[]) => {
     const functionResponses: Array<Record<string, unknown>> = [];
     let endAfterResponse = false;
     let postResumeQueryReceived = false;
