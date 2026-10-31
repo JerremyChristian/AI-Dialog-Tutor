@@ -191,6 +191,9 @@ test("a stop held in persistence cannot capture the newer run's resources", asyn
 
   await releaseSavedLessonWrites(page);
   await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.isHeld())).toBe(true);
+  await releaseFirstStreamerClose(page);
+  await expect.poll(() => page.evaluate(() =>
     Reflect.get(window, "__QA_DISPOSAL__")?.wakeLockReleaseCount())).toBe(1);
   await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
 

@@ -599,23 +599,31 @@ export default function Home() {
     }
   }
 
-  const disposeResources = async (sendAudioStreamEnd: boolean) => {
-    invalidateActiveTeachingBeat("resources-disposed");
+  // Captured before the first await: a newer run may install its own audio
+  // resources while this disposal is suspended, and those are not ours to release.
+  // Every caller bumps the run before capturing; only a newer startConversation
+  // changes it again, so a mismatch after an await means this session was replaced
+  // and the shared page/session state now belongs to the newer run.
+  const captureDisposalOwnership = () => ({
+    ...audioSession.captureResources(),
+    run: conversationRunRef.current,
+    transport: transportRef.current,
+  });
+
+  // Callers that await before disposing (stopConversation) capture first and pass it in.
+  const disposeResources = async (
+    sendAudioStreamEnd: boolean,
+    owned = captureDisposalOwnership(),
+  ) => {
+    const { run } = owned;
+    if (run === conversationRunRef.current) invalidateActiveTeachingBeat("resources-disposed");
     tokenRequestRef.current?.abort();
     tokenRequestRef.current = null;
-    // Captured before the first await: a newer run may install its own audio
-    // resources while this disposal is suspended, and those are not ours to release.
-    // Every caller bumps the run before disposing; only a newer startConversation
-    // changes it again, so a mismatch after an await means this session was replaced
-    // and the shared page/session state now belongs to the newer run.
-    const run = conversationRunRef.current;
-    const owned = audioSession.captureResources();
-    const ownedTransport = transportRef.current;
 
-    await audioSession.stopStreamer();
+    await audioSession.stopStreamer(owned.streamer);
 
-    ownedTransport?.close(sendAudioStreamEnd);
-    if (transportRef.current === ownedTransport) transportRef.current = null;
+    owned.transport?.close(sendAudioStreamEnd);
+    if (transportRef.current === owned.transport) transportRef.current = null;
 
     audioSession.stopTracks(owned.stream);
 
@@ -2008,6 +2016,7 @@ export default function Home() {
 
   const stopConversation = async (reason?: "inactivity" | "confirmed") => {
     conversationRunRef.current += 1;
+    const ownedDisposal = captureDisposalOwnership();
     invalidateActiveTeachingBeat("lesson-ended");
     audioSession.player?.clear();
     const hadMicrophone = audioSession.hasMicrophoneStream;
@@ -2050,7 +2059,7 @@ export default function Home() {
       );
     }
     await workspace.persistCurrentLesson(stoppedLessonState);
-    await disposeResources(true);
+    await disposeResources(true, ownedDisposal);
 
     if (reason === "inactivity") {
       setUserError("The lesson ended after no response to the inactivity check.");

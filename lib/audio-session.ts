@@ -10,8 +10,8 @@ import { MicrophonePcmStreamer, PcmAudioPlayer } from "./realtime-audio";
 // (React StrictMode re-mounts and every new lesson reuse it), and teardown is
 // deliberately split into separate steps so disposeResources keeps its order:
 // streamer stop, transport close, track stop, player close, then the wake lock
-// after the synchronous resets. disposeResources captures the stream, player and
-// wake lock before its first await and passes them to each step, so a disposal
+// after the synchronous resets. Each disposal captures the stream, streamer, player
+// and wake lock before its first await and passes them to each step, so a disposal
 // that resumes after a newer run installed its own resources only releases the
 // ones it captured and clears a slot only while it still holds that resource.
 export class AudioSession {
@@ -78,14 +78,18 @@ export class AudioSession {
     }
   }
 
-  async stopStreamer() {
-    const streamer = this.streamer;
-    this.streamer = null;
+  async stopStreamer(streamer = this.streamer) {
+    if (this.streamer === streamer) this.streamer = null;
     await streamer?.stop();
   }
 
   captureResources() {
-    return { stream: this.stream, player: this.currentPlayer, wakeLock: this.wakeLock };
+    return {
+      stream: this.stream,
+      streamer: this.streamer,
+      player: this.currentPlayer,
+      wakeLock: this.wakeLock,
+    };
   }
 
   stopTracks(stream = this.stream) {

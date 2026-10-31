@@ -210,6 +210,20 @@ describe("AudioSession", () => {
     expect(newerRelease).toHaveBeenCalledOnce();
   });
 
+  it("a captured streamer stop leaves a newer streamer in its slot", async () => {
+    const stop = vi.spyOn(MicrophonePcmStreamer.prototype, "stop").mockResolvedValue();
+    const flush = vi.spyOn(MicrophonePcmStreamer.prototype, "flushPendingAudio").mockResolvedValue();
+    const old = session.createStreamer(fakeStream(), vi.fn());
+    const owned = session.captureResources();
+    const newer = session.createStreamer(fakeStream(), vi.fn());
+
+    await session.stopStreamer(owned.streamer);
+    expect(stop).toHaveBeenCalledOnce();
+    expect(stop.mock.contexts[0]).toBe(old);
+    await session.flushPendingMicrophoneAudio();
+    expect(flush.mock.contexts[0]).toBe(newer);
+  });
+
   it("a captured teardown with nothing captured leaves newer resources alone", async () => {
     const owned = session.captureResources();
     const newer = session.createPlayer();
