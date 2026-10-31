@@ -119,6 +119,49 @@ test("stale disposal cannot close the newer run's playback player", async ({ pag
   expect(newerPlayerClosed).toBe(false);
 });
 
+test("stale disposal cannot tear down the newer authoritative session", async ({ page }) => {
+  await installNoExternalNetworkGuard(page);
+  await installFakeLive(page, { persisted: true, holdFirstStreamerClose: true });
+  await openLessonAndStart(page, true);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.wakeLockCount())).toBe(1);
+
+  await endMicrophoneTrack(page);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.isHeld())).toBe(true);
+
+  await page.getByRole("button", { name: "Continue Lesson", exact: true }).click();
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_LIVE__").socketCount())).toBe(2);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.wakeLockCount())).toBe(2);
+  await expect.poll(async () => {
+    const snapshot = (await readTestState(page)).snapshot;
+    return snapshot.lessonActive && snapshot.connectionState !== "closed";
+  }).toBe(true);
+
+  const before = (await readTestState(page)).snapshot;
+  const bSocketStateBefore = await page.evaluate(() =>
+    Reflect.get(window, "__QA_LIVE__").socketState(1) as number);
+
+  await releaseFirstStreamerClose(page);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.wakeLockReleaseCount())).toBe(1);
+  await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+
+  const after = (await readTestState(page)).snapshot;
+  const bSocketStateAfter = await page.evaluate(() =>
+    Reflect.get(window, "__QA_LIVE__").socketState(1) as number);
+  const newerPlayerClosed = await page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__").isPlayerClosed(1) as boolean);
+
+  expect(getExternalRequests(page)).toEqual([]);
+  expect(newerPlayerClosed).toBe(false);
+  expect.soft(after.lessonActive).toBe(true);
+  expect.soft(after.connectionState).toBe(before.connectionState);
+  expect(bSocketStateAfter).toBe(bSocketStateBefore);
+});
+
 test("fake microphone starts and mute gates learner PCM until unmuted", async ({ page }) => {
   await installFakeLive(page);
   await openLessonAndStart(page);

@@ -197,6 +197,7 @@ export async function installFakeLive(page: Page, options: {
     Reflect.set(window, "__QA_LIVE__", {
       sends: () => structuredClone(sends),
       socketCount: () => sockets.length,
+      socketState: (socketId: number) => sockets[socketId]?.readyState,
       deliver: (body: Record<string, unknown>, socketId = sockets.length - 1) => sockets[socketId]?.deliver(body),
       failActive: () => sockets.at(-1)?.closeWith(1011, "qa socket failure", false),
       pcm,
