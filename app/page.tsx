@@ -1765,6 +1765,7 @@ export default function Home() {
       setMicrophoneStatus("Active");
       addDebugMessage("Microphone active");
       await playerReady;
+      if (!isMountedRef.current || run !== conversationRunRef.current) return;
 
       setAiConnectionStatus("Connecting");
       const tokenBody = await requestFreshToken();
