@@ -10,6 +10,7 @@ import { LessonRoadmap } from "../components/lesson-roadmap";
 import { RecentLessons } from "../components/recent-lessons";
 import { SourceVisual } from "../components/source-visual";
 import { ProcessingQueue } from "../components/processing-queue";
+import { PreprocessingDiagnostic } from "../components/preprocessing-diagnostic";
 import CloudAccount from "../components/cloud-account";
 import type {
   LearningSource,
@@ -2788,6 +2789,7 @@ ${active.mode === "review"
     <main className={`page-shell${lessonActive ? " teaching-shell" : ""}`}>
       {!lessonActive && <AppNavigation activeView={appView} onNavigate={navigateProduct} />}
       <section className={`tutor-card${lessonActive ? " lesson-active" : ""}`}>
+        <PreprocessingDiagnostic jobs={processingQueue.jobs} lessons={savedLessons} />
         {lessonActive ? <header className="teaching-header"><div><p className="eyebrow">Teaching room</p><h1 id="page-title">{learningSource?.name || "Your lesson"}</h1></div><div className="teaching-header-actions"><button className="button-secondary" type="button" disabled={restartPending || Boolean(closingTurnRef.current)} onClick={() => setRestartConfirmationOpen(true)}>Restart Lesson</button><button className="button-danger end-lesson-top" type="button" aria-label="End lesson" onClick={() => void stopConversation()}><span className="end-lesson-desktop">End Lesson</span><span className="end-lesson-mobile" aria-hidden="true">End</span></button></div></header> : null}
 
         {lessonActive && restartConfirmationOpen && <section className="restart-lesson-confirmation" role="alertdialog" aria-labelledby="active-restart-lesson-title" aria-describedby="active-restart-lesson-description"><h2 id="active-restart-lesson-title">Restart this lesson?</h2><p id="active-restart-lesson-description">This will clear all teaching progress for this lesson and start it again from the beginning. Your materials and lesson content will not be deleted.</p><div><button className="button-secondary" type="button" disabled={restartPending} onClick={() => setRestartConfirmationOpen(false)}>Cancel</button><button className="button-danger" type="button" disabled={restartPending} onClick={() => void restartLesson()}>{restartPending ? "Restarting…" : "Restart"}</button></div></section>}

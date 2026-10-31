@@ -1895,6 +1895,39 @@ summary:focus-visible {
 
 @media (prefers-reduced-motion: reduce) { .loading-spinner, .lesson-complete-transition { animation: none; } }
 
+.preprocessing-diagnostic { margin-bottom: 24px; padding: 18px; border: 2px dashed var(--accent); border-radius: 14px; background: var(--accent-soft); }
+.diagnostic-heading, .diagnostic-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.diagnostic-heading h2, .diagnostic-result h3 { margin: 0; }
+.diagnostic-controls { display: grid; grid-template-columns: minmax(0, 2fr) minmax(210px, 1fr); gap: 12px; margin-top: 16px; }
+.diagnostic-controls label { display: grid; gap: 5px; font-weight: 700; }
+.diagnostic-controls select { width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); }
+.diagnostic-source-summary, .diagnostic-result { margin-top: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.diagnostic-source-summary dl, .diagnostic-result dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 0; }
+.diagnostic-source-summary dl div, .diagnostic-result dl div { min-width: 0; }
+.diagnostic-source-summary dt, .diagnostic-result dt { color: var(--text-muted); font-size: .78rem; }
+.diagnostic-source-summary dd, .diagnostic-result dd { margin: 2px 0 0; overflow-wrap: anywhere; font-weight: 700; }
+.diagnostic-source-summary ul { margin: 12px 0 0; padding-left: 20px; }
+.diagnostic-source-summary li span { margin-left: 6px; color: var(--text-muted); }
+.diagnostic-actions { justify-content: flex-start; margin-top: 14px; }
+.diagnostic-step { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.diagnostic-step h3 { margin: 0; }
+.diagnostic-step p { margin: 5px 0 0; color: var(--text-muted); }
+.diagnostic-page-controls { display: grid; grid-template-columns: minmax(0, 2fr) minmax(140px, 1fr); gap: 12px; margin-top: 12px; }
+.diagnostic-page-controls label, .diagnostic-page-controls > div { display: grid; gap: 5px; font-weight: 700; }
+.diagnostic-page-controls select, .diagnostic-page-controls input { width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); }
+.diagnostic-warning, .diagnostic-failure { color: var(--danger); font-weight: 700; }
+.diagnostic-success, .diagnostic-ready { color: var(--success, #18794e); font-weight: 700; }
+.diagnostic-artifact { margin-top: 12px; }
+.diagnostic-artifact summary { cursor: pointer; font-weight: 700; }
+.diagnostic-provider-error { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+.diagnostic-provider-error summary { cursor: pointer; font-weight: 700; }
+.diagnostic-provider-error h4 { margin: 14px 0 6px; }
+.diagnostic-provider-error p { margin: 6px 0 0; }
+.diagnostic-artifact pre { max-height: 420px; overflow: auto; padding: 12px; border-radius: 8px; background: #111; color: #f4f4f4; white-space: pre-wrap; overflow-wrap: anywhere; }
+.diagnostic-interpretation { margin: 14px 0 0; font-weight: 700; }
+
+@media (max-width: 700px) { .diagnostic-controls, .diagnostic-page-controls { grid-template-columns: 1fr; } }
+
 /* Global appearance overrides. Source documents retain their original pixels. */
 :root[data-theme="dark"] .tutor-card,
 :root[data-theme="dark"] .lesson-card,
@@ -1929,6 +1962,7 @@ summary:focus-visible {
 :root[data-theme="dark"] .home-view .processing-queue {
   background: var(--surface-secondary);
 }
+:root[data-theme="dark"] .preprocessing-diagnostic { background: var(--surface-secondary); }
 
 :root[data-theme="dark"] .continue-card,
 :root[data-theme="dark"] .lesson-ready,
