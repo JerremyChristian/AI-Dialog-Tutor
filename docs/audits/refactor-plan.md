@@ -30,7 +30,7 @@ Recommended order (details in §7):
 | 8 | Extract farewell/completion and idle-engagement controllers | A | Medium |
 | 9 | Extract audio session lifecycle (mic stream + streamer + player + wake lock) | A | Med–High |
 | 10 | Extract `useLessonWorkspace` (persistence, hydration, cloud sync orchestration) | A | High |
-| 11 | Extract realtime teaching session controller (start/stop/dispose/transport wiring) | A | High |
+| 11 | Extract realtime teaching session controller (start/stop/dispose/transport wiring) — ✅ complete | A | High |
 | B-n | Behavioral fixes found during analysis (§5), each as its own test-first PR | B | varies |
 
 ---
@@ -448,7 +448,7 @@ Not a refactor. Listed because every later slice depends on it.
 - **Invariants at risk:** I16, persisted `updatedAt` stability, cloud defer-while-active, owner scoping.
 - **Tests:** IndexedDB fake (or a real browser) for hydrate during an active lesson (refused), autosave debounce, sign-in/sign-out owner switch, delete current lesson, cloud sync with a deferred active lesson, incompatible-schema handling.
 
-### Slice 11 — Realtime teaching session controller
+### Slice 11 — Realtime teaching session controller  ✅ complete
 
 - **Kind:** A.
 - **What:** a `TeachingSession` (class or hook) owning:
@@ -459,6 +459,13 @@ Not a refactor. Listed because every later slice depends on it.
 - **Prerequisites:** S1, S4, S5, S7, S8, and S9 merged, plus the full Playwright suite green.
 - **Invariants at risk:** all of I1–I16.
 - **Tests:** the entire QA suite. Add a startup/recovery imperative-count assertion (I8, I9) if one is not already present.
+- **Status:** complete.
+  - `useTeachingSession` was extracted to `lib/use-teaching-session.ts`. Lifecycle ownership moved without behavior changes.
+  - `app/page.tsx` went from 2,354 to 1,937 lines during S11-C.
+  - Prerequisite coverage was added for completed-lesson startup, startup token failure, fatal recovery failure, and visibility wake-lock reacquisition.
+  - The B-A1, B-A2, B-A4, and B-A5 protections are preserved.
+  - Baseline after S11: 239 unit tests, 46 E2E tests.
+  - Known races deliberately left unfixed: shared `tokenRequestRef` ownership, a wake lock acquired after disposal capture, the stale-stop user-facing message, and LW20.
 
 ### B-slices (behavioral; each separate, test-first, with explicit approval)
 
