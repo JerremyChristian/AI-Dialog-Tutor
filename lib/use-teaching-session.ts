@@ -78,6 +78,7 @@ export type TeachingSessionInput = {
   // Page-owned operations, coordinated but not reimplemented here.
   handleLiveMessage: (message: LiveProviderMessage) => void;
   onTransportStateChange: (state: LiveTransportState) => void;
+  markProviderGenerationRequested: () => void;
   canForwardMicrophone: () => boolean;
   resetConversationForStart: () => void;
   pauseLessonForStop: () => LessonState;
@@ -113,6 +114,7 @@ export function useTeachingSession(input: TeachingSessionInput) {
     addDebugMessage,
     handleLiveMessage,
     onTransportStateChange,
+    markProviderGenerationRequested,
     canForwardMicrophone,
     resetConversationForStart,
     pauseLessonForStop,
@@ -323,6 +325,11 @@ export function useTeachingSession(input: TeachingSessionInput) {
           if (!isMountedRef.current || run !== conversationRunRef.current) return;
           onTransportStateChange(state);
         },
+        onGenerationRequested: () => {
+          if (isMountedRef.current && run === conversationRunRef.current) {
+            markProviderGenerationRequested();
+          }
+        },
         seedFreshRecovery: (socket) => {
           const coverage = queryLessonState(lessonStateRef.current);
           socket.seedRecoveryContext({ ...preparedSource, focus: lessonFocus }, {
@@ -429,7 +436,7 @@ export function useTeachingSession(input: TeachingSessionInput) {
       });
       if (startupImperative === "wrap-up") {
         addDebugMessage("Completed lesson restored in wrap-up");
-        transportRef.current?.sendRealtimeInput({ text: LESSON_WRAP_UP_CONTROL });
+        transportRef.current?.sendGenerationRequest(LESSON_WRAP_UP_CONTROL);
       } else if (startupImperative === "persisted-resume") {
         const current = getCurrentConcept(lessonStateRef.current);
         const resumePoint = lessonStateRef.current.resumePoint.trim();

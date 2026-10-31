@@ -46,6 +46,10 @@ type ManagerOptions = {
   systemInstruction: string;
   requestToken: () => Promise<TokenResult>;
   onMessage: (message: LiveServerMessage) => void;
+  // Called after a send that can start audible model output: learner text and
+  // audible controls. History seeds, post-resume sync and tool responses do not
+  // call it; a tool response continues a provider turn its root already opened.
+  onGenerationRequested: () => void;
   onDebug: (message: string) => void;
   onStateChange: (state: LiveTransportState) => void;
   seedFreshRecovery: (socket: GeminiLiveWebSocket) => void;
@@ -143,6 +147,11 @@ export class LiveTransportManager {
     return this.activeSocket?.sendRealtimeInput(input) ?? false;
   }
 
+  // For app controls the model answers aloud; silent controls use sendRealtimeInput.
+  sendGenerationRequest(text: string) {
+    return this.generationRequested(this.activeSocket?.sendRealtimeInput({ text }) ?? false);
+  }
+
   sendLearnerText(text: string) {
     if (this.state === "synchronizing") {
       if (this.queuedLearnerText) return false;
@@ -156,7 +165,7 @@ export class LiveTransportManager {
     if (trackingFirstTurn && this.firstPostResumeLearnerTurnAt) {
       this.options.onDebug("First post-resume learner turn sent");
     }
-    return this.activeSocket?.sendLearnerText(text) ?? false;
+    return this.generationRequested(this.activeSocket?.sendLearnerText(text) ?? false);
   }
 
   sendToolResponse(responses: Array<Record<string, unknown>>) {
@@ -313,7 +322,7 @@ export class LiveTransportManager {
       this.firstPostResumeLearnerTurnAt = Date.now();
       this.awaitingFirstPostResumeTurn = false;
       this.options.onDebug("First post-resume learner turn sent");
-      this.activeSocket?.sendLearnerText(queued);
+      this.generationRequested(this.activeSocket?.sendLearnerText(queued) ?? false);
       this.queuedLearnerText = null;
       this.postResumeState = "waiting-for-user";
       this.options.onDebug("Pending learner turn released after sync");
@@ -322,9 +331,7 @@ export class LiveTransportManager {
     if (this.interruptedTutorContinuationRequired) {
       this.postResumeState = "continuing-interrupted-output";
       this.options.onDebug("Interrupted tutor continuation required");
-      this.activeSocket?.sendRealtimeInput({
-        text: "[[APP_CONTROL:CONTINUE_INTERRUPTED_TUTOR_TURN]]",
-      });
+      this.sendGenerationRequest("[[APP_CONTROL:CONTINUE_INTERRUPTED_TUTOR_TURN]]");
       return;
     }
     this.postResumeState = "waiting-for-user";
@@ -748,7 +755,12 @@ export class LiveTransportManager {
     this.firstPostResumeLearnerTurnAt = Date.now();
     this.awaitingFirstPostResumeTurn = false;
     this.options.onDebug("First post-resume learner turn sent");
-    this.activeSocket?.sendLearnerText(queued);
+    this.generationRequested(this.activeSocket?.sendLearnerText(queued) ?? false);
+  }
+
+  private generationRequested(sent: boolean) {
+    if (sent) this.options.onGenerationRequested();
+    return sent;
   }
 
   private noteFirstPostResumeLearnerTurn() {

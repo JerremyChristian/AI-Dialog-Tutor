@@ -238,8 +238,8 @@ export default function Home() {
   // Live audio chunks carry no generation identity, so turn boundaries decide
   // ownership: once an interruption is accepted while a provider generation is
   // open, every chunk belongs to that interrupted turn until its turnComplete.
-  // A generation is open from a beat request or first output until
-  // generationComplete or turnComplete.
+  // A generation is open from its root (markProviderGenerationRequested) or
+  // first output until generationComplete, turnComplete, handoff or reset.
   const providerGenerationOpenRef = useRef(false);
   const interruptedTurnAudioGateRef = useRef<{ rejectedChunks: number } | null>(null);
   const lessonWrapUpRef = useRef(false);
@@ -340,6 +340,14 @@ export default function Home() {
     setLessonState(next);
   };
 
+  // Every root that can start audible tutor output marks the provider turn
+  // outstanding before that output: transport sends of learner text and audible
+  // controls (onGenerationRequested), a learner voice turn ending, and a beat
+  // assignment carried by a tool response.
+  function markProviderGenerationRequested() {
+    providerGenerationOpenRef.current = true;
+  }
+
   function invalidateActiveTeachingBeat(reason: string) {
     const active = activeTeachingBeatRef.current;
     if (!active) return;
@@ -395,12 +403,12 @@ export default function Home() {
     );
     // Built from the pre-activation ref state: activation is applied only after the send below.
     const instruction = buildTeachingBeatControl(lessonStateRef.current, active, prefix);
-    if (sendInstruction && (!instruction || !transportRef.current?.sendRealtimeInput({ text: instruction }))) {
+    if (sendInstruction && (!instruction || !transportRef.current?.sendGenerationRequest(instruction))) {
       invalidateActiveTeachingBeat("send-failed");
       return null;
     }
-    // The beat's provider turn is outstanding from the request, before any output.
-    providerGenerationOpenRef.current = true;
+    // A deferred assignment rides on the tool response, which is its root.
+    if (!sendInstruction) markProviderGenerationRequested();
     if (activatedState) {
       lessonStateRef.current = activatedState;
       setLessonState(activatedState);
@@ -438,11 +446,11 @@ export default function Home() {
       `unitFinal=${resolved.isFinalBeatInUnit}`,
     );
     const instruction = buildTeachingBeatControl(lessonStateRef.current, active, prefix || NODE_REVIEW_BEAT_PREFIX);
-    if (sendInstruction && (!instruction || !transportRef.current?.sendRealtimeInput({ text: instruction }))) {
+    if (sendInstruction && (!instruction || !transportRef.current?.sendGenerationRequest(instruction))) {
       invalidateActiveTeachingBeat("review-send-failed");
       return null;
     }
-    providerGenerationOpenRef.current = true;
+    if (!sendInstruction) markProviderGenerationRequested();
     addDebugMessage(`Node review beat assigned: concept=${concept.id}, beat=${resolved.deliveryUnitIndex}/${resolved.beatIndex}, epoch=${generationEpoch}`);
     return active;
   }
@@ -808,9 +816,7 @@ export default function Home() {
     addDebugMessage("Possible inactivity");
     updateEngagementState("confirming");
     addDebugMessage("Idle confirmation requested");
-    transportRef.current?.sendRealtimeInput({
-      text: IDLE_CONFIRMATION_CONTROL_TEXT,
-    });
+    transportRef.current?.sendGenerationRequest(IDLE_CONFIRMATION_CONTROL_TEXT);
     scheduleIdleEnd();
   };
 
@@ -959,6 +965,7 @@ export default function Home() {
     addDebugMessage,
     handleLiveMessage: (message) => handleLiveMessage(message),
     onTransportStateChange: (state) => onTransportStateChange(state),
+    markProviderGenerationRequested,
     canForwardMicrophone: () => canForwardMicrophone(),
     resetConversationForStart: () => resetConversationForStart(),
     pauseLessonForStop: () => pauseLessonForStop(),
@@ -970,14 +977,17 @@ export default function Home() {
     resetCurrentLessonProgress,
   });
 
-  const handleLearnerInterruption = (discreteTextTurn = false) => {
+  const handleLearnerInterruption = (
+    discreteTextTurn = false,
+    providerTurnOpen = providerGenerationOpenRef.current,
+  ) => {
     if (isCurrentFarewell(closingTurnRef.current, conversationRunRef.current, generationEpochRef.current)) return;
     // Gemini cuts playback immediately. Smoothing a mid-phoneme cutoff is a
     // later UX refinement; yielding to the learner remains the priority.
     // Close admission before clearing playback, so no chunk still in flight
     // from the interrupted turn (including before a typed interruption's
     // provider acknowledgement) can be scheduled behind the cleared queue.
-    if (providerGenerationOpenRef.current && !interruptedTurnAudioGateRef.current) {
+    if (providerTurnOpen && !interruptedTurnAudioGateRef.current) {
       interruptedTurnAudioGateRef.current = { rejectedChunks: 0 };
     }
     invalidateActiveTeachingBeat("barge-in");
@@ -1026,13 +1036,15 @@ export default function Home() {
     reviewResumeGuardRef.current = false;
     const text = typedReply.trim();
     if (!text) return;
+    // Sampled before the send, which opens the reply's own provider turn.
+    const interruptedProviderTurnOpen = providerGenerationOpenRef.current;
     if (!transportRef.current?.sendLearnerText(text)) {
       setUserError("Your reply could not be sent while reconnecting. Try again.");
       addDebugMessage("Typed learner reply send failed: connection unavailable");
       return;
     }
     if (assistantSpeakingRef.current) {
-      handleLearnerInterruption(true);
+      handleLearnerInterruption(true, interruptedProviderTurnOpen);
       typedInterruptionHandledRef.current = true;
     }
     userTranscriptRef.current = text;
@@ -1081,6 +1093,8 @@ export default function Home() {
             setLatestLearnerReply("");
             addDebugMessage("User speech started");
           } else {
+            // The provider answers a finished learner voice turn.
+            markProviderGenerationRequested();
             transportRef.current?.setLearnerSpeaking(false);
           }
           break;
