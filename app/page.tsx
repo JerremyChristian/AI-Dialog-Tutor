@@ -258,6 +258,8 @@ export default function Home() {
   const nextMessageIdRef = useRef(0);
   const lessonActiveRef = useRef(false);
   const lessonStartupPendingRef = useRef(false);
+  // Run that set lessonStartupPendingRef; only that run may clear it in finally.
+  const lessonStartupRunRef = useRef(0);
   const engagementStateRef = useRef<EngagementState>("ended");
   const lastMeaningfulLearnerActivityAtRef = useRef<number | null>(null);
   const noiseFloorRef = useRef(0.004);
@@ -1737,6 +1739,7 @@ export default function Home() {
     }
 
     const run = ++conversationRunRef.current;
+    lessonStartupRunRef.current = run;
     setMicrophoneStatus("Requesting permission");
     setAiConnectionStatus("Not connected");
     addDebugMessage("Microphone permission requested");
@@ -1981,7 +1984,7 @@ export default function Home() {
         await player.close();
       }
     } finally {
-      lessonStartupPendingRef.current = false;
+      if (lessonStartupRunRef.current === run) lessonStartupPendingRef.current = false;
     }
   };
 
