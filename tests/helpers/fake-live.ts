@@ -44,6 +44,7 @@ export async function installFakeLive(page: Page, options: {
   holdFirstTokenResponse?: boolean;
   holdFirstStreamerClose?: boolean;
   failTokenRequest?: number;
+  observeTutorPlayback?: boolean;
 } = {}) {
   await page.route("**/auth/v1/**", (route) => route.fulfill({
     status: 401, contentType: "application/json", body: JSON.stringify({ message: "Not signed in" }),
@@ -70,7 +71,67 @@ export async function installFakeLive(page: Page, options: {
       body: JSON.stringify({ token: "local-test-token", source: { name: "plc-notes.txt", mimeType: "text/plain" } }),
     });
   });
-  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences, schemaVersion, cloudOwnerId, secondLesson, holdFirstPlayerReady, holdFirstStreamerClose }) => {
+  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences, schemaVersion, cloudOwnerId, secondLesson, holdFirstPlayerReady, holdFirstStreamerClose, observeTutorPlayback }) => {
+    if (observeTutorPlayback) {
+      const NativeAudioContext = window.AudioContext;
+      type PlaybackRecord = { id: number; marker: number; startTime: number; stopped: boolean; ended: boolean };
+      const records: PlaybackRecord[] = [];
+      let currentTime = 10;
+
+      class ObservableTutorAudioContext {
+        state: AudioContextState = "running";
+        destination = {} as AudioDestinationNode;
+        get currentTime() { return currentTime; }
+        constructor(options?: AudioContextOptions) {
+          if (options?.sampleRate !== 24_000) return new NativeAudioContext(options) as unknown as ObservableTutorAudioContext;
+        }
+        createBuffer(_channels: number, samples: number, rate: number) {
+          const channel = new Float32Array(samples);
+          return {
+            duration: samples / rate,
+            getChannelData: () => channel,
+          } as unknown as AudioBuffer;
+        }
+        createBufferSource() {
+          let buffer: AudioBuffer | null = null;
+          let record: PlaybackRecord | null = null;
+          const source = {
+            onended: null as (() => void) | null,
+            connect: () => undefined,
+            get buffer() { return buffer; },
+            set buffer(value: AudioBuffer | null) { buffer = value; },
+            start: (startTime = currentTime) => {
+              const marker = Math.round((buffer?.getChannelData(0)[0] ?? 0) * 32_768);
+              record = { id: records.length, marker, startTime, stopped: false, ended: false };
+              records.push(record);
+            },
+            stop: () => {
+              if (!record || record.ended) return;
+              record.stopped = true;
+              record.ended = true;
+              source.onended?.();
+            },
+          };
+          return source as unknown as AudioBufferSourceNode;
+        }
+        resume = async () => { this.state = "running"; };
+        close = async () => { this.state = "closed"; };
+      }
+
+      Object.defineProperty(window, "AudioContext", {
+        configurable: true,
+        value: ObservableTutorAudioContext,
+      });
+      Reflect.set(window, "__QA_TUTOR_PLAYBACK__", {
+        records: () => structuredClone(records),
+        setCurrentTime: (value: number) => { currentTime = value; },
+        end: (id: number) => {
+          const record = records[id];
+          if (record) record.ended = true;
+        },
+      });
+    }
+
     let wakeLockCount = 0;
     const releasedWakeLocks = new Set<number>();
     Object.defineProperty(navigator, "wakeLock", {
@@ -310,6 +371,7 @@ export async function installFakeLive(page: Page, options: {
     secondLesson: options.secondLesson ?? false,
     holdFirstPlayerReady: options.holdFirstPlayerReady ?? false,
     holdFirstStreamerClose: options.holdFirstStreamerClose ?? false,
+    observeTutorPlayback: options.observeTutorPlayback ?? false,
   });
 }
 
