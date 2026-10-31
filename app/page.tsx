@@ -238,6 +238,8 @@ export default function Home() {
   // Live audio chunks carry no generation identity, so turn boundaries decide
   // ownership: once an interruption is accepted while a provider generation is
   // open, every chunk belongs to that interrupted turn until its turnComplete.
+  // A generation is open from a beat request or first output until
+  // generationComplete or turnComplete.
   const providerGenerationOpenRef = useRef(false);
   const interruptedTurnAudioGateRef = useRef<{ rejectedChunks: number } | null>(null);
   const lessonWrapUpRef = useRef(false);
@@ -397,6 +399,8 @@ export default function Home() {
       invalidateActiveTeachingBeat("send-failed");
       return null;
     }
+    // The beat's provider turn is outstanding from the request, before any output.
+    providerGenerationOpenRef.current = true;
     if (activatedState) {
       lessonStateRef.current = activatedState;
       setLessonState(activatedState);
@@ -438,6 +442,7 @@ export default function Home() {
       invalidateActiveTeachingBeat("review-send-failed");
       return null;
     }
+    providerGenerationOpenRef.current = true;
     addDebugMessage(`Node review beat assigned: concept=${concept.id}, beat=${resolved.deliveryUnitIndex}/${resolved.beatIndex}, epoch=${generationEpoch}`);
     return active;
   }
