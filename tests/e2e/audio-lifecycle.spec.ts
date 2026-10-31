@@ -1,8 +1,9 @@
 import { expect, test } from "@playwright/test";
 import {
   deliverLive, endMicrophoneTrack, getExternalRequests, getLiveSends, installFakeLive,
-  getTokenRequestCount, installNoExternalNetworkGuard, openLessonAndStart, QA_LESSON_ID,
-  readTestState, releaseFirstPlayerReady, releaseFirstStreamerClose, releaseFirstTokenResponse,
+  getTokenRequestCount, holdSavedLessonWrites, installNoExternalNetworkGuard, openLessonAndStart,
+  QA_LESSON_ID, readTestState, releaseFirstPlayerReady, releaseFirstStreamerClose,
+  releaseFirstTokenResponse, releaseSavedLessonWrites,
 } from "../helpers/fake-live";
 
 const learnerAudioCount = async (page: Parameters<typeof getLiveSends>[0]) =>
@@ -157,6 +158,53 @@ test("stale disposal cannot tear down the newer authoritative session", async ({
 
   expect(getExternalRequests(page)).toEqual([]);
   expect(newerPlayerClosed).toBe(false);
+  expect.soft(after.lessonActive).toBe(true);
+  expect.soft(after.connectionState).toBe(before.connectionState);
+  expect(bSocketStateAfter).toBe(bSocketStateBefore);
+});
+
+test("a stop held in persistence cannot capture the newer run's resources", async ({ page }) => {
+  await installNoExternalNetworkGuard(page);
+  await installFakeLive(page, { persisted: true, holdFirstStreamerClose: true });
+  await openLessonAndStart(page, true);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.wakeLockCount())).toBe(1);
+
+  await holdSavedLessonWrites(page);
+  await page.getByRole("button", { name: "End lesson" }).click();
+  await page.getByRole("button", { name: "Continue Lesson", exact: true }).click();
+
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_LIVE__").socketCount())).toBe(2);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.playerCount())).toBe(2);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.wakeLockCount())).toBe(2);
+  await expect.poll(async () => {
+    const snapshot = (await readTestState(page)).snapshot;
+    return snapshot.lessonActive && snapshot.connectionState !== "closed";
+  }).toBe(true);
+
+  const before = (await readTestState(page)).snapshot;
+  const bSocketStateBefore = await page.evaluate(() =>
+    Reflect.get(window, "__QA_LIVE__").socketState(1) as number);
+
+  await releaseSavedLessonWrites(page);
+  await expect.poll(() => page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__")?.wakeLockReleaseCount())).toBe(1);
+  await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+
+  const after = (await readTestState(page)).snapshot;
+  const bSocketStateAfter = await page.evaluate(() =>
+    Reflect.get(window, "__QA_LIVE__").socketState(1) as number);
+  const newerPlayerClosed = await page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__").isPlayerClosed(1) as boolean);
+  const newerWakeLockReleased = await page.evaluate(() =>
+    Reflect.get(window, "__QA_DISPOSAL__").isWakeLockReleased(1) as boolean);
+
+  expect(getExternalRequests(page)).toEqual([]);
+  expect.soft(newerPlayerClosed).toBe(false);
+  expect.soft(newerWakeLockReleased).toBe(false);
   expect.soft(after.lessonActive).toBe(true);
   expect.soft(after.connectionState).toBe(before.connectionState);
   expect(bSocketStateAfter).toBe(bSocketStateBefore);

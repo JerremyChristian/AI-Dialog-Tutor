@@ -118,6 +118,7 @@ export async function installFakeLive(page: Page, options: {
         isPlayerClosed: (index: number) => closedPlayers.has(index),
         wakeLockCount: () => wakeLockCount,
         wakeLockReleaseCount: () => releasedWakeLocks.size,
+        isWakeLockReleased: (index: number) => releasedWakeLocks.has(index),
       });
     }
 
