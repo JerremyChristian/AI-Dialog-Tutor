@@ -97,6 +97,10 @@ import {
 import { isSupabaseConfigured } from "../lib/supabase/config";
 import { sanitizeLearnerVisibleTutorTranscript } from "../lib/transcript-visibility";
 import { mergeLearnerTranscript } from "../lib/learner-transcript";
+import {
+  emitTestEvent,
+  installTestObservabilityBridge,
+} from "../lib/test-observability";
 import { useLessonProcessingQueue } from "../lib/use-lesson-processing-queue";
 
 type MicrophoneStatus =
@@ -345,6 +349,9 @@ export default function Home() {
   const resumeExistingLessonRef = useRef(false);
   const persistenceAvailableRef = useRef(true);
   const persistenceHydratedRef = useRef(false);
+  const cloudAuthReadyRef = useRef(cloudAuthReady);
+  const cloudUserIdTestRef = useRef<string | null>(cloudUserId);
+  const transportStateTestRef = useRef<LiveTransportState>(transportState);
   const workspaceOwnerIdRef = useRef<string | null>(null);
   const cloudOwnerIdRef = useRef<string | null>(null);
   const cloudSyncMetadataRef = useRef<SavedLesson["cloudSync"]>(undefined);
@@ -430,6 +437,49 @@ export default function Home() {
     ]);
   }, []);
 
+  useEffect(() => installTestObservabilityBridge(() => {
+    const state = lessonStateRef.current;
+    const current = getCurrentConcept(state);
+    const active = activeTeachingBeatRef.current;
+    const transcript = [state.lastUserTranscript, state.lastAssistantTranscript].filter(Boolean);
+    return {
+      lessonId: savedLessonIdRef.current,
+      currentNodeId: state.currentNodeId,
+      coverage: Object.fromEntries(Object.values(state.nodes).map((node) => [node.id, node.status])),
+      status: state.status,
+      resumePoint: state.resumePoint,
+      deliveryCursor: current ? state.teachingContractProgress[current.id]?.nextTeachingPointIndex ?? null : null,
+      activeDeliveryUnit: active ? {
+        conceptId: active.conceptId,
+        index: active.deliveryUnitIndex,
+        objective: active.unit.objective,
+      } : null,
+      activePresentationBeat: active ? {
+        index: active.beatIndex,
+        teachingPointIndexes: [...active.teachingPointIndexes],
+        mode: active.mode,
+      } : null,
+      reviewActive: Boolean(nodeReviewRef.current),
+      interruptionCount: state.interruptionCount,
+      connectionState: transportStateTestRef.current,
+      tutorAudioPlaying: assistantSpeakingRef.current,
+      generationEpoch: generationEpochRef.current,
+      audioEpoch: active?.generationEpoch ?? null,
+      transcriptLength: transcript.join(" ").length,
+      latestTranscriptRole: state.lastUserTranscript
+        ? "learner"
+        : state.lastAssistantTranscript ? "tutor" : null,
+      lessonActive: lessonActiveRef.current,
+      persistenceHydrated: persistenceHydratedRef.current,
+      cloudAuthReady: cloudAuthReadyRef.current,
+      cloudUserId: cloudUserIdTestRef.current,
+    };
+  }), []);
+
+  cloudAuthReadyRef.current = cloudAuthReady;
+  cloudUserIdTestRef.current = cloudUserId;
+  transportStateTestRef.current = transportState;
+
   function hasCurrentLearnerActivity() {
     if (learnerActivityRunRef.current !== conversationRunRef.current) return false;
     const continuity = transportRef.current?.getInterruptionContinuity();
@@ -493,6 +543,11 @@ export default function Home() {
     activeTeachingBeatRef.current = null;
     playerRef.current?.cancelBatch(active.generationEpoch);
     generationEpochRef.current += 1;
+    emitTestEvent("audio.epoch-invalidated", {
+      reason,
+      invalidatedEpoch: active.generationEpoch,
+      generationEpoch: generationEpochRef.current,
+    });
     addDebugMessage(`Teaching beat interrupted: epoch=${active.generationEpoch}, commit=no, reason=${reason}`);
   }
 
@@ -569,6 +624,12 @@ ${active.mode === "review"
       cancelled: false,
     };
     activeTeachingBeatRef.current = active;
+    emitTestEvent("lesson.generation-started", {
+      conceptId: concept.id,
+      generationEpoch,
+      deliveryUnitIndex: resolved.deliveryUnitIndex,
+      beatIndex: resolved.beatIndex,
+    });
     const presentation = { ...resolved, conceptId: concept.id };
     presentationBeatRef.current = presentation;
     setPresentationBeat(presentation);
@@ -579,6 +640,7 @@ ${active.mode === "review"
         return;
       }
       current.audioNaturallyDrained = true;
+      emitTestEvent("tutor.audio-ended", { generationEpoch: epoch, natural: true });
       addDebugMessage(`Teaching audio naturally drained: epoch=${epoch}`);
       assistantSpeakingRef.current = false;
       transportRef.current?.setAssistantSpeaking(false);
@@ -683,6 +745,7 @@ ${active.mode === "review"
     }
     nodeReviewRef.current = null;
     setNodeReview(null);
+    emitTestEvent("review.ended", { nodeId: review.nodeId, reason });
     presentationBeatRef.current = review.returnPresentationBeat;
     setPresentationBeat(review.returnPresentationBeat);
     addDebugMessage(`Node review exited: reason=${reason}`);
@@ -738,6 +801,7 @@ ${active.mode === "review"
       activeTeachingBeatRef.current = null;
       playerRef.current?.cancelBatch(epoch);
       addDebugMessage(`Node review beat committed: concept=${review.nodeId}, next=${nextIndex}, complete=${complete}`);
+      emitTestEvent("beat.commit", { mode: "review", conceptId: review.nodeId, nextIndex });
       addReviewFlowDiagnostic(
         "review-beat-committed",
         `nextReviewCursor=${nextIndex} nodeComplete=${complete} ` +
@@ -767,6 +831,9 @@ ${active.mode === "review"
     const nextIndex = computeNextTeachingPointIndexAfterBeat(active.teachingPointIndexes);
     lessonStateRef.current = transition.state;
     setLessonState(transition.state);
+    emitTestEvent("beat.commit", { mode: "lesson", conceptId: active.conceptId, nextIndex });
+    emitTestEvent("delivery.cursor-changed", { conceptId: active.conceptId, from: currentNext, to: nextIndex });
+    emitTestEvent("coverage.changed", { conceptId: active.conceptId, status: transition.state.nodes[active.conceptId]?.status });
     activeTeachingBeatRef.current = null;
     playerRef.current?.cancelBatch(epoch);
     addDebugMessage(
@@ -1673,6 +1740,10 @@ ${active.mode === "review"
         interruptionCount: state.interruptionCount + 1,
         lastAssistantTranscript: interruptedTranscript,
       }));
+      emitTestEvent("interruption.accepted", {
+        conceptId: current.currentNodeId,
+        interruptionCount: current.interruptionCount + 1,
+      });
       resumptionPendingRef.current = true;
       addDebugMessage("Assistant interrupted");
       addDebugMessage(`Resume point saved: ${resumePoint}`);
@@ -1729,6 +1800,7 @@ ${active.mode === "review"
     // ACTIVITY_START and interrupted together; ordering this first prevents a
     // pending graceful rollover from retiring the socket between those events.
     if (voiceActivity === "ACTIVITY_START") {
+      emitTestEvent("learner.activity-detected", { source: "voice" });
       learnerActivityRunRef.current = conversationRunRef.current;
       reviewResumeGuardRef.current = false;
       transportRef.current?.setLearnerSpeaking(true);
@@ -1780,6 +1852,7 @@ ${active.mode === "review"
       }));
 
       if (wasInterrupted) {
+        emitTestEvent("clarification.started", { source: "voice" });
         addDebugMessage("Resolving learner interruption");
       }
     } else if (serverContent?.interimInputTranscription?.text) {
@@ -1871,6 +1944,9 @@ ${active.mode === "review"
       if (!assistantSpeakingRef.current) {
         typedInterruptionHandledRef.current = false;
         assistantSpeakingRef.current = true;
+        emitTestEvent("tutor.audio-started", {
+          generationEpoch: activeTeachingBeatRef.current?.generationEpoch ?? generationEpochRef.current,
+        });
         transportRef.current?.setAssistantSpeaking(true);
         sourceGroundingPendingRef.current = false;
         if (!assistantTurnActiveRef.current) {
@@ -1888,6 +1964,9 @@ ${active.mode === "review"
           addDebugMessage("First persisted-resume response received");
         }
         if (resumptionPendingRef.current) {
+          emitTestEvent("canonical.resume-requested", {
+            conceptId: lessonStateRef.current.currentNodeId,
+          });
           updateLessonState((current) => ({
             ...current,
             status: "resuming",
@@ -1946,6 +2025,12 @@ ${active.mode === "review"
         };
       });
       resumptionPendingRef.current = false;
+      if (lessonStateRef.current.status === "resolving-interruption" ||
+          lessonStateRef.current.status === "resuming") {
+        emitTestEvent("clarification.completed", {
+          conceptId: lessonStateRef.current.currentNodeId,
+        });
+      }
       if (persistedResumeBriefingPendingRef.current) {
         persistedResumeBriefingPendingRef.current = false;
         addDebugMessage("Resume briefing completed");
@@ -2281,12 +2366,14 @@ ${active.mode === "review"
     nodeReviewRef.current = review;
     reviewResumeGuardRef.current = false;
     setNodeReview(review);
+    emitTestEvent("review.started", { nodeId: node.id });
     addDebugMessage(`Node review started: concept=${node.id}`);
     addReviewFlowDiagnostic("review-start");
     assignNextReviewBeat();
   };
 
   const startConversation = async () => {
+    emitTestEvent("lesson.start-requested", { lessonId: savedLessonIdRef.current });
     setUserError("");
     setPersistenceNotice("");
     if (
@@ -2512,6 +2599,7 @@ ${active.mode === "review"
       }
 
       setAiConnectionStatus("Connected");
+      emitTestEvent("live.setup-complete");
       addDebugMessage("Live connection established");
       sourceGroundingPendingRef.current = true;
       addDebugMessage("Source seeding started");
