@@ -36,8 +36,6 @@ test.beforeEach(async ({ page }) => {
       onmessage: ((event: MessageEvent) => void) | null = null;
       onerror: ((event: Event) => void) | null = null;
       onclose: ((event: CloseEvent) => void) | null = null;
-      private teachingStarted = false;
-      private interruptionSent = false;
 
       constructor(url: string | URL) {
         super();
@@ -45,6 +43,8 @@ test.beforeEach(async ({ page }) => {
         if (!this.url.includes("generativelanguage.googleapis.com")) {
           return new OriginalWebSocket(url) as unknown as FakeLiveWebSocket;
         }
+        Reflect.set(window, "__QA_DELIVER_LIVE_MESSAGE__", (body: Record<string, unknown>) =>
+          this.deliver(body));
         setTimeout(() => {
           this.readyState = OriginalWebSocket.OPEN;
           this.onopen?.(new Event("open"));
@@ -60,29 +60,12 @@ test.beforeEach(async ({ page }) => {
         }
         const realtimeInput = message.realtimeInput as { text?: string; audio?: unknown } | undefined;
         if (realtimeInput?.text?.includes("APP_CONTROL:TEACH_PRESENTATION_BEAT")) {
-          this.teachingStarted = true;
           this.deliver({
             serverContent: {
               modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
               outputTranscription: { text: "A programmable logic controller coordinates industrial equipment." },
             },
           });
-          return;
-        }
-        if (this.teachingStarted && realtimeInput?.audio && !this.interruptionSent) {
-          this.interruptionSent = true;
-          setTimeout(() => {
-            this.deliver({
-              voiceActivity: { voiceActivityType: "ACTIVITY_START" },
-              serverContent: { interrupted: true },
-            });
-            this.deliver({
-              serverContent: {
-                inputTranscription: { text: "Wait, what exactly is a PLC?", finished: true },
-                turnComplete: true,
-              },
-            });
-          }, 250);
         }
       }
 
@@ -92,7 +75,10 @@ test.beforeEach(async ({ page }) => {
       }
 
       private deliver(body: Record<string, unknown>) {
-        setTimeout(() => this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(body) })), 0);
+        return new Promise<void>((resolve) => setTimeout(() => {
+          this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(body) }));
+          resolve();
+        }, 0));
       }
     }
 
@@ -222,7 +208,29 @@ test("TC-VOICE-INTERRUPT-001 preserves canonical progress during voice barge-in"
   await page.getByRole("button", { name: /start lesson/i }).click();
 
   await expect.poll(async () => (await readBridge(page)).events.map((event) => event.name))
+    .toContain("tutor.audio-started");
+
+  await deliverLiveMessage(page, { serverContent: { interrupted: true } });
+  await expect.poll(async () => (await readBridge(page)).snapshot.interruptionCount).toBe(0);
+
+  await deliverLiveMessage(page, {
+    voiceActivity: { voiceActivityType: "ACTIVITY_START" },
+    serverContent: { interrupted: true },
+  });
+  await expect.poll(async () => (await readBridge(page)).events.map((event) => event.name))
     .toContain("interruption.accepted");
+
+  await deliverLiveMessage(page, { serverContent: { interrupted: true } });
+  await expect.poll(async () => (await readBridge(page)).snapshot.interruptionCount).toBe(1);
+
+  await deliverLiveMessage(page, {
+    serverContent: {
+      inputTranscription: { text: "Wait, what exactly is a PLC?", finished: true },
+      turnComplete: true,
+    },
+  });
+  await deliverLiveMessage(page, { serverContent: { generationComplete: true } });
+  await expect.poll(async () => (await readBridge(page)).snapshot.deliveryCursor).toBe(0);
 
   const result = await readBridge(page);
   await testInfo.attach("after-snapshot", {
@@ -232,6 +240,8 @@ test("TC-VOICE-INTERRUPT-001 preserves canonical progress during voice barge-in"
   const names = result.events.map((event) => event.name);
   expect(names).toContain("learner.activity-detected");
   expect(names).toContain("interruption.accepted");
+  expect(names.indexOf("learner.activity-detected")).toBeLessThan(names.indexOf("interruption.accepted"));
+  expect(names.filter((name) => name === "interruption.accepted")).toHaveLength(1);
   expect(names).not.toContain("beat.commit");
   expect(result.snapshot.currentNodeId).toBe("what-is-a-plc");
   expect(result.snapshot.deliveryCursor).toBe(0);
@@ -240,6 +250,16 @@ test("TC-VOICE-INTERRUPT-001 preserves canonical progress during voice barge-in"
   expect(result.snapshot.lessonActive).toBe(true);
   expect(["active", "rollover-ready"]).toContain(result.snapshot.connectionState);
 });
+
+async function deliverLiveMessage(page: Page, body: Record<string, unknown>) {
+  await page.evaluate((message) => {
+    const deliver = Reflect.get(window, "__QA_DELIVER_LIVE_MESSAGE__") as
+      | ((value: Record<string, unknown>) => Promise<void>)
+      | undefined;
+    if (!deliver) throw new Error("Fake Live message injector is unavailable");
+    return deliver(message);
+  }, body);
+}
 
 async function readBridge(page: Page) {
   return page.evaluate(() => {
