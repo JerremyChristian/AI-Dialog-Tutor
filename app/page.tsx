@@ -75,9 +75,6 @@ import {
   type TeachingPreferences,
 } from "../lib/teaching-preferences";
 import {
-  MAX_RECENT_TEACHING_CONTEXT_ENTRIES,
-  MAX_RECENT_TEACHING_EXCERPT_LENGTH,
-  SAVED_LESSON_SCHEMA_VERSION,
   clearActiveLessonId,
   deleteSavedLesson,
   getSavedLesson,
@@ -90,6 +87,11 @@ import {
   type RecentTeachingContextEntry,
   type SavedLesson,
 } from "../lib/local-persistence";
+import {
+  appendRecentTeachingContext,
+  buildSavedLessonSnapshot,
+  getPersistedResumeContext,
+} from "../lib/lesson-snapshot";
 import {
   createCloudCompatibleLessonId,
   associateCloudLesson,
@@ -236,42 +238,6 @@ function capitalize(value: string) {
 function isRedundantPreparationNotice(value: string) {
   return /lesson is being prepared/i.test(value) &&
     (/visible in your library/i.test(value) || /follow its progress on home/i.test(value));
-}
-
-function getPersistedResumeContext(
-  state: LessonState,
-  recentTeachingContext: RecentTeachingContextEntry[],
-) {
-  const current = getCurrentConcept(state);
-  const atomicConcepts = getLessonTreeRows(state)
-    .map(({ node }) => node)
-    .filter((node) => node.childrenIds.length === 0 && Boolean(node.teaching));
-  const currentIndex = current
-    ? atomicConcepts.findIndex((node) => node.id === current.id)
-    : -1;
-  const previousCovered = currentIndex > 0
-    ? atomicConcepts.slice(0, currentIndex).reverse()
-      .find((node) => node.status === "taught")
-    : undefined;
-  return {
-    currentConceptTitle: current?.title ?? null,
-    currentConceptStatus: current?.status ?? null,
-    resumePointAvailable: Boolean(state.resumePoint.trim()),
-    previousCoveredConceptTitle: previousCovered?.title ?? null,
-    recentTeachingContext: current
-      ? recentTeachingContext
-        .filter((entry) => entry.conceptId === current.id)
-        .map((entry) => entry.excerpt)
-      : [],
-  };
-}
-
-function createRecentTeachingExcerpt(transcript: string) {
-  const concise = transcript.trim().replace(/\s+/g, " ");
-  if (!concise) return "";
-  return concise.length <= MAX_RECENT_TEACHING_EXCERPT_LENGTH
-    ? concise
-    : `${concise.slice(0, MAX_RECENT_TEACHING_EXCERPT_LENGTH - 3).trimEnd()}...`;
 }
 
 export default function Home() {
@@ -911,16 +877,14 @@ export default function Home() {
   };
 
   const updateRecentTeachingContext = (conceptId: string | null, transcript: string) => {
-    if (!conceptId || !lessonStateRef.current.nodes[conceptId]) return;
-    const excerpt = createRecentTeachingExcerpt(transcript);
-    if (!excerpt) return;
-    const matching = recentTeachingContextRef.current
-      .filter((entry) => entry.conceptId === conceptId);
-    if (matching.at(-1)?.excerpt === excerpt) return;
-    recentTeachingContextRef.current = [
-      ...matching,
-      { conceptId, excerpt },
-    ].slice(-MAX_RECENT_TEACHING_CONTEXT_ENTRIES);
+    const next = appendRecentTeachingContext(
+      recentTeachingContextRef.current,
+      lessonStateRef.current,
+      conceptId,
+      transcript,
+    );
+    if (!next) return;
+    recentTeachingContextRef.current = next;
     addDebugMessage(
       `Resume teaching context updated: concept=${conceptId}, ` +
       `entries=${recentTeachingContextRef.current.length}`,
@@ -936,37 +900,23 @@ export default function Home() {
     const now = new Date().toISOString();
     const createdAt = savedLessonCreatedAtRef.current ?? now;
     savedLessonCreatedAtRef.current = createdAt;
-    const currentState = stateOverride ?? lessonStateRef.current;
-    const candidate = structuredClone<SavedLesson>({
-      schemaVersion: SAVED_LESSON_SCHEMA_VERSION,
+    return buildSavedLessonSnapshot({
       id,
-      title: source.name,
-      lessonFocus: topicInput.trim(),
+      prepared,
+      source,
+      lessonSources,
+      topicInput,
       hasStarted: resumeExistingLessonRef.current,
-      source: {
-        metadata: { ...source, status: "ready", error: undefined },
-        prepared,
-      },
-      sources: lessonSources,
-      lessonState: {
-        ...currentState,
-        // M6.1 persists lesson continuity, not conversation history.
-        lastUserTranscript: "",
-        lastAssistantTranscript: "",
-      },
+      state: stateOverride ?? lessonStateRef.current,
       recentTeachingContext: recentTeachingContextRef.current,
       teachingPreferences: teachingPreferencesRef.current,
       createdAt,
-      updatedAt: savedLessonUpdatedAtRef.current ?? now,
+      previousUpdatedAt: savedLessonUpdatedAtRef.current,
+      previousContentSignature: savedLessonContentSignatureRef.current,
       cloudOwnerId: cloudOwnerIdRef.current,
-      ...(cloudSyncMetadataRef.current ? { cloudSync: cloudSyncMetadataRef.current } : {}),
+      cloudSync: cloudSyncMetadataRef.current,
+      now,
     });
-    const contentSignature = getSavedLessonContentSignature(candidate);
-    candidate.updatedAt = savedLessonContentSignatureRef.current === contentSignature &&
-      savedLessonUpdatedAtRef.current
-      ? savedLessonUpdatedAtRef.current
-      : now;
-    return candidate;
   };
 
   const persistLessonSnapshot = async (snapshot: SavedLesson) => {
