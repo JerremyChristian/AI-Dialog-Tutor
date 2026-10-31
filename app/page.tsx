@@ -11,6 +11,19 @@ import { SourceVisual } from "../components/source-visual";
 import { ProcessingQueue } from "../components/processing-queue";
 import { PreprocessingDiagnostic } from "../components/preprocessing-diagnostic";
 import CloudAccount from "../components/cloud-account";
+import { AppearanceSettings } from "../components/appearance-settings";
+import { DeveloperDebugPanel, type DebugMessage } from "../components/developer-debug-panel";
+import { LessonDetail } from "../components/lesson-detail";
+import { RestartLessonConfirmation } from "../components/restart-lesson-confirmation";
+import {
+  ActiveLessonSummary,
+  ActiveTeachingPreferences,
+  ConversationStatusRow,
+  ConversationTranscript,
+  LessonResponseControls,
+  TeachingRoomHeader,
+} from "../components/teaching-room";
+import { TeachingStyleControls } from "../components/teaching-style-controls";
 import type {
   LearningSource,
   LessonSource,
@@ -79,7 +92,6 @@ import {
   deriveResumePoint,
   GEMINI_LIVE_MODEL,
   getCurrentConcept,
-  getLessonTreeRows,
   isLessonPlanComplete,
   LESSON_WRAP_UP_CONTROL,
   mergeTranscript,
@@ -114,8 +126,6 @@ import {
 } from "../lib/teaching-beat-runtime";
 import {
   DEFAULT_TEACHING_PREFERENCES,
-  EXPLANATION_DEPTHS,
-  SPEAKING_SPEEDS,
   applyTeachingPreferenceUpdate,
   type TeachingPreferences,
 } from "../lib/teaching-preferences";
@@ -152,7 +162,9 @@ import {
   emitTestEvent,
   installTestObservabilityBridge,
 } from "../lib/test-observability";
+import { useAppearance } from "../lib/use-appearance";
 import { useLessonProcessingQueue } from "../lib/use-lesson-processing-queue";
+import { usePwaInstall } from "../lib/use-pwa-install";
 
 type MicrophoneStatus =
   | "Not active"
@@ -163,21 +175,9 @@ type MicrophoneStatus =
 
 type AiConnectionStatus = "Not connected" | "Connecting" | "Connected" | "Error";
 
-type DebugMessage = {
-  id: number;
-  timestamp: string;
-  text: string;
-};
-
-type InstallPromptEvent = Event & {
-  prompt: () => Promise<void>;
-  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
-};
-
 type TeachingPreferenceUpdate = Partial<TeachingPreferences>;
 type PendingTeachingPreferences = Partial<TeachingPreferences>;
 type LibraryView = "index" | "lesson" | "new";
-type AppearancePreference = "system" | "light" | "dark";
 
 type ConversationContinuity = {
   lastMeaningfulLearnerTranscript?: string;
@@ -214,62 +214,6 @@ function getRealtimeErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unknown Gemini Live error";
 }
 
-function TeachingStyleControls({
-  preferences,
-  disabled,
-  onChange,
-}: {
-  preferences: TeachingPreferences;
-  disabled?: boolean;
-  onChange: (update: TeachingPreferenceUpdate) => void;
-}) {
-  return (
-    <div className="teaching-style-controls">
-      <fieldset disabled={disabled}>
-        <legend>Explanation depth</legend>
-        <div className="preference-segments">
-          {EXPLANATION_DEPTHS.map((depth) => (
-            <button
-              key={depth}
-              type="button"
-              className={preferences.explanationDepth === depth ? "selected" : undefined}
-              aria-label={`${capitalize(depth)} explanation depth`}
-              aria-pressed={preferences.explanationDepth === depth}
-              onClick={() => onChange({ explanationDepth: depth })}
-            >
-              {capitalize(depth)}
-            </button>
-          ))}
-        </div>
-      </fieldset>
-      <fieldset disabled={disabled}>
-        <legend>
-          Speaking speed
-          <small>How fast the tutor talks</small>
-        </legend>
-        <div className="preference-segments">
-          {SPEAKING_SPEEDS.map((speed) => (
-            <button
-              key={speed}
-              type="button"
-              className={preferences.speakingSpeed === speed ? "selected" : undefined}
-              aria-label={`${capitalize(speed)} speaking speed`}
-              aria-pressed={preferences.speakingSpeed === speed}
-              onClick={() => onChange({ speakingSpeed: speed })}
-            >
-              {capitalize(speed)}
-            </button>
-          ))}
-        </div>
-      </fieldset>
-    </div>
-  );
-}
-
-function capitalize(value: string) {
-  return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
-}
-
 function isRedundantPreparationNotice(value: string) {
   return /lesson is being prepared/i.test(value) &&
     (/visible in your library/i.test(value) || /follow its progress on home/i.test(value));
@@ -294,8 +238,6 @@ export default function Home() {
   const [desktopTeachingStyleExpanded, setDesktopTeachingStyleExpanded] = useState(true);
   const [mobileTeachingStyleExpanded, setMobileTeachingStyleExpanded] = useState(false);
   const [typedReply, setTypedReply] = useState("");
-  const [appearance, setAppearance] = useState<AppearancePreference>("system");
-  const [appearanceReady, setAppearanceReady] = useState(false);
   const [teachingPreferences, setTeachingPreferences] = useState<TeachingPreferences>(
     DEFAULT_TEACHING_PREFERENCES,
   );
@@ -314,8 +256,6 @@ export default function Home() {
   const [cloudSyncState, setCloudSyncState] = useState<CloudSyncState>("local-only");
   const [cloudLessonCount, setCloudLessonCount] = useState(0);
   const [localOnlyLessonCount, setLocalOnlyLessonCount] = useState(0);
-  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
-  const [showIosInstallHint, setShowIosInstallHint] = useState(false);
   const [topicInput, setTopicInput] = useState("");
   const [lessonState, setLessonState] = useState<LessonState>(() =>
     createLessonState("Uploaded material"),
@@ -482,35 +422,7 @@ export default function Home() {
     );
   }
 
-  useEffect(() => {
-    try {
-      const saved = window.localStorage.getItem("ai-tutor-appearance");
-      setAppearance(saved === "light" || saved === "dark" ? saved : "system");
-    } catch {
-      setAppearance("system");
-    }
-    setAppearanceReady(true);
-  }, []);
-
-  useEffect(() => {
-    if (!appearanceReady) return;
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const applyAppearance = () => {
-      const resolved = appearance === "system"
-        ? media.matches ? "dark" : "light"
-        : appearance;
-      document.documentElement.dataset.theme = resolved;
-    };
-    try {
-      window.localStorage.setItem("ai-tutor-appearance", appearance);
-    } catch {
-      // Appearance still applies for this session when browser storage is unavailable.
-    }
-    applyAppearance();
-    if (appearance !== "system") return;
-    media.addEventListener("change", applyAppearance);
-    return () => media.removeEventListener("change", applyAppearance);
-  }, [appearance, appearanceReady]);
+  const { appearance, setAppearance } = useAppearance();
 
   const updateLessonState = (
     update: (current: LessonState) => LessonState,
@@ -1532,16 +1444,10 @@ export default function Home() {
     topicInput,
   ]);
 
+  const { installPrompt, showIosInstallHint, requestInstall } = usePwaInstall();
+
   useEffect(() => {
     isMountedRef.current = true;
-
-    const onInstallPrompt = (event: Event) => {
-      event.preventDefault();
-      setInstallPrompt(event as InstallPromptEvent);
-    };
-    const standalone = window.matchMedia("(display-mode: standalone)").matches;
-    setShowIosInstallHint(/iPad|iPhone|iPod/.test(navigator.userAgent) && !standalone);
-    window.addEventListener("beforeinstallprompt", onInstallPrompt);
 
     const onVisibilityChange = () => {
       if (document.visibilityState === "visible" && lessonActiveRef.current) {
@@ -1558,7 +1464,6 @@ export default function Home() {
     document.addEventListener("visibilitychange", onVisibilityChange);
 
     return () => {
-      window.removeEventListener("beforeinstallprompt", onInstallPrompt);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       isMountedRef.current = false;
       conversationRunRef.current += 1;
@@ -2646,7 +2551,6 @@ export default function Home() {
   const microphoneActive = microphoneStatus === "Active";
   const aiConnected = aiConnectionStatus === "Connected";
   const requestingPermission = microphoneStatus === "Requesting permission";
-  const currentTeachingContract = getCurrentConcept(lessonState)?.teaching;
   const currentConcept = getCurrentConcept(lessonState);
   const currentTeachingPointIndex = currentConcept
     ? lessonState.teachingContractProgress[currentConcept.id]?.nextTeachingPointIndex ?? 0
@@ -2698,21 +2602,24 @@ export default function Home() {
     if (view === "library") setLibraryView("index");
   };
 
-  const requestInstall = async () => {
-    if (!installPrompt) return;
-    await installPrompt.prompt();
-    await installPrompt.userChoice;
-    setInstallPrompt(null);
-  };
-
   return (
     <main className={`page-shell${lessonActive ? " teaching-shell" : ""}`}>
       {!lessonActive && <AppNavigation activeView={appView} onNavigate={navigateProduct} />}
       <section className={`tutor-card${lessonActive ? " lesson-active" : ""}`}>
         <PreprocessingDiagnostic jobs={processingQueue.jobs} lessons={savedLessons} />
-        {lessonActive ? <header className="teaching-header"><div><p className="eyebrow">Teaching room</p><h1 id="page-title">{learningSource?.name || "Your lesson"}</h1></div><div className="teaching-header-actions"><button className="button-secondary" type="button" disabled={restartPending || Boolean(closingTurnRef.current)} onClick={() => setRestartConfirmationOpen(true)}>Restart Lesson</button><button className="button-danger end-lesson-top" type="button" aria-label="End lesson" onClick={() => void stopConversation()}><span className="end-lesson-desktop">End Lesson</span><span className="end-lesson-mobile" aria-hidden="true">End</span></button></div></header> : null}
+        {lessonActive ? <TeachingRoomHeader
+          title={learningSource?.name || "Your lesson"}
+          restartDisabled={restartPending || Boolean(closingTurnRef.current)}
+          onRequestRestart={() => setRestartConfirmationOpen(true)}
+          onEndLesson={() => void stopConversation()}
+        /> : null}
 
-        {lessonActive && restartConfirmationOpen && <section className="restart-lesson-confirmation" role="alertdialog" aria-labelledby="active-restart-lesson-title" aria-describedby="active-restart-lesson-description"><h2 id="active-restart-lesson-title">Restart this lesson?</h2><p id="active-restart-lesson-description">This will clear all teaching progress for this lesson and start it again from the beginning. Your materials and lesson content will not be deleted.</p><div><button className="button-secondary" type="button" disabled={restartPending} onClick={() => setRestartConfirmationOpen(false)}>Cancel</button><button className="button-danger" type="button" disabled={restartPending} onClick={() => void restartLesson()}>{restartPending ? "Restarting…" : "Restart"}</button></div></section>}
+        {lessonActive && restartConfirmationOpen && <RestartLessonConfirmation
+          idPrefix="active-restart-lesson"
+          restartPending={restartPending}
+          onCancel={() => setRestartConfirmationOpen(false)}
+          onRestart={() => void restartLesson()}
+        />}
         {lessonActive && showLessonComplete && <div className="lesson-complete-transition" role="status"><span aria-hidden="true">✓</span><strong>Lesson complete</strong></div>}
 
         {!lessonActive && !persistenceHydrated && <div className="loading-state" role="status"><span className="loading-spinner" aria-hidden="true" /> Restoring your learning workspace…</div>}
@@ -2753,12 +2660,7 @@ export default function Home() {
             onSyncNow={() => void syncCurrentAccount()}
             onImportLocalLessons={() => void importLocalLessons()}
           />
-          <section className="appearance-settings" aria-labelledby="appearance-title">
-            <p className="eyebrow">Appearance</p><h2 id="appearance-title">Choose your theme</h2>
-            <div className="appearance-options">
-              {(["system", "light", "dark"] as AppearancePreference[]).map((option) => <button key={option} type="button" className={appearance === option ? "selected" : undefined} aria-pressed={appearance === option} onClick={() => setAppearance(option)}><strong>{capitalize(option)}</strong><small>{option === "system" ? "Use your device appearance" : option === "light" ? "Always use light appearance" : "Always use dark appearance"}</small></button>)}
-            </div>
-          </section>
+          <AppearanceSettings appearance={appearance} onChange={setAppearance} />
           <section className="teaching-style" aria-labelledby="profile-preferences-title"><p className="eyebrow">Teaching preferences</p><h2 id="profile-preferences-title">Make lessons feel right for you</h2><TeachingStyleControls preferences={teachingPreferences} onChange={(update) => applyAuthoritativeTeachingPreferences({ ...teachingPreferencesRef.current, ...update })} /></section>
         </div>
 
@@ -2778,26 +2680,25 @@ export default function Home() {
           {userError && <p className="session-error" role="alert">{userError}</p>}
         </section>}
 
-        {!lessonActive && persistenceHydrated && appView === "library" && libraryView === "lesson" && <section className="product-view lesson-detail-view" aria-labelledby="lesson-detail-title">
-          <button className="back-button" type="button" onClick={() => setLibraryView("index")}>← Back to Library</button>
-          {selectedSavedLesson ? <>
-            <div className="focused-view-heading"><p className="eyebrow">Lesson</p><h1 id="lesson-detail-title">{selectedSavedLesson.title}</h1></div>
-            <section className="lesson-detail-card" aria-label="Lesson details"><dl>
-              <div><dt>Progress</dt><dd>{lessonProgress(selectedSavedLesson)}%</dd></div>
-              <div><dt>Current topic</dt><dd>{selectedSavedLesson.lessonState.currentNodeId ? selectedSavedLesson.lessonState.nodes[selectedSavedLesson.lessonState.currentNodeId]?.title || "Ready to begin" : "Ready to begin"}</dd></div>
-              <div><dt>Sources</dt><dd>{selectedSavedLesson.sources.length}</dd></div>
-            </dl></section>
-            <label className="topic-field setup-only"><span>Lesson topic or focus (optional)</span><input type="text" value={topicInput} onChange={(event) => setTopicInput(event.target.value)} placeholder="Teach the source's main topics" maxLength={160} disabled={requestingPermission} /></label>
-            <div className="lesson-detail-actions"><button className="button-primary" type="button" onClick={startConversation} disabled={requestingPermission || learningSource?.status !== "ready" || restartPending}>{requestingPermission ? "Connecting…" : resumeExistingLesson ? "Continue Lesson" : "Start Lesson"}</button>{selectedLessonRestartable && <button className="button-secondary" type="button" disabled={restartPending || lessonLibraryBusyId !== null} onClick={() => setRestartConfirmationOpen(true)}>Restart Lesson</button>}<button className="button-danger" type="button" disabled={restartPending || lessonLibraryBusyId !== null} onClick={() => void requestDeleteSavedLesson(selectedSavedLesson)}>Delete Lesson</button></div>
-            {selectedLessonRestartable && restartConfirmationOpen && <section className="restart-lesson-confirmation" role="alertdialog" aria-labelledby="restart-lesson-title" aria-describedby="restart-lesson-description">
-              <h2 id="restart-lesson-title">Restart this lesson?</h2>
-              <p id="restart-lesson-description">This will clear all teaching progress for this lesson and start it again from the beginning. Your materials and lesson content will not be deleted.</p>
-              <div><button className="button-secondary" type="button" disabled={restartPending} onClick={() => setRestartConfirmationOpen(false)}>Cancel</button><button className="button-danger" type="button" disabled={restartPending} onClick={() => void restartLesson()}>{restartPending ? "Restarting…" : "Restart"}</button></div>
-            </section>}
-            <div className="lesson-detail-progress"><LessonRoadmap lessonState={selectedSavedLesson.lessonState} lessonActive={false} readOnly navigationPending={false} onNavigate={() => undefined} /></div>
-            {userError && <p className="session-error" role="alert">{userError}</p>}
-          </> : <div className="empty-state compact"><h1 id="lesson-detail-title">Lesson unavailable</h1><p>This lesson could not be loaded.</p></div>}
-        </section>}
+        {!lessonActive && persistenceHydrated && appView === "library" && libraryView === "lesson" && <LessonDetail
+          lesson={selectedSavedLesson}
+          topicInput={topicInput}
+          requestingPermission={requestingPermission}
+          learningSourceReady={learningSource?.status === "ready"}
+          resumeExistingLesson={resumeExistingLesson}
+          restartable={selectedLessonRestartable}
+          restartPending={restartPending}
+          restartConfirmationOpen={restartConfirmationOpen}
+          libraryBusy={lessonLibraryBusyId !== null}
+          userError={userError}
+          onBack={() => setLibraryView("index")}
+          onTopicInputChange={setTopicInput}
+          onStart={startConversation}
+          onRequestRestart={() => setRestartConfirmationOpen(true)}
+          onCancelRestart={() => setRestartConfirmationOpen(false)}
+          onRestart={() => void restartLesson()}
+          onDelete={(lesson) => void requestDeleteSavedLesson(lesson)}
+        />}
 
         {lessonActive && <div className="active-learning-grid">
           <SourceVisual
@@ -2813,41 +2714,28 @@ export default function Home() {
             onDebug={addDebugMessage}
           />
           <div className="active-learning-sidebar">
-          {learningSource && <section className="active-summary" aria-label="Active lesson overview">
-            <p className="active-source" title={learningSource.name}>{learningSource.name}</p>
-            <p className="active-label">Current concept</p>
-            <h2>{currentConcept?.title || "Preparing lesson…"}</h2>
-            <p className="active-teaching-style">
-              Teaching: {capitalize(teachingPreferences.explanationDepth)} · Speech: {capitalize(teachingPreferences.speakingSpeed)}
-            </p>
-          </section>}
+          {learningSource && <ActiveLessonSummary
+            sourceName={learningSource.name}
+            conceptTitle={currentConcept?.title}
+            teachingPreferences={teachingPreferences}
+          />}
 
-          <section className={desktopTeachingStyleExpanded ? "active-teaching-preferences" : "active-teaching-preferences desktop-collapsed"} aria-labelledby="active-teaching-style-title">
-            <header className="mobile-disclosure-header">
-              <h2 id="active-teaching-style-title">Teaching style</h2>
-              <button type="button" aria-expanded={mobileTeachingStyleExpanded} aria-controls="active-teaching-style-content" onClick={() => setMobileTeachingStyleExpanded((expanded) => !expanded)}>Teaching style</button>
-              <button className="desktop-teaching-style-toggle" type="button" aria-label={desktopTeachingStyleExpanded ? "Collapse teaching style" : "Expand teaching style"} aria-expanded={desktopTeachingStyleExpanded} aria-controls="active-teaching-style-content" onClick={() => setDesktopTeachingStyleExpanded((expanded) => !expanded)}>
-                <span aria-hidden="true">{desktopTeachingStyleExpanded ? "▼" : "▶"}</span>
-              </button>
-            </header>
-            <div id="active-teaching-style-content" className={mobileTeachingStyleExpanded ? "mobile-disclosure-content mobile-expanded" : "mobile-disclosure-content"}>
-            <TeachingStyleControls
-              preferences={{ ...teachingPreferences, ...pendingTeachingPreferences }}
-              onChange={changeActiveTeachingPreference}
-            />
-            {preferenceUpdatePending && (
-              <p className="preference-pending" role="status">Updating teaching style…</p>
-            )}
-            </div>
-          </section>
+          <ActiveTeachingPreferences
+            preferences={{ ...teachingPreferences, ...pendingTeachingPreferences }}
+            updatePending={preferenceUpdatePending}
+            desktopExpanded={desktopTeachingStyleExpanded}
+            mobileExpanded={mobileTeachingStyleExpanded}
+            onToggleDesktopExpanded={() => setDesktopTeachingStyleExpanded((expanded) => !expanded)}
+            onToggleMobileExpanded={() => setMobileTeachingStyleExpanded((expanded) => !expanded)}
+            onChange={changeActiveTeachingPreference}
+          />
 
-          <section className="conversation-transcript" aria-labelledby="conversation-transcript-title">
-            <header className="mobile-disclosure-header">
-              <h2 id="conversation-transcript-title">Transcript</h2>
-              <button type="button" aria-expanded={mobileTranscriptExpanded} aria-controls="conversation-transcript-content" onClick={() => setMobileTranscriptExpanded((expanded) => !expanded)}>Transcript</button>
-            </header>
-            <div id="conversation-transcript-content" className={mobileTranscriptExpanded ? "conversation-transcript-body mobile-disclosure-content mobile-expanded" : "conversation-transcript-body mobile-disclosure-content"}><p><strong>You</strong>{latestLearnerReply || "No learner transcript yet."}</p><p><strong>Tutor</strong>{visibleTutorTranscript || "The tutor has not spoken yet."}</p></div>
-          </section>
+          <ConversationTranscript
+            learnerReply={latestLearnerReply}
+            tutorTranscript={visibleTutorTranscript}
+            mobileExpanded={mobileTranscriptExpanded}
+            onToggleMobileExpanded={() => setMobileTranscriptExpanded((expanded) => !expanded)}
+          />
           </div>
         </div>}
 
@@ -2855,55 +2743,24 @@ export default function Home() {
         {lessonActive && persistenceNotice && !isRedundantPreparationNotice(persistenceNotice) && <p className="session-notice" role="status">{persistenceNotice}</p>}
 
         {lessonActive && <div className="teaching-controls-stack">
-        {lessonActive && <div className="status-row" aria-label="Conversation status">
-          <div className="status-item" aria-live="polite">
-            <span
-              className={`status-dot${microphoneActive ? " status-dot-active" : ""}`}
-              aria-hidden="true"
-            />
-            <span className="status-copy">
-              <strong>{farewellFinishing ? "Finishing lesson…" : microphoneMuted ? "Muted" : "Listening"}</strong>
-              <small>{farewellFinishing ? "Playing the tutor’s farewell" : microphoneMuted ? "Microphone is off" : "You can speak at any time"}</small>
-            </span>
-            <button className={`mute-button${microphoneMuted ? " mute-button-active" : ""}`} type="button" onClick={toggleMicrophoneMute} aria-label={microphoneMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={microphoneMuted}>{microphoneMuted ? "Unmute" : "Mute"}</button>
-          </div>
-          <div className="status-item" aria-live="polite">
-            <span
-              className={`status-dot${aiConnected ? " status-dot-active" : ""}`}
-              aria-hidden="true"
-            />
-            <span>
-              <strong>{transportState === "recovering" || transportState === "handoff" || transportState === "synchronizing" ? "Reconnecting…" : aiConnected ? "Tutor ready" : "Connecting…"}</strong>
-              <small>{aiConnected ? "Voice conversation is active" : "Starting your lesson"}</small>
-            </span>
-          </div>
-        </div>}
+        {lessonActive && <ConversationStatusRow
+          microphoneActive={microphoneActive}
+          microphoneMuted={microphoneMuted}
+          aiConnected={aiConnected}
+          farewellFinishing={farewellFinishing}
+          transportState={transportState}
+          onToggleMute={toggleMicrophoneMute}
+        />}
 
         {lessonActive && (
-          <section className="lesson-controls" aria-label="Lesson response controls">
-            <div className="quick-replies-group">
-              <h3 className="quick-replies-heading" id="quick-replies-title">Quick Replies</h3>
-              <div className="quick-responses" aria-labelledby="quick-replies-title">
-                <button type="button" onClick={() => sendQuickResponse("Yes")} aria-label="Yes">
-                  Yes
-                </button>
-                <button type="button" onClick={() => sendQuickResponse("Repeat")} aria-label="Repeat explanation">
-                  Repeat
-                </button>
-                <button type="button" onClick={() => sendQuickResponse("Continue")} aria-label="Continue lesson">
-                  Continue
-                </button>
-              </div>
-              <p className="quick-response-feedback" role="status" aria-live="polite">
-                {quickResponseFeedback}
-              </p>
-            </div>
-            <form className="typed-reply-form" onSubmit={submitTypedReply}>
-              <label className="visually-hidden" htmlFor="typed-reply">Type a reply</label>
-              <input ref={typedReplyInputRef} id="typed-reply" type="text" value={typedReply} onChange={(event) => setTypedReply(event.target.value)} placeholder="Type a reply…" autoComplete="off" />
-              <button type="submit" disabled={!typedReply.trim()}>Send</button>
-            </form>
-          </section>
+          <LessonResponseControls
+            quickResponseFeedback={quickResponseFeedback}
+            typedReply={typedReply}
+            typedReplyInputRef={typedReplyInputRef}
+            onQuickResponse={sendQuickResponse}
+            onTypedReplyChange={setTypedReply}
+            onSubmitTypedReply={submitTypedReply}
+          />
         )}
 
         {lessonActive && lessonState.rootNodeIds.length > 0 && <div className="lesson-progress-area"><LessonRoadmap
@@ -2935,165 +2792,21 @@ export default function Home() {
                 : "Start Conversation"}
         </button>}
 
-        {process.env.NODE_ENV === "development" && <details className="developer-debug"><summary>Developer Debug</summary><section className="lesson-state" aria-labelledby="lesson-state-title">
-          <div className="panel-heading">
-            <h2 id="lesson-state-title">Lesson State</h2>
-            <span>Development</span>
-          </div>
-          <dl className="engineering-state">
-            <div>
-              <dt>Topic</dt>
-              <dd>{lessonState.topic}</dd>
-            </div>
-            <div>
-              <dt>Status</dt>
-              <dd>{lessonState.status}</dd>
-            </div>
-            <div>
-              <dt>Current concept</dt>
-              <dd>{getCurrentConcept(lessonState)?.title || "-"}</dd>
-            </div>
-            <div>
-              <dt>Resume point</dt>
-              <dd>{lessonState.resumePoint || "-"}</dd>
-            </div>
-            <div>
-              <dt>Interruptions</dt>
-              <dd>{lessonState.interruptionCount}</dd>
-            </div>
-            <div>
-              <dt>Transport</dt>
-              <dd>{transportState}</dd>
-            </div>
-            <div>
-              <dt>Engagement</dt>
-              <dd>{engagementState}</dd>
-            </div>
-            <div>
-              <dt>Latest learner transcript</dt>
-              <dd>{lessonState.lastUserTranscript || "-"}</dd>
-            </div>
-            <div>
-              <dt>Latest tutor transcript</dt>
-              <dd>{lessonState.lastAssistantTranscript || "-"}</dd>
-            </div>
-          </dl>
-          <div className="coverage-map">
-            <h3>Lesson Coverage</h3>
-            {lessonState.rootNodeIds.length === 0 ? (
-              <p>No lesson tree loaded.</p>
-            ) : (
-              <ol>
-                {getLessonTreeRows(lessonState).map(({ node, depth }) => (
-                  <li
-                    key={node.id}
-                    className={
-                      node.id === lessonState.currentNodeId
-                        ? "coverage-current"
-                        : undefined
-                    }
-                    style={{ paddingLeft: `${Math.min(depth * 16, 48)}px` }}
-                  >
-                    <span aria-hidden="true">
-                      {node.id === lessonState.currentNodeId
-                        ? "▶"
-                        : node.status === "taught"
-                          ? "✓"
-                          : node.status === "partial"
-                            ? "◐"
-                            : node.status === "skipped"
-                              ? "○"
-                              : "·"}
-                    </span>
-                    <strong>{node.title}</strong>
-                    <small>{node.status.replace("-", " ")}</small>
-                  </li>
-                ))}
-              </ol>
-            )}
-          </div>
-          {currentTeachingContract && (
-            <div className="teaching-contract">
-              <h3>Current Teaching Contract</h3>
-              <p className="contract-meta">
-                {currentTeachingContract.type.replace("-", " ")} · {currentTeachingContract.importance}
-                {currentTeachingContract.sourceConfidence
-                  ? ` · ${currentTeachingContract.sourceConfidence}`
-                  : ""}
-              </p>
-              <h4>Objective</h4>
-              <p>{currentTeachingContract.objective}</p>
-              <h4>Teaching points</h4>
-              <ul>
-                {currentTeachingContract.teachingPoints.map((point) => (
-                  <li key={point}>{point}</li>
-                ))}
-              </ul>
-              <h4>Completion criteria</h4>
-              <ul>
-                {currentTeachingContract.completionCriteria.map((criterion) => (
-                  <li key={criterion}>{criterion}</li>
-                ))}
-              </ul>
-              {currentTeachingContract.sourceReferences?.length ? (
-                <p><strong>Source:</strong> {currentTeachingContract.sourceReferences.map((reference) => {
-                  const sourceName = lessonSources.find((source) => source.id === reference.sourceId)?.name ?? reference.sourceId;
-                  return `${sourceName}${reference.page ? ` page ${reference.page}` : ""}${reference.section ? ` (${reference.section})` : ""}`;
-                }).join(", ")}</p>
-              ) : null}
-              {currentTeachingContract.keyTerms?.length ? (
-                <p><strong>Terms:</strong> {currentTeachingContract.keyTerms.join(", ")}</p>
-              ) : null}
-              {currentTeachingContract.notation?.length ? (
-                <p><strong>Notation:</strong> {currentTeachingContract.notation.join(", ")}</p>
-              ) : null}
-              {currentTeachingContract.uncertaintyNote ? (
-                <p><strong>Uncertainty:</strong> {currentTeachingContract.uncertaintyNote}</p>
-              ) : null}
-            </div>
-          )}
-        </section>
-
-        <details className="transcript">
-          <summary id="transcript-title">Show Debug</summary>
-          <div className="transcript-body" role="log" aria-live="polite" aria-labelledby="transcript-title">
-            {process.env.NODE_ENV === "development" && lessonActive && (
-              <div className="debug-session-controls" aria-label="Development session controls">
-                <button type="button" onClick={() => transportRef.current?.requestSafeRolloverForTest()}>
-                  Force safe rollover
-                </button>
-                <button type="button" onClick={() => transportRef.current?.requestImmediateRolloverForTest()}>
-                  Force immediate rollover
-                </button>
-                <button type="button" onClick={() => transportRef.current?.requestImmediateRolloverForTest(true)}>
-                  Test recovery fallback
-                </button>
-                <button type="button" onClick={requestIdleConfirmation}>
-                  Test idle confirmation
-                </button>
-                <button
-                  type="button"
-                  onClick={() => transportRef.current?.sendRealtimeInput({
-                    text: "[[APP_CONTROL:TEST_INVALID_ID]]",
-                  })}
-                >
-                  Test invalid lesson ID
-                </button>
-              </div>
-            )}
-            {debugMessages.length === 0 ? (
-              <p>Conversation events and transcript messages will appear here.</p>
-            ) : (
-              <ol className="debug-messages">
-                {debugMessages.map((message) => (
-                  <li key={message.id}>
-                    <time>{message.timestamp}</time> {message.text}
-                  </li>
-                ))}
-              </ol>
-            )}
-          </div>
-        </details></details>}
+        {process.env.NODE_ENV === "development" && <DeveloperDebugPanel
+          lessonState={lessonState}
+          lessonSources={lessonSources}
+          transportState={transportState}
+          engagementState={engagementState}
+          lessonActive={lessonActive}
+          debugMessages={debugMessages}
+          onForceSafeRollover={() => transportRef.current?.requestSafeRolloverForTest()}
+          onForceImmediateRollover={() => transportRef.current?.requestImmediateRolloverForTest()}
+          onTestRecoveryFallback={() => transportRef.current?.requestImmediateRolloverForTest(true)}
+          onTestIdleConfirmation={requestIdleConfirmation}
+          onTestInvalidLessonId={() => transportRef.current?.sendRealtimeInput({
+            text: "[[APP_CONTROL:TEST_INVALID_ID]]",
+          })}
+        />}
 
         {!lessonActive && appView === "home" && (installPrompt || showIosInstallHint) && (
           <aside className="install-hint">
