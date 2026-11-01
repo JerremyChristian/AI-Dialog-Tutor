@@ -34,11 +34,13 @@ export type HardEvaluation = {
   packetHash: string;
   /**
    * fail: any hard violation. inconclusive: no violation, but an applicable
-   * assertion was unsupported or the capture is partial (open or aborted).
-   * pass: a finished capture where every applicable assertion was proven.
-   * not-applicable assertions never affect the verdict.
+   * assertion was unsupported, the capture is partial (open or aborted), or a
+   * finished capture has no final canonical anchor. pass: a finished, anchored
+   * capture where every applicable assertion was proven. not-applicable
+   * assertions never affect the verdict.
    */
   verdict: "pass" | "fail" | "inconclusive";
+  finalization: FinalizationEvidence;
   assertions: HardAssertionResult[];
   deferred: Array<{ id: string; reason: string }>;
   corePath: CorePathSummary;
@@ -638,31 +640,54 @@ export function checkH10(packet: EvidencePacket): HardAssertionResult {
 
 export const HARD_ASSERTIONS = [checkH1, checkH2, checkH3, checkH4, checkH5, checkH6, checkH7, checkH8, checkH10];
 
+/**
+ * A finished capture claims a final canonical state, so it must contain a
+ * snapshot read after the last app event (the recorder's "finalize" snapshot).
+ * Missing proof is inconclusive, never a failure; contradictions between that
+ * snapshot and the event history are failed by H1/H5/H7.
+ */
+export type FinalizationEvidence = {
+  status: "anchored" | "missing" | "not-required";
+  anchorSnapshotId: string | null;
+};
+
+export function checkFinalizationAnchor(packet: EvidencePacket): FinalizationEvidence {
+  if (!FINAL_CAPTURE_ENDINGS.has(packet.harness.endedBy)) return { status: "not-required", anchorSnapshotId: null };
+  const lastAppSeq = packet.events.findLast(({ source }) => source === "app")?.seq ?? 0;
+  const anchor = packet.snapshots.findLast(({ afterSeq }) => afterSeq >= lastAppSeq);
+  return anchor ? { status: "anchored", anchorSnapshotId: anchor.id } : { status: "missing", anchorSnapshotId: null };
+}
+
 /** Captures that ended with the session; open (cut mid-session) and aborted ones are partial. */
 const FINAL_CAPTURE_ENDINGS: ReadonlySet<EvidencePacket["harness"]["endedBy"]> =
   new Set(["lesson-completed", "harness-stop"]);
 
 /**
- * Precedence: any fail -> fail; otherwise an unsupported assertion or a
- * partial capture (open or aborted) -> inconclusive; otherwise pass.
+ * Precedence: any fail -> fail; otherwise an unsupported assertion, a partial
+ * capture (open or aborted) or a finished capture without a final canonical
+ * anchor -> inconclusive; otherwise pass.
  */
 export function aggregateVerdict(
   assertions: Pick<HardAssertionResult, "status">[],
   endedBy: EvidencePacket["harness"]["endedBy"],
+  finalization: Pick<FinalizationEvidence, "status">,
 ): HardEvaluation["verdict"] {
   if (assertions.some(({ status }) => status === "fail")) return "fail";
   if (assertions.some(({ status }) => status === "unsupported")) return "inconclusive";
   if (!FINAL_CAPTURE_ENDINGS.has(endedBy)) return "inconclusive";
+  if (finalization.status !== "anchored") return "inconclusive";
   return "pass";
 }
 
 export function evaluateHardAssertions(packet: EvidencePacket): HardEvaluation {
   const assertions = HARD_ASSERTIONS.map((check) => check(packet));
+  const finalization = checkFinalizationAnchor(packet);
   return {
     evaluatorVersion: HARD_EVALUATOR_VERSION,
     packetId: packet.packetId,
     packetHash: packet.packetHash,
-    verdict: aggregateVerdict(assertions, packet.harness.endedBy),
+    verdict: aggregateVerdict(assertions, packet.harness.endedBy, finalization),
+    finalization,
     assertions,
     deferred: DEFERRED_ASSERTIONS,
     corePath: corePathSummary(packet),

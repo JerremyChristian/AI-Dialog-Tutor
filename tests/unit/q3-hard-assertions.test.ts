@@ -86,21 +86,81 @@ describe("aggregate verdict", () => {
     expect(evaluation.verdict).toBe("inconclusive");
   });
 
+  describe("finalization anchor", () => {
+    /** A learner-stopped session; `finalSnap` adds the anchor read after the last app event. */
+    const stoppedSession = (finalSnap: boolean) => {
+      const trace = new SyntheticTrace();
+      trace.snap("start");
+      trace.deliver("what-is-a-plc", [0]);
+      trace.stopRequested().complete("stopped", false);
+      if (finalSnap) trace.snap("finalize");
+      return trace;
+    };
+
+    it("anchors a completed session on its final snapshot", () => {
+      const evaluation = evaluateHardAssertions(validFullSession().build("lesson-completed"));
+      expect(evaluation.finalization).toEqual({ status: "anchored", anchorSnapshotId: "S5" });
+      expect(evaluation.verdict).toBe("pass");
+    });
+
+    it("passes a harness-stopped session with a final anchor", () => {
+      const evaluation = evaluateHardAssertions(stoppedSession(true).build("harness-stop"));
+      expect(evaluation.finalization.status).toBe("anchored");
+      expect(evaluation.verdict).toBe("pass");
+    });
+
+    it("is inconclusive when a harness-stopped session's only snapshot predates the end", () => {
+      const evaluation = evaluateHardAssertions(stoppedSession(false).build("harness-stop"));
+      expect(evaluation.assertions.some(({ status }) => status === "fail")).toBe(false);
+      expect(evaluation.finalization).toEqual({ status: "missing", anchorSnapshotId: null });
+      expect(evaluation.verdict).toBe("inconclusive");
+    });
+
+    it("fails, not inconclusive, when the anchor is missing and a hard assertion fails", () => {
+      const trace = validFullSession();
+      trace.snapshots.length = 0;
+      trace.app("delivery.cursor-changed", { conceptId: "what-is-a-plc", from: 2, to: 3 });
+      expect(evaluateHardAssertions(trace.build("lesson-completed")).verdict).toBe("fail");
+    });
+
+    it("fails when the final snapshot contradicts the committed event history", () => {
+      const trace = validFullSession();
+      trace.snap("contradicting finalize", { deliveryCursor: 0 });
+      const evaluation = evaluateHardAssertions(trace.build("lesson-completed"));
+      expect(evaluation.finalization.status).toBe("anchored");
+      expect(evaluation.assertions.find(({ id }) => id === "H1")?.status).toBe("fail");
+      expect(evaluation.verdict).toBe("fail");
+    });
+
+    it("is not required for open or aborted captures, which stay inconclusive", () => {
+      for (const endedBy of ["open", "aborted"] as const) {
+        const trace = new SyntheticTrace();
+        trace.deliver("what-is-a-plc", [0]);
+        const evaluation = evaluateHardAssertions(trace.build(endedBy));
+        expect(evaluation.finalization.status).toBe("not-required");
+        expect(evaluation.verdict).toBe("inconclusive");
+      }
+    });
+  });
+
   it.each([
-    ["finished, all applicable pass", ["pass", "pass", "not-applicable"], "lesson-completed", "pass"],
-    ["harness-stopped, all applicable pass", ["pass", "pass"], "harness-stop", "pass"],
-    ["finished, only not-applicable", ["not-applicable", "not-applicable"], "lesson-completed", "pass"],
-    ["one unsupported", ["pass", "unsupported", "not-applicable"], "lesson-completed", "inconclusive"],
-    ["multiple unsupported", ["unsupported", "pass", "unsupported"], "lesson-completed", "inconclusive"],
-    ["unsupported plus fail", ["unsupported", "fail", "pass"], "lesson-completed", "fail"],
-    ["open without fail", ["pass", "not-applicable"], "open", "inconclusive"],
-    ["open with unsupported", ["pass", "unsupported"], "open", "inconclusive"],
-    ["open with fail", ["pass", "fail"], "open", "fail"],
-    ["aborted without fail", ["pass", "not-applicable"], "aborted", "inconclusive"],
-    ["aborted with unsupported", ["unsupported"], "aborted", "inconclusive"],
-    ["aborted with fail", ["pass", "fail"], "aborted", "fail"],
-  ] as const)("aggregates %s", (_label, statuses, endedBy, verdict) => {
-    expect(aggregateVerdict(statuses.map((status) => ({ status })), endedBy)).toBe(verdict);
+    ["finished, all applicable pass", ["pass", "pass", "not-applicable"], "lesson-completed", "anchored", "pass"],
+    ["harness-stopped, all applicable pass", ["pass", "pass"], "harness-stop", "anchored", "pass"],
+    ["finished, only not-applicable", ["not-applicable", "not-applicable"], "lesson-completed", "anchored", "pass"],
+    ["finished without final anchor", ["pass", "pass"], "lesson-completed", "missing", "inconclusive"],
+    ["harness-stopped without final anchor", ["pass", "pass"], "harness-stop", "missing", "inconclusive"],
+    ["finished without final anchor, with fail", ["pass", "fail"], "lesson-completed", "missing", "fail"],
+    ["one unsupported", ["pass", "unsupported", "not-applicable"], "lesson-completed", "anchored", "inconclusive"],
+    ["multiple unsupported", ["unsupported", "pass", "unsupported"], "lesson-completed", "anchored", "inconclusive"],
+    ["unsupported plus fail", ["unsupported", "fail", "pass"], "lesson-completed", "anchored", "fail"],
+    ["open without fail", ["pass", "not-applicable"], "open", "not-required", "inconclusive"],
+    ["open with unsupported", ["pass", "unsupported"], "open", "not-required", "inconclusive"],
+    ["open with fail", ["pass", "fail"], "open", "not-required", "fail"],
+    ["aborted without fail", ["pass", "not-applicable"], "aborted", "not-required", "inconclusive"],
+    ["aborted with unsupported", ["unsupported"], "aborted", "not-required", "inconclusive"],
+    ["aborted with fail", ["pass", "fail"], "aborted", "not-required", "fail"],
+  ] as const)("aggregates %s", (_label, statuses, endedBy, finalization, verdict) => {
+    expect(aggregateVerdict(statuses.map((status) => ({ status })), endedBy, { status: finalization })).toBe(verdict);
   });
 });
 

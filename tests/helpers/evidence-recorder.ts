@@ -57,8 +57,9 @@ export async function startEvidence(page: Page, scenarioId: string) {
         throw new Error("The page reloaded during evidence capture; app events no longer cover the session");
       }
       const seeded = seededAtStart;
-      await this.snapshot("finalize");
-      const state = await readTestState(page);
+      // One read supplies both the final snapshot and the events, so the
+      // snapshot is always anchored after the last app event in the packet.
+      const state = this.observe("finalize", await readTestState(page));
       return buildEvidencePacket({
         seeded,
         appEvents: state.events,
