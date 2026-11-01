@@ -135,6 +135,14 @@ describe("H4 Review isolation", () => {
     expect(checkH4(new SyntheticTrace().build()).status).toBe("not-applicable");
   });
 
+  it("is unsupported when Review has no canonical boundary snapshot", () => {
+    const trace = new SyntheticTrace();
+    trace.app("review.started", { nodeId: "what-is-a-plc" });
+    trace.app("review.ended", { nodeId: "what-is-a-plc", reason: "completed" });
+
+    expect(checkH4(trace.build()).status).toBe("unsupported");
+  });
+
   it("fails when a lesson commit happens during Review", () => {
     const trace = reviewTrace();
     trace.deliver("plc-scan-cycle", [0]);
