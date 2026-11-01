@@ -53,6 +53,94 @@ test("fresh-socket recovery sends history only and does not duplicate a teaching
   expect(teachingImperatives(await getLiveSends(page))).toHaveLength(1);
 });
 
+test("Q2-G transport recovery preserves canonical state and resumes the unconfirmed beat once", async ({ page }) => {
+  await installFakeLive(page);
+  await openLessonAndStart(page);
+  const pcm = await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").pcm as string);
+  const beforeFailure = await readTestState(page);
+  const originalBeat = beforeFailure.snapshot.activePresentationBeat;
+  expect(originalBeat).toMatchObject({ index: 0, teachingPointIndexes: [0], mode: "lesson" });
+  expect(beforeFailure.snapshot.deliveryCursor).toBe(0);
+  expect((beforeFailure.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("teaching");
+  expect(beforeFailure.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+  expect(teachingImperatives(await getLiveSends(page))).toHaveLength(1);
+
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "A PLC is a rugged industrial computer." },
+  } }, 0);
+  await expect.poll(async () => (await readTestState(page)).snapshot.tutorAudioPlaying).toBe(true);
+  await failActiveSocket(page);
+
+  await expect.poll(async () => Math.max(...(await getLiveSends(page)).map(({ socketId }) => socketId))).toBe(1);
+  await expect.poll(async () => (await getLiveSends(page)).filter(({ socketId, message }) =>
+    socketId === 1 && Boolean(message.clientContent) &&
+    textOf(message).includes("RECOVERED_APPLICATION_CONTEXT")).length).toBe(1);
+
+  const recoverySends = (await getLiveSends(page)).filter(({ socketId }) => socketId === 1);
+  expect(recoverySends.filter(({ message }) => Boolean(message.clientContent) &&
+    textOf(message).includes("RECOVERED_APPLICATION_CONTEXT"))).toHaveLength(1);
+  expect(teachingImperatives(recoverySends)).toHaveLength(0);
+  expect(teachingImperatives(await getLiveSends(page))).toHaveLength(1);
+
+  const recovered = await readTestState(page);
+  expect(recovered.snapshot.lessonActive).toBe(true);
+  expect(recovered.snapshot.deliveryCursor).toBe(0);
+  expect((recovered.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("teaching");
+  expect(recovered.snapshot.activePresentationBeat).toBeNull();
+  expect(recovered.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+  const audioStartsAfterRecovery = recovered.events.filter((event) => event.name === "tutor.audio-started").length;
+
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "Stale socket output." },
+    generationComplete: true,
+  } }, 0);
+  const afterStaleSocket = await readTestState(page);
+  expect(afterStaleSocket.snapshot.deliveryCursor).toBe(0);
+  expect(afterStaleSocket.snapshot.activePresentationBeat).toBeNull();
+  expect(afterStaleSocket.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+  expect(afterStaleSocket.events.filter((event) => event.name === "tutor.audio-started")).toHaveLength(audioStartsAfterRecovery);
+
+  await deliverLive(page, { serverContent: {
+    inputTranscription: { text: "Continue with the lesson.", finished: true },
+  } }, 1);
+  await deliverLive(page, { toolCall: { functionCalls: [{
+    id: "continue-after-recovery",
+    name: "lesson_state",
+    args: { action: "query", purpose: "continue" },
+  }] } }, 1);
+  await expect.poll(async () => (await getLiveSends(page))
+    .filter(({ message }) => Boolean(message.toolResponse)).length).toBe(1);
+
+  const resumed = await readTestState(page);
+  expect(resumed.snapshot.activePresentationBeat).toEqual(originalBeat);
+  expect(resumed.snapshot.deliveryCursor).toBe(0);
+  expect((resumed.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("teaching");
+  expect(resumed.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+  expect(teachingImperatives(await getLiveSends(page))).toHaveLength(1);
+  const continueResponse = (await getLiveSends(page)).find(({ message }) => Boolean(message.toolResponse));
+  expect(textOf(continueResponse!.message)).toContain("PLC means programmable logic controller");
+  expect(textOf(continueResponse!.message)).toContain("APP_CONTROL:TEACH_PRESENTATION_BEAT");
+
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "A PLC means programmable logic controller." },
+    generationComplete: true,
+  } }, 1);
+  await expect.poll(async () => (await readTestState(page)).snapshot.deliveryCursor).toBe(1);
+
+  const completed = await readTestState(page);
+  expect(completed.events.filter((event) => event.name === "beat.commit")).toHaveLength(1);
+  expect(completed.events.filter((event) => event.name === "beat.commit")[0]).toMatchObject({
+    detail: { mode: "lesson", conceptId: "what-is-a-plc", nextIndex: 1 },
+  });
+  expect(completed.snapshot.deliveryCursor).toBe(1);
+  expect((completed.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("teaching");
+  expect(completed.snapshot.activePresentationBeat).toMatchObject({ index: 1, mode: "lesson" });
+  expect(completed.snapshot.lessonActive).toBe(true);
+});
+
 test("Q2-A clarification preserves progress and continue restarts then commits the same beat once", async ({ page }) => {
   await installFakeLive(page);
   await openLessonAndStart(page);
