@@ -223,3 +223,89 @@ test("Q2-E idle confirmation learner return resumes the correct next canonical b
   expect(completed.events.filter((event) => event.name === "beat.commit")).toHaveLength(3);
   expect(completed.snapshot.lessonActive).toBe(true);
 });
+
+test("Q2-H final canonical completion waits for one naturally drained farewell before stopping", async ({ page }) => {
+  await installFakeLive(page);
+  await openLessonAndStart(page);
+  const pcm = await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").pcm as string);
+
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "A PLC means programmable logic controller." },
+    generationComplete: true,
+  } });
+  await expect.poll(async () => (await readTestState(page)).snapshot.deliveryCursor).toBe(1);
+
+  const beforeFinalBeat = await readTestState(page);
+  expect(beforeFinalBeat.snapshot.currentNodeId).toBe("what-is-a-plc");
+  expect(beforeFinalBeat.snapshot.deliveryCursor).toBe(1);
+  expect(beforeFinalBeat.snapshot.coverage).toEqual({ "what-is-a-plc": "teaching" });
+  expect(beforeFinalBeat.snapshot.activePresentationBeat).toMatchObject({
+    index: 1,
+    teachingPointIndexes: [1],
+    mode: "lesson",
+  });
+  expect(beforeFinalBeat.events.filter((event) => event.name === "beat.commit")).toHaveLength(1);
+
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "PLCs coordinate industrial inputs and outputs." },
+    generationComplete: true,
+  } });
+  await expect.poll(async () => (await readTestState(page)).snapshot.deliveryCursor).toBe(2);
+
+  const canonicalComplete = await readTestState(page);
+  expect(canonicalComplete.snapshot.coverage).toEqual({ "what-is-a-plc": "taught" });
+  expect(canonicalComplete.snapshot.activePresentationBeat).toBeNull();
+  expect(canonicalComplete.snapshot.lessonActive).toBe(true);
+  expect(canonicalComplete.snapshot.tutorAudioPlaying).toBe(false);
+  expect(canonicalComplete.events.filter((event) => event.name === "beat.commit")).toHaveLength(2);
+  expect(teachingImperatives(await getLiveSends(page))).toHaveLength(2);
+  const audioStartsBeforeFarewell = canonicalComplete.events
+    .filter((event) => event.name === "tutor.audio-started").length;
+
+  await deliverLive(page, { serverContent: {
+    inputTranscription: { text: "No more questions, thanks.", finished: true },
+  } });
+  const farewellResponse = await sendSessionControl(page, "q2-h-end", "end");
+  expect(textOf(farewellResponse)).toContain("exactly one brief, warm, natural closing sentence");
+  await expect(page.getByText("Finishing lesson…")).toBeVisible();
+
+  const farewellPcm = Buffer.alloc(48_000).toString("base64");
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: farewellPcm } }] },
+    outputTranscription: { text: "Thanks for learning with me today. Goodbye!" },
+    generationComplete: true,
+  } });
+
+  const generationCompleteBeforeDrain = await readTestState(page);
+  expect(generationCompleteBeforeDrain.snapshot.lessonActive).toBe(true);
+  expect(generationCompleteBeforeDrain.snapshot.tutorAudioPlaying).toBe(true);
+  expect(generationCompleteBeforeDrain.snapshot.deliveryCursor).toBe(2);
+  expect(generationCompleteBeforeDrain.snapshot.coverage).toEqual({ "what-is-a-plc": "taught" });
+  expect(generationCompleteBeforeDrain.snapshot.activePresentationBeat).toBeNull();
+  expect(generationCompleteBeforeDrain.events.filter((event) => event.name === "beat.commit")).toHaveLength(2);
+  expect(generationCompleteBeforeDrain.events.filter((event) => event.name === "tutor.audio-started"))
+    .toHaveLength(audioStartsBeforeFarewell + 1);
+  expect(teachingImperatives(await getLiveSends(page))).toHaveLength(2);
+  await expect(page.getByText("Lesson complete")).toHaveCount(0);
+
+  await expect(page.getByText("Lesson complete")).toBeVisible();
+  const afterNaturalDrain = await readTestState(page);
+  expect(afterNaturalDrain.snapshot.lessonActive).toBe(true);
+  expect(afterNaturalDrain.snapshot.tutorAudioPlaying).toBe(false);
+  expect(afterNaturalDrain.snapshot.deliveryCursor).toBe(2);
+  expect(afterNaturalDrain.snapshot.coverage).toEqual({ "what-is-a-plc": "taught" });
+  expect(afterNaturalDrain.events.filter((event) => event.name === "beat.commit")).toHaveLength(2);
+  expect(page.getByText("Lesson complete")).toHaveCount(1);
+
+  await expect.poll(async () => (await readTestState(page)).snapshot.lessonActive, { timeout: 5_000 }).toBe(false);
+  const stopped = await readTestState(page);
+  expect(stopped.snapshot.deliveryCursor).toBe(2);
+  expect(stopped.snapshot.coverage).toEqual({ "what-is-a-plc": "taught" });
+  expect(stopped.snapshot.activePresentationBeat).toBeNull();
+  expect(stopped.snapshot.tutorAudioPlaying).toBe(false);
+  expect(stopped.events.filter((event) => event.name === "beat.commit")).toHaveLength(2);
+  expect(teachingImperatives(await getLiveSends(page))).toHaveLength(2);
+  expect((await getLiveSends(page)).filter(({ message }) => Boolean(message.toolResponse))).toHaveLength(1);
+});
