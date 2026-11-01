@@ -62,6 +62,24 @@ describe("provider frame normalization", () => {
     for (const secret of ["abc123", "AIza-secret", "xyz", "qqq"]) expect(json).not.toContain(secret);
     expect(redacted.url).toContain("x=1");
   });
+
+  it("redacts a bearer credential carried under a nonstandard nested header name", () => {
+    const credential = "Bearer q3-provider-secret";
+    const events = normalizeProviderFrame({
+      toolCall: {
+        functionCalls: [{
+          id: "call-1",
+          name: "lesson_state",
+          args: { headers: { "X-Custom-Auth": credential }, action: "query" },
+        }],
+      },
+    });
+
+    const json = JSON.stringify(events);
+    expect(json).not.toContain("q3-provider-secret");
+    expect(json).toContain("lesson_state");
+    expect(json).toContain("query");
+  });
 });
 
 describe("EvidencePacket construction", () => {
