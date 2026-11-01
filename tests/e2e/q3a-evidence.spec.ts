@@ -114,3 +114,13 @@ test("Q3-A scripted Q3-fixture session produces evidence that passes every appli
   expect(performance.gating).toBe(false);
   expect(performance.interruptionAcceptLatencyMs).toHaveLength(1);
 });
+
+test("Q3-A evidence capture refuses duplicate finalization", async ({ page }) => {
+  await installFakeLive(page, { lessonFixture: PLC_Q3_FIXTURE });
+  await openLessonAndStart(page);
+  const evidence = await startEvidence(page, "q3a-duplicate-finalization");
+
+  await evidence.finalize({ endedBy: "open" });
+
+  await expect(evidence.finalize({ endedBy: "open" })).rejects.toThrow(/already finalized/i);
+});
