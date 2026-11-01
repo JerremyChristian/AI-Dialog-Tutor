@@ -1,7 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import {
   deliverLive, getLiveSends, installFakeLive, openLessonAndStart,
-  readTestState,
+  readTestState, textOf,
 } from "../helpers/fake-live";
 
 function canonicalProgress(snapshot: Record<string, unknown>) {
@@ -22,6 +22,22 @@ async function sendSessionControl(page: Page, id: string, action: string) {
     (await getLiveSends(page)).filter(({ message }) => message.toolResponse).length,
   ).toBe(count + 1);
   return (await getLiveSends(page)).filter(({ message }) => message.toolResponse).at(-1)!.message;
+}
+
+async function sendLessonContinue(page: Page, id: string) {
+  const count = (await getLiveSends(page)).filter(({ message }) => message.toolResponse).length;
+  await deliverLive(page, {
+    toolCall: { functionCalls: [{ id, name: "lesson_state", args: { action: "query", purpose: "continue" } }] },
+  });
+  await expect.poll(async () =>
+    (await getLiveSends(page)).filter(({ message }) => message.toolResponse).length,
+  ).toBe(count + 1);
+  return (await getLiveSends(page)).filter(({ message }) => message.toolResponse).at(-1)!.message;
+}
+
+function teachingImperatives(items: Awaited<ReturnType<typeof getLiveSends>>) {
+  return items.filter(({ message }) => Boolean(message.realtimeInput) &&
+    textOf(message).includes("APP_CONTROL:TEACH_PRESENTATION_BEAT"));
 }
 
 async function enterWrapUp(page: Page) {
@@ -116,4 +132,94 @@ test("meaningful learner speech during idle confirmation remains active when con
   const state = await readTestState(page);
   expect(state.snapshot.lessonActive).toBe(true);
   expect(state.snapshot.latestTranscriptRole).toBe("learner");
+});
+
+test("Q2-E idle confirmation learner return resumes the correct next canonical beat once", async ({ page }) => {
+  await installFakeLive(page, { additionalConcept: true });
+  await openLessonAndStart(page);
+  const pcm = await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").pcm as string);
+
+  for (const transcript of [
+    "A PLC means programmable logic controller.",
+    "PLCs coordinate industrial inputs and outputs.",
+  ]) {
+    await deliverLive(page, { serverContent: {
+      modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+      outputTranscription: { text: transcript },
+      generationComplete: true,
+    } });
+    await expect.poll(async () => (await readTestState(page)).events.filter((event) =>
+      event.name === "beat.commit" && event.detail?.mode === "lesson").length)
+      .toBe(transcript.startsWith("A PLC means") ? 1 : 2);
+  }
+
+  const beforeIdle = await readTestState(page);
+  expect(beforeIdle.snapshot.currentNodeId).toBe("what-is-a-plc");
+  expect(beforeIdle.snapshot.deliveryCursor).toBe(2);
+  expect(beforeIdle.snapshot.coverage).toEqual({
+    "what-is-a-plc": "taught",
+    "plc-scan-cycle": "not-started",
+  });
+  expect(beforeIdle.snapshot.activePresentationBeat).toBeNull();
+  expect(beforeIdle.events.filter((event) => event.name === "beat.commit")).toHaveLength(2);
+  expect(teachingImperatives(await getLiveSends(page))).toHaveLength(2);
+
+  await requestIdleConfirmation(page);
+  const engagementValue = page.locator(".engineering-state dt", { hasText: "Engagement" })
+    .locator("..").locator("dd");
+  await expect(engagementValue).toHaveText("confirming");
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "Are you still there and would you like to continue?" },
+    generationComplete: true,
+  } });
+  await deliverLive(page, { serverContent: { turnComplete: true } });
+
+  const afterPrompt = await readTestState(page);
+  expect(canonicalProgress(afterPrompt.snapshot)).toEqual(canonicalProgress(beforeIdle.snapshot));
+  expect(afterPrompt.events.filter((event) => event.name === "beat.commit")).toHaveLength(2);
+  expect(afterPrompt.snapshot.activePresentationBeat).toBeNull();
+
+  await deliverLive(page, { serverContent: {
+    inputTranscription: { text: "Yes, continue.", finished: true },
+  } });
+  await sendSessionControl(page, "q2-e-idle-continue", "continue");
+  await expect(engagementValue).toHaveText("active");
+
+  const continuationResponse = await sendLessonContinue(page, "q2-e-lesson-continue");
+  const resumed = await readTestState(page);
+  expect(resumed.snapshot.currentNodeId).toBe("plc-scan-cycle");
+  expect(resumed.snapshot.deliveryCursor).toBe(0);
+  expect(resumed.snapshot.coverage).toEqual({
+    "what-is-a-plc": "taught",
+    "plc-scan-cycle": "teaching",
+  });
+  expect(resumed.snapshot.activePresentationBeat).toMatchObject({
+    index: 0,
+    teachingPointIndexes: [0],
+    mode: "lesson",
+  });
+  expect(resumed.events.filter((event) => event.name === "beat.commit")).toHaveLength(2);
+  expect(teachingImperatives(await getLiveSends(page))).toHaveLength(2);
+  expect(textOf(continuationResponse)).toContain("A PLC repeatedly reads inputs, executes logic, and updates outputs.");
+  expect(textOf(continuationResponse)).toContain("APP_CONTROL:TEACH_PRESENTATION_BEAT");
+  expect(resumed.snapshot.lessonActive).toBe(true);
+
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "A PLC repeatedly reads inputs, executes logic, and updates outputs." },
+    generationComplete: true,
+  } });
+  await expect.poll(async () => (await readTestState(page)).events.filter((event) =>
+    event.name === "beat.commit" && event.detail?.mode === "lesson").length).toBe(3);
+
+  const completed = await readTestState(page);
+  expect(completed.snapshot.currentNodeId).toBe("plc-scan-cycle");
+  expect(completed.snapshot.deliveryCursor).toBe(1);
+  expect(completed.snapshot.coverage).toEqual({
+    "what-is-a-plc": "taught",
+    "plc-scan-cycle": "taught",
+  });
+  expect(completed.events.filter((event) => event.name === "beat.commit")).toHaveLength(3);
+  expect(completed.snapshot.lessonActive).toBe(true);
 });
