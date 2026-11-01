@@ -637,6 +637,7 @@ export default function Home() {
   const updateEngagementState = (state: EngagementState) => {
     engagementStateRef.current = state;
     setEngagementState(state);
+    emitTestEvent("engagement.changed", { state });
   };
 
   const markMeaningfulActivity = () => {

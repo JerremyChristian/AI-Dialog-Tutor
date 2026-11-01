@@ -51,6 +51,11 @@ export class SyntheticTrace {
     });
     return this;
   }
+  /** Engagement transitions as the runtime emits them (active, possibly-idle, confirming). */
+  engagement(...states: string[]) {
+    for (const state of states) this.app("engagement.changed", { state });
+    return this;
+  }
   stopRequested() {
     this.harnessEvents.push({ anchor: this.appEvents.length, t: this.tick(), name: "harness.stop-requested" });
     return this;

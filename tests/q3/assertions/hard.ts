@@ -328,18 +328,54 @@ export function checkH4(packet: EvidencePacket): HardAssertionResult {
   return result("H4", "Review does not mutate canonical progress", violations, starts.length > 0, notes);
 }
 
+// ---- Completion attribution (shared by H5 and H7) ----
+
+/**
+ * A completion's `reason` is an outcome, not evidence. Each reason names the
+ * observable cause that must precede it; the cause is returned, or null when
+ * the packet cannot show why the runtime was allowed to end the lesson.
+ */
+const COMPLETION_CAUSES: Record<string, (before: EvidenceEvent[]) => EvidenceEvent | undefined> = {
+  confirmed: (before) => before.findLast((event) => app(event, "tool.decision") &&
+    event.detail?.name === "session_control" &&
+    (event.detail?.outcome === "wrap-up-end" || event.detail?.outcome === "confirm-end")),
+  stopped: (before) => before.findLast((event) =>
+    (event.source === "harness" && event.name === "harness.stop-requested") ||
+    (app(event, "tool.decision") && event.detail?.outcome === "restart-confirm")),
+  // The runtime ends for inactivity only while engagement is still
+  // "confirming" (an idle confirmation was requested and never resolved).
+  inactivity: (before) => {
+    const latest = before.findLast((event) => app(event, "engagement.changed"));
+    return latest?.detail?.state === "confirming" ? latest : undefined;
+  },
+};
+
+export function completionCause(packet: EvidencePacket, completion: EvidenceEvent) {
+  const findCause = COMPLETION_CAUSES[str(completion, "reason") ?? ""];
+  return findCause?.(packet.events.filter(({ seq }) => seq < completion.seq)) ?? null;
+}
+
+/** Completions whose cause is evidenced; only these may explain unfinished content. */
+const attributedCompletions = (packet: EvidencePacket) => packet.events
+  .filter((event) => app(event, "lesson.completed"))
+  .flatMap((completion) => {
+    const cause = completionCause(packet, completion);
+    return cause ? [{ completion, cause }] : [];
+  });
+
 // ---- H5: Core Path integrity ----
 
 export function corePathSummary(packet: EvidencePacket): CorePathSummary {
   const replay = cursorReplay(packet);
   const transitions = packet.events.filter(isAppliedTransition);
-  const completion = packet.events.find((event) => app(event, "lesson.completed"));
+  const earlyEnds = attributedCompletions(packet)
+    .filter(({ completion }) => completion.detail?.planComplete !== true);
   const core = packet.contract.concepts.filter(({ importance }) => importance === "core");
   const incomplete = core.filter(({ id, teachingPoints }) => (replay.final[id] ?? 0) < teachingPoints.length)
     .map(({ id, teachingPoints }) => {
       const attributedTo: string[] = [];
       if (transitions.length) attributedTo.push(...transitions.map(({ id: eventId }) => eventId));
-      if (completion && completion.detail?.planComplete !== true) attributedTo.push(completion.id);
+      attributedTo.push(...earlyEnds.map(({ cause }) => cause.id));
       if (packet.harness.endedBy !== "lesson-completed") attributedTo.push(`harness:${packet.harness.endedBy}`);
       return { conceptId: id, cursor: replay.final[id] ?? 0, required: teachingPoints.length, attributedTo };
     });
@@ -391,8 +427,9 @@ export function checkH5(packet: EvidencePacket): HardAssertionResult {
       if ((status === "skipped" || status === "partial") && seenStatus.get(conceptId) !== status) {
         // Skip/navigation produce skipped/partial; ending a session pauses the
         // current concept as partial. Nothing else may.
-        const attributed = packet.events.some((event) => event.seq <= snapshot.afterSeq &&
-          (isAppliedTransition(event) || (status === "partial" && app(event, "lesson.completed"))));
+        const attributed = packet.events.some((event) => event.seq <= snapshot.afterSeq && isAppliedTransition(event)) ||
+          (status === "partial" && attributedCompletions(packet)
+            .some(({ completion }) => completion.seq <= snapshot.afterSeq));
         if (!attributed) {
           violations.push({ message: `${conceptId} became ${status} without an applied skip/navigation or session end`, evidence: [snapshot.id] });
         }
@@ -438,17 +475,8 @@ export function checkH6(packet: EvidencePacket): HardAssertionResult {
 
 // ---- H7: completion integrity ----
 
-const COMPLETION_ATTRIBUTIONS: Record<string, (event: EvidenceEvent) => boolean> = {
-  confirmed: (event) => app(event, "tool.decision") && event.detail?.name === "session_control" &&
-    (event.detail?.outcome === "wrap-up-end" || event.detail?.outcome === "confirm-end"),
-  stopped: (event) => (event.source === "harness" && event.name === "harness.stop-requested") ||
-    (app(event, "tool.decision") && event.detail?.outcome === "restart-confirm"),
-  inactivity: () => true,
-};
-
 export function checkH7(packet: EvidencePacket): HardAssertionResult {
   const violations: Violation[] = [];
-  const notes: string[] = [];
   const completions = packet.events.filter((event) => app(event, "lesson.completed"));
   if (completions.length > 1) {
     violations.push({ message: `lesson completed ${completions.length} times`, evidence: completions.map(({ id }) => id) });
@@ -459,13 +487,11 @@ export function checkH7(packet: EvidencePacket): HardAssertionResult {
   const replay = cursorReplay(packet);
   for (const completion of completions) {
     const reason = str(completion, "reason") ?? "";
-    const attribution = COMPLETION_ATTRIBUTIONS[reason];
-    if (!attribution) {
+    if (!COMPLETION_CAUSES[reason]) {
       violations.push({ message: `lesson completed with unknown reason "${reason}"`, evidence: [completion.id] });
-    } else if (!packet.events.some((event) => event.seq < completion.seq && attribution(event))) {
-      violations.push({ message: `lesson completed (${reason}) without a preceding end decision or stop request`, evidence: [completion.id] });
+    } else if (!completionCause(packet, completion)) {
+      violations.push({ message: `lesson completed (${reason}) without a preceding idle or end event`, evidence: [completion.id] });
     }
-    if (reason === "inactivity") notes.push("Inactivity completion is accepted without idle-timer evidence.");
 
     const coverage = (completion.detail?.coverage ?? {}) as Record<string, string>;
     const teachable = packet.contract.concepts.map(({ id }) => id);
@@ -486,7 +512,7 @@ export function checkH7(packet: EvidencePacket): HardAssertionResult {
     }
   }
   return result("H7", "Completion integrity", violations,
-    completions.length > 0 || packet.harness.endedBy === "lesson-completed", notes);
+    completions.length > 0 || packet.harness.endedBy === "lesson-completed");
 }
 
 // ---- H8: logical interruption integrity (no latency threshold) ----

@@ -98,13 +98,24 @@ test("idle continue keeps the lesson active", async ({ page }) => {
 
 });
 
-test("idle end follows the existing confirmed-stop behavior", async ({ page }) => {
+test("idle end follows the existing confirmed-stop behavior", async ({ page }, testInfo) => {
   await installFakeLive(page);
   await openLessonAndStart(page);
+  const evidence = await startEvidence(page, "q2-idle-confirmed-end");
   await requestIdleConfirmation(page);
 
   await sendSessionControl(page, "idle-end", "end");
   await expect.poll(async () => (await readTestState(page)).snapshot.lessonActive).toBe(false);
+
+  // Early end is attributed to the observable idle confirmation and end decision.
+  const packet = await evidence.finalize({ endedBy: "lesson-completed" });
+  const evaluation = await expectHardEvidencePass(packet, testInfo);
+  expect(statusOf(evaluation)).toMatchObject({ H5: "pass", H7: "pass" });
+  const completion = packet.events.find(({ name }) => name === "lesson.completed")!;
+  expect(completion.detail).toMatchObject({ reason: "confirmed", planComplete: false });
+  const before = packet.events.filter(({ seq }) => seq < completion.seq);
+  expect(before.findLast(({ name }) => name === "engagement.changed")?.detail).toEqual({ state: "confirming" });
+  expect(before.some(({ name, detail }) => name === "tool.decision" && detail?.outcome === "confirm-end")).toBe(true);
 });
 
 test("unclear idle response preserves confirmation until a later clear end", async ({ page }) => {

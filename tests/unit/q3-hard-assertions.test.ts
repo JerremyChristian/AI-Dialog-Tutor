@@ -231,7 +231,7 @@ describe("H7 completion integrity", () => {
   it("fails when a confirmed completion has no end decision", () => {
     const trace = new SyntheticTrace();
     trace.complete("confirmed", false);
-    expectFail(checkH7(trace.build()), /without a preceding end decision or stop request/);
+    expectFail(checkH7(trace.build()), /lesson completed \(confirmed\) without a preceding idle or end event/);
   });
 
   it("fails when canonical progress continues after completion", () => {
@@ -258,6 +258,83 @@ describe("H7 completion integrity", () => {
     trace.complete("inactivity", false);
 
     expectFail(checkH7(trace.build("lesson-completed")), /without a preceding idle or end event/);
+  });
+
+  describe("completion attribution comes from observable cause, not the reason string", () => {
+    it("fails inactivity when idle confirmation was resolved back to active", () => {
+      const trace = new SyntheticTrace();
+      trace.engagement("active", "possibly-idle", "confirming", "active");
+      trace.complete("inactivity", false);
+      expectFail(checkH7(trace.build("lesson-completed")), /lesson completed \(inactivity\) without a preceding idle or end event/);
+    });
+
+    it("passes inactivity while an idle confirmation is still unresolved", () => {
+      const trace = new SyntheticTrace();
+      trace.engagement("active");
+      trace.deliver("what-is-a-plc", [0]);
+      trace.engagement("possibly-idle", "confirming");
+      trace.complete("inactivity", false);
+      expect(checkH7(trace.build("lesson-completed")).status).toBe("pass");
+    });
+
+    it("passes an explicit learner-requested early end via confirmed idle end decision", () => {
+      const trace = new SyntheticTrace();
+      trace.engagement("active", "possibly-idle", "confirming");
+      trace.decision("session_control", "end", null, "confirm-end");
+      trace.complete("confirmed", false);
+      expect(checkH7(trace.build("lesson-completed")).status).toBe("pass");
+    });
+
+    it("passes normal full-plan completion after the wrap-up end decision", () => {
+      const packet = validFullSession().build("lesson-completed");
+      expect(checkH7(packet).status).toBe("pass");
+      expect(checkH5(packet).status).toBe("pass");
+    });
+
+    it("fails an unknown completion reason", () => {
+      const trace = new SyntheticTrace();
+      trace.complete("finished", false);
+      expectFail(checkH7(trace.build()), /unknown reason "finished"/);
+    });
+
+    it("does not let a fake inactivity completion rescue an unfinished Core Path", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]);
+      trace.app("clarification.started", { source: "typed" });
+      trace.complete("inactivity", false);
+      trace.snap("ended", { coverage: { ...trace.coverage, "what-is-a-plc": "partial" } });
+      const packet = trace.build("lesson-completed");
+      const h5 = checkH5(packet);
+      expectFail(h5, /core concept what-is-a-plc left at 1\/2 with no skip, navigation, early end, or harness cut/);
+      expectFail(h5, /what-is-a-plc became partial without an applied skip\/navigation or session end/);
+      expect(evaluateHardAssertions(packet).corePath.incompleteCoreConcepts
+        .every(({ attributedTo }) => attributedTo.length === 0)).toBe(true);
+    });
+
+    it("lets an evidenced inactivity end explain unfinished Core Path, citing the cause", () => {
+      const trace = new SyntheticTrace();
+      trace.engagement("active");
+      trace.deliver("what-is-a-plc", [0]);
+      trace.engagement("possibly-idle", "confirming");
+      trace.complete("inactivity", false);
+      trace.snap("ended", { coverage: { ...trace.coverage, "what-is-a-plc": "partial" } });
+      const packet = trace.build("lesson-completed");
+      const causeId = packet.events.findLast(({ name }) => name === "engagement.changed")!.id;
+      expect(packet.events.find(({ id }) => id === causeId)?.detail).toEqual({ state: "confirming" });
+      expect(checkH5(packet).status).toBe("pass");
+      const incomplete = evaluateHardAssertions(packet).corePath.incompleteCoreConcepts;
+      expect(incomplete.every(({ attributedTo }) => attributedTo.includes(causeId))).toBe(true);
+    });
+
+    it("keeps an aborted run inconclusive and never a completed Core Path", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]);
+      const evaluation = evaluateHardAssertions(trace.build("aborted", { category: "infrastructure", message: "browser crashed" }));
+      expect(evaluation.verdict).toBe("inconclusive");
+      expect(evaluation.assertions.filter(({ status }) => status === "fail")).toEqual([]);
+      expect(evaluation.corePath).toMatchObject({ status: "aborted", allCoreBeatsCommitted: false });
+      expect(evaluation.corePath.incompleteCoreConcepts[0].attributedTo).toEqual(["harness:aborted"]);
+    });
   });
 });
 
