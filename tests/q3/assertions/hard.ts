@@ -286,9 +286,14 @@ const canonicalKey = (snapshot: EvidenceSnapshot) => stableStringify({
   interruptionCount: snapshot.canonical.interruptionCount,
 });
 
+/** Events after which a canonical snapshot can no longer stand in for the current state. */
+const mayMoveCanonical = (event: EvidenceEvent) => isCanonicalChange(event) ||
+  app(event, "lesson.generation-started") || app(event, "tool.decision") || app(event, "interruption.accepted");
+
 export function checkH4(packet: EvidencePacket): HardAssertionResult {
   const violations: Violation[] = [];
   const notes: string[] = [];
+  let unsupportedWindows = 0;
   const starts = packet.events.filter((event) => app(event, "review.started"));
   for (const start of starts) {
     const nodeId = str(start, "nodeId");
@@ -307,15 +312,25 @@ export function checkH4(packet: EvidencePacket): HardAssertionResult {
       }
     }
 
+    // Snapshot proof needs a baseline taken after the last event that could
+    // move canonical state before Review, and a snapshot covering Review's end
+    // (or, for a Review still open at packet end, a snapshot during it).
     const before = [...packet.snapshots].reverse().find((snapshot) => snapshot.afterSeq < start.seq);
-    if (!before) {
-      notes.push(`No snapshot before Review ${start.id}; canonical snapshot comparison skipped.`);
-      continue;
-    }
-    const nextCanonical = packet.events.find((event) => event.seq > endSeq && (isCanonicalChange(event) ||
-      app(event, "lesson.generation-started") || app(event, "tool.decision") || app(event, "interruption.accepted")));
+    const staleBaseline = before && packet.events.some((event) =>
+      event.seq > before.afterSeq && event.seq < start.seq && mayMoveCanonical(event));
+    const nextCanonical = packet.events.find((event) => event.seq > endSeq && mayMoveCanonical(event));
     const comparable = packet.snapshots.filter((snapshot) => snapshot.afterSeq >= start.seq &&
       snapshot.afterSeq < (nextCanonical?.seq ?? Number.POSITIVE_INFINITY));
+    const covered = end ? comparable.some(({ afterSeq }) => afterSeq >= endSeq) : comparable.length > 0;
+    if (!before || staleBaseline) {
+      unsupportedWindows += 1;
+      notes.push(`No canonical snapshot immediately before Review ${start.id}; isolation cannot be proven.`);
+      continue;
+    }
+    if (!covered) {
+      unsupportedWindows += 1;
+      notes.push(`No canonical snapshot ${end ? `after Review end ${end.id}` : "during open Review"} for ${start.id}; isolation cannot be proven.`);
+    }
     for (const snapshot of comparable) {
       if (canonicalKey(before) !== canonicalKey(snapshot)) {
         violations.push({
@@ -325,7 +340,9 @@ export function checkH4(packet: EvidencePacket): HardAssertionResult {
       }
     }
   }
-  return result("H4", "Review does not mutate canonical progress", violations, starts.length > 0, notes);
+  // FAIL beats UNSUPPORTED: result() reports fail whenever violations exist.
+  return result("H4", "Review does not mutate canonical progress", violations, starts.length > 0, notes,
+    unsupportedWindows > 0);
 }
 
 // ---- Completion attribution (shared by H5 and H7) ----

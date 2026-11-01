@@ -143,6 +143,67 @@ describe("H4 Review isolation", () => {
     expect(checkH4(trace.build()).status).toBe("unsupported");
   });
 
+  describe("snapshot evidence sufficiency", () => {
+    const endReview = (trace: SyntheticTrace) => {
+      trace.app("review.ended", { nodeId: "what-is-a-plc", reason: "completed" });
+      trace.reviewActive = false;
+      return trace;
+    };
+
+    it("is unsupported when the baseline snapshot before Review is missing", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]).deliver("what-is-a-plc", [1]);
+      trace.app("review.started", { nodeId: "what-is-a-plc" });
+      endReview(trace).snap("after review");
+      const result = checkH4(trace.build());
+      expect(result.status).toBe("unsupported");
+      expect(result.notes.join(" ")).toMatch(/No canonical snapshot immediately before Review/);
+    });
+
+    it("is unsupported when the baseline snapshot predates later canonical progress", () => {
+      const trace = new SyntheticTrace();
+      trace.snap("stale baseline");
+      trace.deliver("what-is-a-plc", [0]).deliver("what-is-a-plc", [1]);
+      trace.app("review.started", { nodeId: "what-is-a-plc" });
+      endReview(trace).snap("after review");
+      expect(checkH4(trace.build()).status).toBe("unsupported");
+    });
+
+    it("is unsupported when an ended Review has no snapshot after its end", () => {
+      const trace = reviewTrace();
+      endReview(trace);
+      const result = checkH4(trace.build());
+      expect(result.status).toBe("unsupported");
+      expect(result.notes.join(" ")).toMatch(/No canonical snapshot after Review end/);
+    });
+
+    it("fails, not unsupported, on an explicit canonical mutation despite missing snapshots", () => {
+      const trace = new SyntheticTrace();
+      trace.app("review.started", { nodeId: "what-is-a-plc" });
+      trace.deliver("what-is-a-plc", [0]);
+      endReview(trace);
+      expectFail(checkH4(trace.build()), /beat.commit changed canonical progress during Review/);
+    });
+
+    it("passes multiple Review windows when each is fully evidenced", () => {
+      const trace = reviewTrace();
+      endReview(trace).snap("first review ended");
+      trace.app("review.started", { nodeId: "what-is-a-plc" });
+      endReview(trace).snap("second review ended");
+      expect(checkH4(trace.build()).status).toBe("pass");
+    });
+
+    it("is unsupported when one of several Review windows lacks evidence", () => {
+      const trace = reviewTrace();
+      endReview(trace).snap("first review ended");
+      trace.app("review.started", { nodeId: "what-is-a-plc" });
+      endReview(trace);
+      const result = checkH4(trace.build());
+      expect(result.status).toBe("unsupported");
+      expect(result.notes).toHaveLength(1);
+    });
+  });
+
   it("fails when a lesson commit happens during Review", () => {
     const trace = reviewTrace();
     trace.deliver("plc-scan-cycle", [0]);
