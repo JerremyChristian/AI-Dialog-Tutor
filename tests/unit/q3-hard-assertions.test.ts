@@ -143,6 +143,17 @@ describe("H4 Review isolation", () => {
     expect(checkH4(trace.build()).status).toBe("unsupported");
   });
 
+  it("makes the aggregate verdict inconclusive when Review isolation is unsupported", () => {
+    const trace = new SyntheticTrace();
+    trace.app("review.started", { nodeId: "what-is-a-plc" });
+    trace.app("review.ended", { nodeId: "what-is-a-plc", reason: "completed" });
+
+    const evaluation = evaluateHardAssertions(trace.build());
+    expect(evaluation.assertions.find(({ id }) => id === "H4")?.status).toBe("unsupported");
+    expect(evaluation.assertions.some(({ status }) => status === "fail")).toBe(false);
+    expect(evaluation.verdict).toBe("inconclusive");
+  });
+
   describe("snapshot evidence sufficiency", () => {
     const endReview = (trace: SyntheticTrace) => {
       trace.app("review.ended", { nodeId: "what-is-a-plc", reason: "completed" });
