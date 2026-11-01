@@ -761,6 +761,14 @@ describe("H10 internal-control leakage", () => {
     expect(checkH10(validFullSession().build()).status).toBe("pass");
   });
 
+  it("passes an ordinary nested-array programming example", () => {
+    const trace = new SyntheticTrace();
+    const beat = trace.assign("what-is-a-plc", [0]);
+    trace.speak(beat.generationEpoch, "A JSON matrix can be written as [[1, 2], [3, 4]].");
+
+    expect(checkH10(trace.build()).status).toBe("pass");
+  });
+
   it("fails when tutor speech contains an app control marker", () => {
     const trace = new SyntheticTrace();
     const beat = trace.assign("what-is-a-plc", [0]);
