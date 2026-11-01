@@ -32,7 +32,11 @@ export type HardEvaluation = {
   evaluatorVersion: typeof HARD_EVALUATOR_VERSION;
   packetId: string;
   packetHash: string;
-  /** fail: any hard violation. inconclusive: harness/infra abort without violations. */
+  /**
+   * fail: any hard violation. inconclusive: no violation, but an applicable
+   * assertion was unsupported or the harness aborted. pass: every applicable
+   * assertion was proven. not-applicable assertions never affect the verdict.
+   */
   verdict: "pass" | "fail" | "inconclusive";
   assertions: HardAssertionResult[];
   deferred: Array<{ id: string; reason: string }>;
@@ -633,14 +637,23 @@ export function checkH10(packet: EvidencePacket): HardAssertionResult {
 
 export const HARD_ASSERTIONS = [checkH1, checkH2, checkH3, checkH4, checkH5, checkH6, checkH7, checkH8, checkH10];
 
+/** Precedence: fail, then unsupported or aborted (inconclusive), then pass. */
+export function aggregateVerdict(
+  assertions: Pick<HardAssertionResult, "status">[],
+  endedBy: EvidencePacket["harness"]["endedBy"],
+): HardEvaluation["verdict"] {
+  if (assertions.some(({ status }) => status === "fail")) return "fail";
+  if (assertions.some(({ status }) => status === "unsupported") || endedBy === "aborted") return "inconclusive";
+  return "pass";
+}
+
 export function evaluateHardAssertions(packet: EvidencePacket): HardEvaluation {
   const assertions = HARD_ASSERTIONS.map((check) => check(packet));
-  const failed = assertions.some(({ status }) => status === "fail");
   return {
     evaluatorVersion: HARD_EVALUATOR_VERSION,
     packetId: packet.packetId,
     packetHash: packet.packetHash,
-    verdict: failed ? "fail" : packet.harness.endedBy === "aborted" ? "inconclusive" : "pass",
+    verdict: aggregateVerdict(assertions, packet.harness.endedBy),
     assertions,
     deferred: DEFERRED_ASSERTIONS,
     corePath: corePathSummary(packet),

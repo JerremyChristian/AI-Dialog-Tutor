@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   checkH1, checkH2, checkH3, checkH4, checkH5, checkH6, checkH7, checkH8, checkH10,
-  evaluateHardAssertions, type HardAssertionResult,
+  aggregateVerdict, evaluateHardAssertions, type HardAssertionResult,
 } from "../q3/assertions/hard";
 import { SyntheticTrace, validFullSession } from "../q3/evidence/synthetic-trace";
 
@@ -34,6 +34,51 @@ describe("Q3-A full valid session", () => {
       status: "complete", allCoreBeatsCommitted: true, requiredCoreBeats: 6, committedCoreBeats: 6,
     });
     expect(evaluation.deferred.map(({ id }) => id)).toEqual(["H9", "H11", "stale-audio", "non-beat-output-stop"]);
+  });
+});
+
+describe("aggregate verdict", () => {
+  /** Review with no boundary snapshots: H4 unsupported, nothing fails. */
+  const unsupportedReview = () => {
+    const trace = new SyntheticTrace();
+    trace.app("review.started", { nodeId: "what-is-a-plc" });
+    trace.app("review.ended", { nodeId: "what-is-a-plc", reason: "completed" });
+    return trace;
+  };
+
+  it("fails when one applicable assertion fails", () => {
+    const trace = new SyntheticTrace();
+    trace.app("delivery.cursor-changed", { conceptId: "what-is-a-plc", from: 0, to: 1 });
+    expect(evaluateHardAssertions(trace.build()).verdict).toBe("fail");
+  });
+
+  it("fails, not inconclusive, when an unsupported assertion coexists with a failure", () => {
+    const trace = unsupportedReview();
+    trace.deliver("what-is-a-plc", [0]);
+    trace.app("review.started", { nodeId: "what-is-a-plc" });
+    trace.deliver("what-is-a-plc", [1]);
+    const evaluation = evaluateHardAssertions(trace.build());
+    expect(evaluation.assertions.find(({ id }) => id === "H4")?.status).toBe("fail");
+    expect(evaluation.verdict).toBe("fail");
+  });
+
+  it("fails an aborted run that has a hard failure", () => {
+    const trace = new SyntheticTrace();
+    trace.app("delivery.cursor-changed", { conceptId: "what-is-a-plc", from: 0, to: 1 });
+    expect(evaluateHardAssertions(trace.build("aborted", { category: "provider", message: "Live 503" })).verdict).toBe("fail");
+  });
+
+  it.each([
+    ["all applicable pass", ["pass", "pass", "not-applicable"], "open", "pass"],
+    ["only not-applicable", ["not-applicable", "not-applicable"], "open", "pass"],
+    ["one unsupported", ["pass", "unsupported", "not-applicable"], "open", "inconclusive"],
+    ["multiple unsupported", ["unsupported", "pass", "unsupported"], "lesson-completed", "inconclusive"],
+    ["unsupported plus fail", ["unsupported", "fail", "pass"], "open", "fail"],
+    ["aborted without fail", ["pass", "not-applicable"], "aborted", "inconclusive"],
+    ["aborted with unsupported", ["unsupported"], "aborted", "inconclusive"],
+    ["aborted with fail", ["pass", "fail"], "aborted", "fail"],
+  ] as const)("aggregates %s", (_label, statuses, endedBy, verdict) => {
+    expect(aggregateVerdict(statuses.map((status) => ({ status })), endedBy)).toBe(verdict);
   });
 });
 
