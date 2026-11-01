@@ -77,6 +77,77 @@ test("interruption invalidates the Review beat without canonical interruption or
   expect(interrupted.events.filter((event) => event.name === "interruption.accepted")).toHaveLength(0);
 });
 
+test("Q2-D Review interruption clarification and continue restart the same unconfirmed Review beat", async ({ page }) => {
+  const before = await startReview(page);
+  const reviewStarted = await readTestState(page);
+  const initialReviewBeat = reviewStarted.snapshot.activePresentationBeat;
+  expect(initialReviewBeat).toMatchObject({ index: 0, teachingPointIndexes: [0], mode: "review" });
+  expect(canonicalProjection(reviewStarted.snapshot)).toEqual(canonicalProjection(before));
+
+  const pcm = await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").pcm as string);
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "PLC means programmable logic controller." },
+  } });
+  await deliverLive(page, {
+    voiceActivity: { voiceActivityType: "ACTIVITY_START" },
+    serverContent: { interrupted: true },
+  });
+  await expect.poll(async () => (await readTestState(page)).snapshot.activePresentationBeat).toBeNull();
+
+  await deliverLive(page, { serverContent: {
+    inputTranscription: { text: "Can you clarify what programmable means here?", finished: true },
+    turnComplete: true,
+  } });
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "Programmable means its control instructions can be changed." },
+    generationComplete: true,
+  } });
+  await deliverLive(page, { serverContent: { turnComplete: true } });
+
+  const clarified = await readTestState(page);
+  expect(clarified.snapshot.reviewActive).toBe(true);
+  expect(clarified.snapshot.activePresentationBeat).toBeNull();
+  expect(canonicalProjection(clarified.snapshot)).toEqual(canonicalProjection(before));
+  expect(clarified.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+  expect(clarified.events.filter((event) => event.name === "delivery.cursor-changed")).toHaveLength(0);
+  expect(clarified.events.filter((event) => event.name === "coverage.changed")).toHaveLength(0);
+
+  await deliverLive(page, { serverContent: {
+    inputTranscription: { text: "Okay, continue the Review.", finished: true },
+  } });
+  const continueResponse = await sendLessonTool(page, "continue-review-after-clarification", {
+    action: "query",
+    purpose: "continue",
+  });
+  const resumed = await readTestState(page);
+  expect(resumed.snapshot.reviewActive).toBe(true);
+  expect(resumed.snapshot.activePresentationBeat).toEqual(initialReviewBeat);
+  expect(canonicalProjection(resumed.snapshot)).toEqual(canonicalProjection(before));
+  expect(resumed.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+  expect(textOf(continueResponse.message)).toContain("PLC means programmable logic controller");
+  expect(textOf(continueResponse.message)).toContain("APP_CONTROL:TEACH_PRESENTATION_BEAT");
+
+  await finishActiveBeat(page, "PLC means programmable logic controller.");
+  await expect.poll(async () => (await readTestState(page)).events.filter((event) =>
+    event.name === "beat.commit" && event.detail?.mode === "review").length).toBe(1);
+
+  const progressed = await readTestState(page);
+  expect(progressed.snapshot.reviewActive).toBe(true);
+  expect(progressed.snapshot.activePresentationBeat).toMatchObject({
+    index: 1,
+    teachingPointIndexes: [1],
+    mode: "review",
+  });
+  expect(canonicalProjection(progressed.snapshot)).toEqual(canonicalProjection(before));
+  expect(progressed.events.filter((event) =>
+    event.name === "beat.commit" && event.detail?.mode === "lesson")).toHaveLength(0);
+  expect(progressed.events.filter((event) => event.name === "delivery.cursor-changed")).toHaveLength(0);
+  expect(progressed.events.filter((event) => event.name === "coverage.changed")).toHaveLength(0);
+  expect(progressed.events.filter((event) => event.name === "review.ended")).toHaveLength(0);
+});
+
 test("final Review beat waits, then continue exits Review and restores canonical lesson", async ({ page }) => {
   const before = await startReview(page);
   const returnBeat = before.activePresentationBeat;
