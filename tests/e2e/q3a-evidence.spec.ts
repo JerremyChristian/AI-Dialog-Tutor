@@ -127,6 +127,15 @@ test("Q3-A evidence capture refuses duplicate finalization", async ({ page }) =>
   await expect(evidence.finalize({ endedBy: "open" })).rejects.toThrow(/already finalized/i);
 });
 
+test("Q3-A evidence capture refuses to start after live canonical progress moves", async ({ page }) => {
+  await installFakeLive(page, { lessonFixture: PLC_Q3_FIXTURE });
+  await openLessonAndStart(page);
+  await deliverBeat(page, "PLC means programmable logic controller.");
+
+  await expect(startEvidence(page, "q3a-late-capture"))
+    .rejects.toThrow(/before canonical progress/i);
+});
+
 test("Q3-A finalized evidence is one immutable artifact and rejects further capture", async ({ page }) => {
   await installFakeLive(page, { lessonFixture: PLC_Q3_FIXTURE });
   await openLessonAndStart(page);
