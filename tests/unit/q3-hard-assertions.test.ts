@@ -367,6 +367,16 @@ describe("H8 logical interruption integrity", () => {
     expectFail(checkH8(trace.build()), /did not invalidate the interrupted beat epoch 1/);
   });
 
+  it("fails when one learner interruption is accepted twice", () => {
+    const trace = new SyntheticTrace();
+    const beat = trace.assign("what-is-a-plc", [0]);
+    trace.speak(beat.generationEpoch, "PLC means");
+    trace.typedInterrupt(beat.generationEpoch, "wait");
+    trace.app("interruption.accepted", { conceptId: "what-is-a-plc", interruptionCount: 2 });
+
+    expectFail(checkH8(trace.build()), /learner interruption was accepted 2 times/);
+  });
+
   it("fails when a provider voice barge-in is not accepted", () => {
     const trace = new SyntheticTrace();
     const beat = trace.assign("what-is-a-plc", [0]);
