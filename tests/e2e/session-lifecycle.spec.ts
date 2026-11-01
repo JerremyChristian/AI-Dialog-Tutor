@@ -53,15 +53,30 @@ test("fresh-socket recovery sends history only and does not duplicate a teaching
   expect(teachingImperatives(await getLiveSends(page))).toHaveLength(1);
 });
 
-test("clarification preserves canonical progress and continue reassigns the unconfirmed beat", async ({ page }) => {
+test("Q2-A clarification preserves progress and continue restarts then commits the same beat once", async ({ page }) => {
   await installFakeLive(page);
   await openLessonAndStart(page);
   const initialImperative = teachingImperatives(await getLiveSends(page))[0];
+  const initialState = await readTestState(page);
+  expect(initialState.snapshot.activePresentationBeat).toMatchObject({
+    index: 0,
+    teachingPointIndexes: [0],
+    mode: "lesson",
+  });
   const pcm = await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").pcm as string);
   await deliverLive(page, { serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] }, outputTranscription: { text: "A PLC is a rugged industrial computer." } } });
   await deliverLive(page, { voiceActivity: { voiceActivityType: "ACTIVITY_START" }, serverContent: { interrupted: true } });
+  const interrupted = await readTestState(page);
+  expect(interrupted.events.map((event) => event.name)).toContain("interruption.accepted");
+  expect(interrupted.events.map((event) => event.name)).toContain("audio.epoch-invalidated");
+  expect(interrupted.snapshot.deliveryCursor).toBe(0);
+  expect((interrupted.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("teaching");
+  expect(interrupted.events.map((event) => event.name)).not.toContain("beat.commit");
   await deliverLive(page, { serverContent: { inputTranscription: { text: "What exactly does rugged mean?", finished: true }, turnComplete: true } });
-  await deliverLive(page, { serverContent: { outputTranscription: { text: "It means designed for harsh industrial conditions." } } });
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "It means designed for harsh industrial conditions." },
+  } });
   await deliverLive(page, { serverContent: { generationComplete: true } });
 
   const afterClarification = await readTestState(page);
@@ -81,5 +96,30 @@ test("clarification preserves canonical progress and continue reassigns the unco
   expect(textOf(toolResponse!.message)).toContain("APP_CONTROL:TEACH_PRESENTATION_BEAT");
   expect(textOf(initialImperative.message)).toContain("APP_CONTROL:TEACH_PRESENTATION_BEAT");
 
-  expect((await readTestState(page)).snapshot.deliveryCursor).toBe(0);
+  const afterContinue = await readTestState(page);
+  expect(afterContinue.snapshot.deliveryCursor).toBe(0);
+  expect(afterContinue.snapshot.activePresentationBeat).toEqual(initialState.snapshot.activePresentationBeat);
+  expect((afterContinue.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("teaching");
+  expect(afterContinue.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "A PLC means programmable logic controller." },
+  } });
+  await deliverLive(page, { serverContent: { generationComplete: true } });
+
+  const beforeResumedBeatDrain = await readTestState(page);
+  expect(beforeResumedBeatDrain.snapshot.deliveryCursor).toBe(0);
+  expect(beforeResumedBeatDrain.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+  await expect.poll(async () => (await readTestState(page)).snapshot.deliveryCursor).toBe(1);
+
+  const completed = await readTestState(page);
+  expect(completed.events.filter((event) => event.name === "beat.commit")).toHaveLength(1);
+  expect(completed.events.filter((event) => event.name === "beat.commit")[0]).toMatchObject({
+    detail: { mode: "lesson", conceptId: "what-is-a-plc", nextIndex: 1 },
+  });
+  expect(completed.snapshot.deliveryCursor).toBe(1);
+  expect((completed.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("teaching");
+  expect(completed.snapshot.activePresentationBeat).toMatchObject({ index: 1, mode: "lesson" });
+  expect(completed.snapshot.lessonActive).toBe(true);
 });
