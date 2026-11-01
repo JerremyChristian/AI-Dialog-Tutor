@@ -56,13 +56,26 @@ export const DEFERRED_ASSERTIONS: HardEvaluation["deferred"] = [
   },
 ];
 
-/** Tokens that only exist in app/provider control traffic and must never be spoken. */
+// Internal app tools (lib/gemini-live-websocket.ts). A bare mention of these
+// words is ordinary speech; only their protocol forms below are leakage.
+const APP_TOOL_NAMES = "lesson_state|session_control|update_teaching_preferences";
+// A JSON quote, optionally backslash-escaped, so stringified payloads match too.
+const QUOTE = String.raw`\\?["']`;
+const OPTIONAL_QUOTE = `(?:${QUOTE})?`;
+
+/**
+ * Structural forms that only exist in app/provider control traffic and must
+ * never be spoken. Punctuation ([[ ]]) and vocabulary alone are not leakage.
+ */
 export const INTERNAL_CONTROL_PATTERNS: RegExp[] = [
-  /APP_CONTROL/i,
-  /\[\[|\]\]/,
-  /\b(lesson_state|session_control|update_teaching_preferences)\b/,
-  /\bteachingAssignment\b/,
-  /\bTEACH_PRESENTATION_BEAT\b/,
+  // App control marker, e.g. [[APP_CONTROL:TEACH_PRESENTATION_BEAT]].
+  /\bAPP_CONTROL\s*:\s*[A-Z][A-Z0-9_]*/i,
+  // Function-call envelope naming an app tool: "name": "lesson_state".
+  new RegExp(String.raw`${QUOTE}name${QUOTE}\s*:\s*${QUOTE}(?:${APP_TOOL_NAMES})${QUOTE}`),
+  // Tool invocation with its action argument: lesson_state({ action: "skip" }).
+  new RegExp(String.raw`\b(?:${APP_TOOL_NAMES})\s*\(\s*\{?\s*${OPTIONAL_QUOTE}action${OPTIONAL_QUOTE}\s*[:=]`),
+  // Live protocol envelope keys and app tool-result keys used as JSON keys.
+  new RegExp(String.raw`${QUOTE}(?:toolCall|toolResponse|functionCalls|functionResponses|teachingAssignment)${QUOTE}\s*:`),
 ];
 
 const CANONICAL_CHANGE_EVENTS = new Set(["beat.commit", "delivery.cursor-changed", "coverage.changed"]);

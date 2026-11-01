@@ -776,10 +776,36 @@ describe("H10 internal-control leakage", () => {
     expectFail(checkH10(trace.build()), /tutor speech leaked internal control text/);
   });
 
-  it("fails when tutor speech names an internal tool", () => {
-    const trace = new SyntheticTrace();
-    const beat = trace.assign("what-is-a-plc", [0]);
-    trace.speak(beat.generationEpoch, "Let me call lesson_state to check.");
-    expectFail(checkH10(trace.build()), /leaked internal control text/);
+  describe("structural protocol forms, not punctuation or vocabulary", () => {
+    const spoken = (text: string) => {
+      const trace = new SyntheticTrace();
+      const beat = trace.assign("what-is-a-plc", [0]);
+      trace.speak(beat.generationEpoch, text);
+      return checkH10(trace.build());
+    };
+
+    it.each([
+      ["nested arrays", "Index it like grid[[0, 1]] or write [[\"a\"], [\"b\", [[\"c\"]]]]."],
+      ["session control in OS design", "Session control is part of operating-system design."],
+      ["lesson state as JSON", "Lesson state can be represented in JSON, like {\"topic\": \"PLCs\"}."],
+      ["tools and APIs", "A PLC vendor API exposes a tool for reading inputs."],
+      ["bare tool-name mention", "Let me call lesson_state to check; session_control and update_teaching_preferences are names."],
+      ["code that mentions a tool name without its protocol form", "const lesson_state = load(); print(session_control)"],
+    ])("passes ordinary content: %s", (_label, text) => {
+      expect(spoken(text).status).toBe("pass");
+    });
+
+    it.each([
+      ["bracketed app control marker", "Sure. [[APP_CONTROL:TEACH_PRESENTATION_BEAT]] PLC means"],
+      ["unbracketed app control marker", "Resuming APP_CONTROL:PERSISTED_LESSON_RESUME now."],
+      ["session_control function-call envelope", "{\"name\": \"session_control\", \"args\": {\"action\": \"end\"}}"],
+      ["lesson_state function-call envelope", "Calling {name: 'x'} then {\"name\":\"lesson_state\",\"args\":{\"action\":\"query\"}}"],
+      ["lesson_state invocation with action", "lesson_state({ action: \"skip\", conceptId: \"plc-history\" })"],
+      ["Live tool-call envelope", "{\"toolCall\": {\"functionCalls\": []}}"],
+      ["app tool-result key", "{\"ok\": true, \"teachingAssignment\": \"...\"}"],
+      ["stringified nested control payload", "{\"payload\": \"{\\\"name\\\":\\\"session_control\\\",\\\"args\\\":{}}\"}"],
+    ])("fails internal leakage: %s", (_label, text) => {
+      expectFail(spoken(text), /tutor speech leaked internal control text/);
+    });
   });
 });
