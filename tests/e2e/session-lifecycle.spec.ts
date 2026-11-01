@@ -123,3 +123,71 @@ test("Q2-A clarification preserves progress and continue restarts then commits t
   expect(completed.snapshot.activePresentationBeat).toMatchObject({ index: 1, mode: "lesson" });
   expect(completed.snapshot.lessonActive).toBe(true);
 });
+
+test("Q2-B confused learner response preserves canonical progress until explicit continue", async ({ page }) => {
+  await installFakeLive(page, { additionalConcept: true });
+  await openLessonAndStart(page);
+  const pcm = await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").pcm as string);
+
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "A PLC means programmable logic controller." },
+    generationComplete: true,
+  } });
+  await expect.poll(async () => (await readTestState(page)).snapshot.deliveryCursor).toBe(1);
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "PLCs coordinate industrial inputs and outputs." },
+    generationComplete: true,
+  } });
+  await expect.poll(async () => (await readTestState(page)).snapshot.deliveryCursor).toBe(2);
+
+  const atCheckIn = await readTestState(page);
+  expect(atCheckIn.snapshot.currentNodeId).toBe("what-is-a-plc");
+  expect(atCheckIn.snapshot.activePresentationBeat).toBeNull();
+  expect((atCheckIn.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("taught");
+  expect((atCheckIn.snapshot.coverage as Record<string, string>)["plc-scan-cycle"]).toBe("not-started");
+  expect(atCheckIn.events.filter((event) => event.name === "beat.commit")).toHaveLength(2);
+  expect(teachingImperatives(await getLiveSends(page))).toHaveLength(2);
+
+  await deliverLive(page, { serverContent: {
+    inputTranscription: { text: "I don't understand.", finished: true },
+    turnComplete: true,
+  } });
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "A PLC is a rugged computer that controls machines." },
+    generationComplete: true,
+  } });
+
+  const afterClarification = await readTestState(page);
+  expect(afterClarification.snapshot.currentNodeId).toBe("what-is-a-plc");
+  expect(afterClarification.snapshot.deliveryCursor).toBe(2);
+  expect(afterClarification.snapshot.coverage).toEqual(atCheckIn.snapshot.coverage);
+  expect(afterClarification.snapshot.activePresentationBeat).toBeNull();
+  expect(afterClarification.snapshot.lessonActive).toBe(true);
+  expect(afterClarification.events.filter((event) => event.name === "beat.commit")).toHaveLength(2);
+  expect(teachingImperatives(await getLiveSends(page))).toHaveLength(2);
+
+  await deliverLive(page, { toolCall: { functionCalls: [{
+    id: "continue-after-confusion",
+    name: "lesson_state",
+    args: { action: "query", purpose: "continue" },
+  }] } });
+  await expect.poll(async () => (await getLiveSends(page))
+    .filter(({ message }) => Boolean(message.toolResponse)).length).toBe(1);
+
+  const continued = await readTestState(page);
+  expect(continued.snapshot.currentNodeId).toBe("plc-scan-cycle");
+  expect(continued.snapshot.deliveryCursor).toBe(0);
+  expect(continued.snapshot.activePresentationBeat).toMatchObject({
+    index: 0,
+    teachingPointIndexes: [0],
+    mode: "lesson",
+  });
+  expect(continued.events.filter((event) => event.name === "beat.commit")).toHaveLength(2);
+  expect(teachingImperatives(await getLiveSends(page))).toHaveLength(2);
+  const continueResponse = (await getLiveSends(page)).find(({ message }) => Boolean(message.toolResponse));
+  expect(textOf(continueResponse!.message)).toContain("A PLC repeatedly reads inputs, executes logic, and updates outputs.");
+  expect(textOf(continueResponse!.message)).toContain("APP_CONTROL:TEACH_PRESENTATION_BEAT");
+});

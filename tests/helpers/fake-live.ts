@@ -40,6 +40,7 @@ export async function installFakeLive(page: Page, options: {
   schemaVersion?: number;
   cloudOwnerId?: string | null;
   secondLesson?: boolean;
+  additionalConcept?: boolean;
   holdFirstPlayerReady?: boolean;
   holdFirstTokenResponse?: boolean;
   holdFirstStreamerClose?: boolean;
@@ -71,7 +72,7 @@ export async function installFakeLive(page: Page, options: {
       body: JSON.stringify({ token: "local-test-token", source: { name: "plc-notes.txt", mimeType: "text/plain" } }),
     });
   });
-  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences, schemaVersion, cloudOwnerId, secondLesson, holdFirstPlayerReady, holdFirstStreamerClose, observeTutorPlayback }) => {
+  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences, schemaVersion, cloudOwnerId, secondLesson, additionalConcept, holdFirstPlayerReady, holdFirstStreamerClose, observeTutorPlayback }) => {
     if (observeTutorPlayback) {
       const NativeAudioContext = window.AudioContext;
       type PlaybackRecord = { id: number; marker: number; startTime: number; stopped: boolean; ended: boolean };
@@ -314,11 +315,11 @@ export async function installFakeLive(page: Page, options: {
         lessonTree: [{ id: "what-is-a-plc", title: "What is a PLC?", parentId: null, order: 0, teaching: {
           objective: "Define a programmable logic controller.", teachingPoints: ["PLC means programmable logic controller.", "PLCs coordinate industrial inputs and outputs."],
           completionCriteria: ["Explain the role of a PLC."], deliveryUnits: [{ objective: "Introduce the PLC definition and role.", teachingPointIndexes: [0, 1], completionCriteriaIndexes: [0], presentationBeats: [{ teachingPointIndexes: [0] }, { teachingPointIndexes: [1] }] }], type: "definition", importance: "core",
-        } }, ...(reviewReady ? [{ id: "plc-scan-cycle", title: "PLC scan cycle", parentId: null, order: 1, teaching: secondNode.teaching }] : [])] } },
-      lessonState: { topic: "PLC fundamentals", objective: "Understand PLC fundamentals.", status: persistedStatus, currentNodeId: reviewReady ? "plc-scan-cycle" : "what-is-a-plc", rootNodeIds: reviewReady ? ["what-is-a-plc", "plc-scan-cycle"] : ["what-is-a-plc"], nodes: {
+        } }, ...(reviewReady || additionalConcept ? [{ id: "plc-scan-cycle", title: "PLC scan cycle", parentId: null, order: 1, teaching: secondNode.teaching }] : [])] } },
+      lessonState: { topic: "PLC fundamentals", objective: "Understand PLC fundamentals.", status: persistedStatus, currentNodeId: reviewReady ? "plc-scan-cycle" : "what-is-a-plc", rootNodeIds: reviewReady || additionalConcept ? ["what-is-a-plc", "plc-scan-cycle"] : ["what-is-a-plc"], nodes: {
         "what-is-a-plc": firstNode,
-        ...(reviewReady ? { "plc-scan-cycle": secondNode } : {}),
-      }, teachingContractProgress: { "what-is-a-plc": { nextTeachingPointIndex: persistedCursor }, ...(reviewReady ? { "plc-scan-cycle": { nextTeachingPointIndex: 0 } } : {}) }, resumePoint, interruptionCount: persistedStatus === "interrupted" ? 1 : 0, lastUserTranscript: "not persisted by snapshots", lastAssistantTranscript: "not persisted by snapshots" },
+        ...(reviewReady || additionalConcept ? { "plc-scan-cycle": secondNode } : {}),
+      }, teachingContractProgress: { "what-is-a-plc": { nextTeachingPointIndex: persistedCursor }, ...(reviewReady || additionalConcept ? { "plc-scan-cycle": { nextTeachingPointIndex: 0 } } : {}) }, resumePoint, interruptionCount: persistedStatus === "interrupted" ? 1 : 0, lastUserTranscript: "not persisted by snapshots", lastAssistantTranscript: "not persisted by snapshots" },
       recentTeachingContext, teachingPreferences, createdAt: now, updatedAt: now, cloudOwnerId,
     };
     const seedMarker = `__qa_lesson_seeded__:${lessonId}`;
@@ -369,6 +370,7 @@ export async function installFakeLive(page: Page, options: {
     schemaVersion: options.schemaVersion ?? 1,
     cloudOwnerId: options.cloudOwnerId ?? null,
     secondLesson: options.secondLesson ?? false,
+    additionalConcept: options.additionalConcept ?? false,
     holdFirstPlayerReady: options.holdFirstPlayerReady ?? false,
     holdFirstStreamerClose: options.holdFirstStreamerClose ?? false,
     observeTutorPlayback: options.observeTutorPlayback ?? false,
