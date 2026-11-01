@@ -7,6 +7,7 @@ import {
   readTestState,
   textOf,
 } from "../helpers/fake-live";
+import { expectHardEvidencePass, startEvidence, statusOf } from "../helpers/evidence-recorder";
 
 async function sendLessonActions(
   page: Page,
@@ -25,11 +26,12 @@ async function sendLessonActions(
     .filter(({ message }) => Boolean(message.toolResponse)).at(-1)!.message;
 }
 
-test("Q2-C skip forward preserves the unfinished concept and explicitly navigates to the next", async ({ page }) => {
+test("Q2-C skip forward preserves the unfinished concept and explicitly navigates to the next", async ({ page }, testInfo) => {
   await installFakeLive(page, { additionalConcept: true });
   await openLessonAndStart(page);
+  const evidence = await startEvidence(page, "q2-c-skip-forward");
 
-  const before = await readTestState(page);
+  const before = evidence.observe("before skip", await readTestState(page));
   expect(before.snapshot.currentNodeId).toBe("what-is-a-plc");
   expect(before.snapshot.deliveryCursor).toBe(0);
   expect(before.snapshot.activePresentationBeat).toMatchObject({
@@ -44,7 +46,7 @@ test("Q2-C skip forward preserves the unfinished concept and explicitly navigate
     { id: "navigate-next", action: "navigate", conceptId: "plc-scan-cycle" },
   ]);
 
-  const after = await readTestState(page);
+  const after = evidence.observe("after skip and navigate", await readTestState(page));
   expect(after.snapshot.currentNodeId).toBe("plc-scan-cycle");
   expect(after.snapshot.deliveryCursor).toBe(0);
   expect(after.snapshot.activePresentationBeat).toMatchObject({
@@ -62,11 +64,17 @@ test("Q2-C skip forward preserves the unfinished concept and explicitly navigate
   expect(textOf(response)).toContain("Moved to PLC scan cycle");
   expect(textOf(response)).toContain("A PLC repeatedly reads inputs, executes logic, and updates outputs.");
   expect(textOf(response)).toContain("APP_CONTROL:TEACH_PRESENTATION_BEAT");
+
+  const evaluation = await expectHardEvidencePass(await evidence.finalize({ endedBy: "open" }), testInfo);
+  expect(statusOf(evaluation)).toMatchObject({ H1: "pass", H2: "not-applicable", H5: "pass", H7: "not-applicable" });
+  expect(evaluation.corePath.incompleteCoreConcepts.map(({ conceptId }) => conceptId))
+    .toEqual(["what-is-a-plc", "plc-scan-cycle"]);
 });
 
-test("Q2-C go back preserves committed history and reassigns only the earlier uncommitted beat", async ({ page }) => {
+test("Q2-C go back preserves committed history and reassigns only the earlier uncommitted beat", async ({ page }, testInfo) => {
   await installFakeLive(page, { additionalConcept: true });
   await openLessonAndStart(page);
+  const evidence = await startEvidence(page, "q2-c-go-back");
   const pcm = await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").pcm as string);
 
   await deliverLive(page, { serverContent: {
@@ -76,7 +84,7 @@ test("Q2-C go back preserves committed history and reassigns only the earlier un
   } });
   await expect.poll(async () => (await readTestState(page)).snapshot.deliveryCursor).toBe(1);
 
-  const beforeForwardNavigation = await readTestState(page);
+  const beforeForwardNavigation = evidence.observe("first beat committed", await readTestState(page));
   expect(beforeForwardNavigation.snapshot.activePresentationBeat).toMatchObject({
     index: 1,
     teachingPointIndexes: [1],
@@ -87,7 +95,7 @@ test("Q2-C go back preserves committed history and reassigns only the earlier un
   await sendLessonActions(page, [
     { id: "navigate-later", action: "navigate", conceptId: "plc-scan-cycle" },
   ]);
-  const later = await readTestState(page);
+  const later = evidence.observe("navigated forward", await readTestState(page));
   expect(later.snapshot.currentNodeId).toBe("plc-scan-cycle");
   expect(later.snapshot.deliveryCursor).toBe(0);
   expect(later.snapshot.coverage).toEqual({
@@ -100,7 +108,7 @@ test("Q2-C go back preserves committed history and reassigns only the earlier un
     { id: "navigate-back", action: "navigate", conceptId: "what-is-a-plc" },
   ]);
 
-  const returned = await readTestState(page);
+  const returned = evidence.observe("navigated back", await readTestState(page));
   expect(returned.snapshot.currentNodeId).toBe("what-is-a-plc");
   expect(returned.snapshot.deliveryCursor).toBe(1);
   expect(returned.snapshot.coverage).toEqual({
@@ -117,4 +125,7 @@ test("Q2-C go back preserves committed history and reassigns only the earlier un
   expect(textOf(response)).toContain("Moved to What is a PLC?");
   expect(textOf(response)).toContain("PLCs coordinate industrial inputs and outputs.");
   expect(textOf(response)).toContain("APP_CONTROL:TEACH_PRESENTATION_BEAT");
+
+  const evaluation = await expectHardEvidencePass(await evidence.finalize({ endedBy: "open" }), testInfo);
+  expect(statusOf(evaluation)).toMatchObject({ H1: "pass", H2: "pass", H3: "pass", H5: "pass" });
 });

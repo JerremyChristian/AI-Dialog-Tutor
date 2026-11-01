@@ -1,0 +1,116 @@
+import { expect, test, type Page } from "@playwright/test";
+import { expectHardEvidencePass, startEvidence, statusOf } from "../helpers/evidence-recorder";
+import {
+  deliverLive, getLiveSends, installFakeLive, openLessonAndStart, readTestState,
+} from "../helpers/fake-live";
+import { PLC_Q3_FIXTURE } from "../helpers/lesson-fixture";
+import { measurePerformance } from "../q3/assertions/performance";
+
+const pcmOf = (page: Page) => page.evaluate(() => Reflect.get(window, "__QA_LIVE__").pcm as string);
+const eventCount = async (page: Page, name: string) =>
+  (await readTestState(page)).events.filter((event) => event.name === name).length;
+
+async function deliverBeat(page: Page, text: string) {
+  const commits = await eventCount(page, "beat.commit");
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: await pcmOf(page) } }] },
+    outputTranscription: { text },
+    generationComplete: true,
+  } });
+  await expect.poll(() => eventCount(page, "beat.commit")).toBe(commits + 1);
+}
+
+async function sendTool(page: Page, id: string, name: string, args: Record<string, unknown>) {
+  const responses = (await getLiveSends(page)).filter(({ message }) => Boolean(message.toolResponse)).length;
+  await deliverLive(page, { toolCall: { functionCalls: [{ id, name, args }] } });
+  await expect.poll(async () => (await getLiveSends(page))
+    .filter(({ message }) => Boolean(message.toolResponse)).length).toBe(responses + 1);
+}
+
+test("Q3-A scripted Q3-fixture session produces evidence that passes every applicable hard assertion", async ({ page }, testInfo) => {
+  await installFakeLive(page, { lessonFixture: PLC_Q3_FIXTURE });
+  await openLessonAndStart(page);
+  const evidence = await startEvidence(page, "q3a-plc-fixture-session");
+  const start = evidence.observe("start", await readTestState(page));
+  expect(start.snapshot.coverage).toEqual({
+    "what-is-a-plc": "teaching", "plc-scan-cycle": "not-started", "plc-history": "not-started", "plc-io-modules": "not-started",
+  });
+
+  // Beat 1 drains naturally; beat 2 auto-chains and is interrupted mid-output.
+  await deliverBeat(page, "PLC means programmable logic controller.");
+  await deliverLive(page, { serverContent: { modelTurn: { parts: [{
+    inlineData: { mimeType: "audio/pcm;rate=24000", data: Buffer.alloc(96_000).toString("base64") },
+  }] }, outputTranscription: { text: "PLCs coordinate" } } });
+  await expect.poll(() => eventCount(page, "tutor.audio-started")).toBe(2);
+
+  const question = "Wait, what counts as an input?";
+  await evidence.learnerTyped(question, { duringTutorOutput: true });
+  await page.getByLabel("Type a reply").fill(question);
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => eventCount(page, "interruption.accepted")).toBe(1);
+  await deliverLive(page, { serverContent: { interrupted: true } });
+  await deliverLive(page, { serverContent: { turnComplete: true } });
+
+  // Clarification: no canonical progress until the tutor resumes the lesson.
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: await pcmOf(page) } }] },
+    outputTranscription: { text: "Inputs are signals from sensors, such as a push button." },
+    generationComplete: true,
+  } });
+  await deliverLive(page, { serverContent: { turnComplete: true } });
+  // This typed-clarification path emits canonical.resume-requested but not
+  // clarification.completed; H6 closes the branch at the next teaching assignment.
+  await expect.poll(() => eventCount(page, "canonical.resume-requested")).toBe(1);
+  const clarified = evidence.observe("clarified", await readTestState(page));
+  expect(clarified.snapshot.deliveryCursor).toBe(1);
+
+  await sendTool(page, "resume-after-clarification", "lesson_state", { action: "query", purpose: "continue" });
+  await deliverBeat(page, "PLCs coordinate industrial inputs and outputs.");
+  evidence.observe("first concept taught", await readTestState(page));
+
+  await sendTool(page, "continue-to-scan-cycle", "lesson_state", { action: "query", purpose: "continue" });
+  await deliverBeat(page, "A PLC first reads the state of every input.");
+  await deliverBeat(page, "It then executes its program and updates outputs, again and again.");
+
+  const skipRequest = "Can we skip the history part?";
+  await evidence.learnerTyped(skipRequest, { duringTutorOutput: false });
+  await page.getByLabel("Type a reply").fill(skipRequest);
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await sendTool(page, "skip-history", "lesson_state", { action: "skip", conceptId: "plc-history" });
+  const skipped = evidence.observe("history skipped", await readTestState(page));
+  expect(skipped.snapshot.coverage).toMatchObject({ "plc-history": "skipped", "plc-io-modules": "teaching" });
+
+  await deliverBeat(page, "Input modules convert sensor signals into values the program can read.");
+  await deliverBeat(page, "Output modules turn program decisions into signals that drive actuators.");
+  const complete = evidence.observe("canonical complete", await readTestState(page));
+  expect(complete.snapshot.coverage).toEqual({
+    "what-is-a-plc": "taught", "plc-scan-cycle": "taught", "plc-history": "skipped", "plc-io-modules": "taught",
+  });
+
+  await deliverLive(page, { serverContent: { inputTranscription: { text: "No more questions, thanks.", finished: true } } });
+  await sendTool(page, "end-lesson", "session_control", { action: "end" });
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: await pcmOf(page) } }] },
+    outputTranscription: { text: "Thanks for learning with me today. Goodbye!" },
+    generationComplete: true,
+  } });
+  await expect.poll(async () => (await readTestState(page)).snapshot.lessonActive, { timeout: 8_000 }).toBe(false);
+
+  const packet = await evidence.finalize({ endedBy: "lesson-completed" });
+  const evaluation = await expectHardEvidencePass(packet, testInfo);
+  expect(statusOf(evaluation)).toEqual({
+    H1: "pass", H2: "pass", H3: "pass", H4: "not-applicable", H5: "pass",
+    H6: "pass", H7: "pass", H8: "pass", H10: "pass",
+  });
+  expect(evaluation.corePath).toMatchObject({ status: "complete", requiredCoreBeats: 6, committedCoreBeats: 6 });
+  expect(packet.contract).toMatchObject({ fixtureId: "plc-q3", fixtureVersion: "1" });
+  expect(packet.turns.filter(({ role }) => role === "learner").map(({ channel, text }) => `${channel}:${text}`)).toEqual([
+    `typed:${question}`, `typed:${skipRequest}`, "voice-transcript:No more questions, thanks.",
+  ]);
+  expect(packet.audioSummary.invalidationsByReason["barge-in"]).toBe(1);
+  expect(JSON.stringify(packet)).not.toContain(await pcmOf(page));
+
+  const performance = measurePerformance(packet);
+  expect(performance.gating).toBe(false);
+  expect(performance.interruptionAcceptLatencyMs).toHaveLength(1);
+});

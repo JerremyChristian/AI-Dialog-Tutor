@@ -3,6 +3,7 @@ import {
   deliverLive, getLiveSends, installFakeLive, openLessonAndStart,
   readTestState, textOf,
 } from "../helpers/fake-live";
+import { expectHardEvidencePass, startEvidence, statusOf } from "../helpers/evidence-recorder";
 
 function canonicalProgress(snapshot: Record<string, unknown>) {
   return {
@@ -224,9 +225,10 @@ test("Q2-E idle confirmation learner return resumes the correct next canonical b
   expect(completed.snapshot.lessonActive).toBe(true);
 });
 
-test("Q2-H final canonical completion waits for one naturally drained farewell before stopping", async ({ page }) => {
+test("Q2-H final canonical completion waits for one naturally drained farewell before stopping", async ({ page }, testInfo) => {
   await installFakeLive(page);
   await openLessonAndStart(page);
+  const evidence = await startEvidence(page, "q2-h-final-farewell");
   const pcm = await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").pcm as string);
 
   await deliverLive(page, { serverContent: {
@@ -236,7 +238,7 @@ test("Q2-H final canonical completion waits for one naturally drained farewell b
   } });
   await expect.poll(async () => (await readTestState(page)).snapshot.deliveryCursor).toBe(1);
 
-  const beforeFinalBeat = await readTestState(page);
+  const beforeFinalBeat = evidence.observe("before final beat", await readTestState(page));
   expect(beforeFinalBeat.snapshot.currentNodeId).toBe("what-is-a-plc");
   expect(beforeFinalBeat.snapshot.deliveryCursor).toBe(1);
   expect(beforeFinalBeat.snapshot.coverage).toEqual({ "what-is-a-plc": "teaching" });
@@ -254,7 +256,7 @@ test("Q2-H final canonical completion waits for one naturally drained farewell b
   } });
   await expect.poll(async () => (await readTestState(page)).snapshot.deliveryCursor).toBe(2);
 
-  const canonicalComplete = await readTestState(page);
+  const canonicalComplete = evidence.observe("canonical complete", await readTestState(page));
   expect(canonicalComplete.snapshot.coverage).toEqual({ "what-is-a-plc": "taught" });
   expect(canonicalComplete.snapshot.activePresentationBeat).toBeNull();
   expect(canonicalComplete.snapshot.lessonActive).toBe(true);
@@ -300,7 +302,7 @@ test("Q2-H final canonical completion waits for one naturally drained farewell b
   expect(page.getByText("Lesson complete")).toHaveCount(1);
 
   await expect.poll(async () => (await readTestState(page)).snapshot.lessonActive, { timeout: 5_000 }).toBe(false);
-  const stopped = await readTestState(page);
+  const stopped = evidence.observe("stopped", await readTestState(page));
   expect(stopped.snapshot.deliveryCursor).toBe(2);
   expect(stopped.snapshot.coverage).toEqual({ "what-is-a-plc": "taught" });
   expect(stopped.snapshot.activePresentationBeat).toBeNull();
@@ -308,4 +310,8 @@ test("Q2-H final canonical completion waits for one naturally drained farewell b
   expect(stopped.events.filter((event) => event.name === "beat.commit")).toHaveLength(2);
   expect(teachingImperatives(await getLiveSends(page))).toHaveLength(2);
   expect((await getLiveSends(page)).filter(({ message }) => Boolean(message.toolResponse))).toHaveLength(1);
+
+  const evaluation = await expectHardEvidencePass(await evidence.finalize({ endedBy: "lesson-completed" }), testInfo);
+  expect(statusOf(evaluation)).toMatchObject({ H1: "pass", H2: "pass", H3: "pass", H5: "pass", H7: "pass", H10: "pass" });
+  expect(evaluation.corePath).toMatchObject({ status: "complete", requiredCoreBeats: 2, committedCoreBeats: 2 });
 });

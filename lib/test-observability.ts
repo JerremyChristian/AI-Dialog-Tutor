@@ -15,6 +15,8 @@ export const TEST_EVENT_NAMES = [
   "coverage.changed",
   "review.started",
   "review.ended",
+  "tool.decision",
+  "lesson.completed",
 ] as const;
 
 export type TestEventName = (typeof TEST_EVENT_NAMES)[number];

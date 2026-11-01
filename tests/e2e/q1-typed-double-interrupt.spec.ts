@@ -9,6 +9,7 @@ import {
   readTestState,
   textOf,
 } from "../helpers/fake-live";
+import { expectHardEvidencePass, startEvidence, statusOf } from "../helpers/evidence-recorder";
 
 const INITIAL_AUDIO_MARKER = 3_333;
 const STALE_TYPED_RESPONSE_MARKER = 1_111;
@@ -26,10 +27,11 @@ async function playbackRecords(page: Page): Promise<PlaybackRecord[]> {
   return page.evaluate(() => Reflect.get(window, "__QA_TUTOR_PLAYBACK__").records());
 }
 
-test("Q1-F OLD turnComplete cannot erase a typed replacement response before a second interruption", async ({ page }) => {
+test("Q1-F OLD turnComplete cannot erase a typed replacement response before a second interruption", async ({ page }, testInfo) => {
   await installNoExternalNetworkGuard(page);
   await installFakeLive(page, { observeTutorPlayback: true });
   await openLessonAndStart(page);
+  const evidence = await startEvidence(page, "q1-f-typed-double-interrupt");
 
   await deliverLive(page, { serverContent: { modelTurn: { parts: [{
     inlineData: {
@@ -41,6 +43,7 @@ test("Q1-F OLD turnComplete cannot erase a typed replacement response before a s
 
   const typedText = "Wait, explain that another way.";
   const sendsBeforeTypedTurn = (await getLiveSends(page)).length;
+  await evidence.learnerTyped(typedText, { duringTutorOutput: true });
   await page.getByLabel("Type a reply").fill(typedText);
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect.poll(async () => (await getLiveSends(page)).slice(sendsBeforeTypedTurn).some(({ message }) =>
@@ -91,4 +94,7 @@ test("Q1-F OLD turnComplete cannot erase a typed replacement response before a s
   expect.soft((state.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("teaching");
   expect.soft(state.events.map(({ name }) => name)).not.toContain("beat.commit");
   expect(getExternalRequests(page)).toEqual([]);
+
+  const evaluation = await expectHardEvidencePass(await evidence.finalize({ endedBy: "open" }), testInfo);
+  expect(statusOf(evaluation)).toMatchObject({ H2: "not-applicable", H6: "pass", H8: "pass" });
 });

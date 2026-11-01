@@ -3,18 +3,21 @@ import {
   deliverLive, failActiveSocket, getLiveSends, installFakeLive,
   openLessonAndStart, readTestState, textOf,
 } from "../helpers/fake-live";
+import { expectHardEvidencePass, startEvidence, statusOf } from "../helpers/evidence-recorder";
 
 const REVIEWED_NODE = "what-is-a-plc";
 const CANONICAL_NODE = "plc-scan-cycle";
 
-async function startReview(page: Page) {
+async function startReview(page: Page, scenarioId?: string) {
   await installFakeLive(page, { persisted: true, reviewReady: true });
   await openLessonAndStart(page, true);
+  const evidence = scenarioId ? await startEvidence(page, scenarioId) : undefined;
   const before = await readTestState(page);
+  evidence?.observe("before review", before);
   await page.locator(".lesson-roadmap").locator("summary").click();
   await page.getByRole("button", { name: "Review What is a PLC? from start" }).click();
   await expect.poll(async () => (await readTestState(page)).snapshot.reviewActive).toBe(true);
-  return before.snapshot;
+  return Object.assign(before.snapshot, { evidence });
 }
 
 async function finishActiveBeat(page: Page, transcript: string) {
@@ -57,7 +60,7 @@ test("Review starts on a completed leaf and progresses only its review cursor", 
 
   const progressed = await readTestState(page);
   expect(progressed.events).toContainEqual(expect.objectContaining({
-    name: "beat.commit", detail: { mode: "review", conceptId: REVIEWED_NODE, nextIndex: 1 },
+    name: "beat.commit", detail: expect.objectContaining({ mode: "review", conceptId: REVIEWED_NODE, nextIndex: 1 }),
   }));
   expect(progressed.snapshot.activePresentationBeat).toMatchObject({ index: 1, mode: "review" });
   expect(canonicalProjection(progressed.snapshot)).toEqual(canonicalProjection(before));
@@ -77,9 +80,10 @@ test("interruption invalidates the Review beat without canonical interruption or
   expect(interrupted.events.filter((event) => event.name === "interruption.accepted")).toHaveLength(0);
 });
 
-test("Q2-D Review interruption clarification and continue restart the same unconfirmed Review beat", async ({ page }) => {
-  const before = await startReview(page);
-  const reviewStarted = await readTestState(page);
+test("Q2-D Review interruption clarification and continue restart the same unconfirmed Review beat", async ({ page }, testInfo) => {
+  const before = await startReview(page, "q2-d-review-interruption");
+  const evidence = before.evidence!;
+  const reviewStarted = evidence.observe("review started", await readTestState(page));
   const initialReviewBeat = reviewStarted.snapshot.activePresentationBeat;
   expect(initialReviewBeat).toMatchObject({ index: 0, teachingPointIndexes: [0], mode: "review" });
   expect(canonicalProjection(reviewStarted.snapshot)).toEqual(canonicalProjection(before));
@@ -106,7 +110,7 @@ test("Q2-D Review interruption clarification and continue restart the same uncon
   } });
   await deliverLive(page, { serverContent: { turnComplete: true } });
 
-  const clarified = await readTestState(page);
+  const clarified = evidence.observe("review clarified", await readTestState(page));
   expect(clarified.snapshot.reviewActive).toBe(true);
   expect(clarified.snapshot.activePresentationBeat).toBeNull();
   expect(canonicalProjection(clarified.snapshot)).toEqual(canonicalProjection(before));
@@ -121,7 +125,7 @@ test("Q2-D Review interruption clarification and continue restart the same uncon
     action: "query",
     purpose: "continue",
   });
-  const resumed = await readTestState(page);
+  const resumed = evidence.observe("review resumed", await readTestState(page));
   expect(resumed.snapshot.reviewActive).toBe(true);
   expect(resumed.snapshot.activePresentationBeat).toEqual(initialReviewBeat);
   expect(canonicalProjection(resumed.snapshot)).toEqual(canonicalProjection(before));
@@ -133,7 +137,7 @@ test("Q2-D Review interruption clarification and continue restart the same uncon
   await expect.poll(async () => (await readTestState(page)).events.filter((event) =>
     event.name === "beat.commit" && event.detail?.mode === "review").length).toBe(1);
 
-  const progressed = await readTestState(page);
+  const progressed = evidence.observe("review progressed", await readTestState(page));
   expect(progressed.snapshot.reviewActive).toBe(true);
   expect(progressed.snapshot.activePresentationBeat).toMatchObject({
     index: 1,
@@ -146,6 +150,9 @@ test("Q2-D Review interruption clarification and continue restart the same uncon
   expect(progressed.events.filter((event) => event.name === "delivery.cursor-changed")).toHaveLength(0);
   expect(progressed.events.filter((event) => event.name === "coverage.changed")).toHaveLength(0);
   expect(progressed.events.filter((event) => event.name === "review.ended")).toHaveLength(0);
+
+  const evaluation = await expectHardEvidencePass(await evidence.finalize({ endedBy: "open" }), testInfo);
+  expect(statusOf(evaluation)).toMatchObject({ H2: "not-applicable", H3: "pass", H4: "pass", H8: "pass" });
 });
 
 test("final Review beat waits, then continue exits Review and restores canonical lesson", async ({ page }) => {

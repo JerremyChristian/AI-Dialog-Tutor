@@ -528,7 +528,13 @@ export default function Home() {
       activeTeachingBeatRef.current = null;
       audioSession.player?.cancelBatch(epoch);
       addDebugMessage(`Node review beat committed: concept=${nextReview.nodeId}, next=${nextIndex}, complete=${complete}`);
-      emitTestEvent("beat.commit", { mode: "review", conceptId: nextReview.nodeId, nextIndex });
+      emitTestEvent("beat.commit", {
+        mode: "review",
+        conceptId: nextReview.nodeId,
+        nextIndex,
+        generationEpoch: active.generationEpoch,
+        teachingPointIndexes: [...active.teachingPointIndexes],
+      });
       addReviewFlowDiagnostic(
         "review-beat-committed",
         `nextReviewCursor=${nextIndex} nodeComplete=${complete} ` +
@@ -546,7 +552,13 @@ export default function Home() {
     const { state: committedState, previousIndex: currentNext, nextIndex } = evaluation;
     lessonStateRef.current = committedState;
     setLessonState(committedState);
-    emitTestEvent("beat.commit", { mode: "lesson", conceptId: active.conceptId, nextIndex });
+    emitTestEvent("beat.commit", {
+      mode: "lesson",
+      conceptId: active.conceptId,
+      nextIndex,
+      generationEpoch: active.generationEpoch,
+      teachingPointIndexes: [...active.teachingPointIndexes],
+    });
     emitTestEvent("delivery.cursor-changed", { conceptId: active.conceptId, from: currentNext, to: nextIndex });
     emitTestEvent("coverage.changed", { conceptId: active.conceptId, status: committedState.nodes[active.conceptId]?.status });
     activeTeachingBeatRef.current = null;
@@ -1383,6 +1395,7 @@ export default function Home() {
       let result;
       let events: string[] = [];
       let assignmentControl = "";
+      let sessionControlOutcome = "";
       const route = routeToolCall(call.name);
       const lessonCall = route === "lesson_state"
         ? classifyLessonStateCall(action, conceptId, Boolean(nodeReviewRef.current))
@@ -1421,6 +1434,7 @@ export default function Home() {
           wrapUpActive: lessonWrapUpRef.current,
           idleConfirmationActive: engagementStateRef.current === "confirming",
         });
+        sessionControlOutcome = decision.kind;
         switch (decision.kind) {
           case "restart-request":
             conversationalRestartConfirmationRef.current = true;
@@ -1567,6 +1581,23 @@ export default function Home() {
           requestSilentRecovery = true;
         }
       }
+
+      const resultOk = Boolean(result && typeof result === "object" &&
+        (result as { ok?: unknown }).ok === true);
+      emitTestEvent("tool.decision", {
+        name: call.name ?? null,
+        action: typeof action === "string" ? action : null,
+        conceptId: typeof conceptId === "string" ? conceptId : null,
+        outcome: route === "session_control"
+          ? sessionControlOutcome
+          : route === "update_teaching_preferences"
+            ? resultOk ? "applied" : "rejected"
+            : route !== "lesson_state"
+              ? "unknown-tool"
+              : lessonCall?.kind === "transition"
+                ? resultOk ? "transition-applied" : "transition-rejected"
+                : lessonCall?.kind ?? "invalid",
+      });
 
       if (call.name === "lesson_state" && result && typeof result === "object") {
         result = decorateLessonStateResult(result, teachingPreferencesRef.current, assignmentControl);

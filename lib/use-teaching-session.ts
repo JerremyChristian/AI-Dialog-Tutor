@@ -493,12 +493,21 @@ export function useTeachingSession(input: TeachingSessionInput) {
   };
 
   const stopConversation = async (reason?: "inactivity" | "confirmed") => {
+    const wasLessonActive = lessonActiveRef.current;
     conversationRunRef.current += 1;
     const ownedDisposal = captureDisposalOwnership();
     invalidateActiveTeachingBeat("lesson-ended");
     audioSession.player?.clear();
     const hadMicrophone = audioSession.hasMicrophoneStream;
     const hadSession = Boolean(transportRef.current);
+    if (wasLessonActive) {
+      const endingState = lessonStateRef.current;
+      emitTestEvent("lesson.completed", {
+        reason: reason ?? "stopped",
+        planComplete: isLessonPlanComplete(endingState),
+        coverage: Object.fromEntries(Object.values(endingState.nodes).map((node) => [node.id, node.status])),
+      });
+    }
     const stoppedLessonState = pauseLessonForStop();
     const persistedCurrent = getCurrentConcept(stoppedLessonState);
     setMicrophoneStatus("Not active");

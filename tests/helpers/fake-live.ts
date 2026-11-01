@@ -1,8 +1,15 @@
 import { expect, type Page } from "@playwright/test";
+import { buildFixtureSavedLesson, type LessonFixture } from "./lesson-fixture";
 
 export const QA_LESSON_ID = "qa-session-lifecycle-001";
 
 export type LiveSend = { socketId: number; message: Record<string, unknown> };
+// A provider->app frame delivered by the fake socket. `anchor` is the number of
+// app test events already emitted when the frame was handed to the app, which
+// orders frames exactly against app events in Q3 evidence.
+export type LiveReceived = { socketId: number; anchor: number; t: number; body: Record<string, unknown> };
+// Identifies the lesson the fake seeded for this document, for Q3 evidence contracts.
+export type SeededLessonRecord = { fixtureId: string; fixtureVersion: string; lesson: Record<string, unknown> };
 
 const externalRequests = new WeakMap<Page, string[]>();
 const tokenRequests = new WeakMap<Page, number>();
@@ -46,6 +53,8 @@ export async function installFakeLive(page: Page, options: {
   holdFirstStreamerClose?: boolean;
   failTokenRequest?: number;
   observeTutorPlayback?: boolean;
+  /** Seeds this fixture instead of the inline Q2 lesson; Q2 seeding options do not apply to it. */
+  lessonFixture?: LessonFixture;
 } = {}) {
   await page.route("**/auth/v1/**", (route) => route.fulfill({
     status: 401, contentType: "application/json", body: JSON.stringify({ message: "Not signed in" }),
@@ -72,7 +81,7 @@ export async function installFakeLive(page: Page, options: {
       body: JSON.stringify({ token: "local-test-token", source: { name: "plc-notes.txt", mimeType: "text/plain" } }),
     });
   });
-  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences, schemaVersion, cloudOwnerId, secondLesson, additionalConcept, holdFirstPlayerReady, holdFirstStreamerClose, observeTutorPlayback }) => {
+  await page.addInitScript(({ lessonId, persisted, reviewReady, completed, microphoneFailure, persistedCursor, persistedStatus, resumePoint, recentTeachingContext, teachingPreferences, schemaVersion, cloudOwnerId, secondLesson, additionalConcept, holdFirstPlayerReady, holdFirstStreamerClose, observeTutorPlayback, fixtureLesson, fixtureIdentity }) => {
     if (observeTutorPlayback) {
       const NativeAudioContext = window.AudioContext;
       type PlaybackRecord = { id: number; marker: number; startTime: number; stopped: boolean; ended: boolean };
@@ -232,6 +241,7 @@ export async function installFakeLive(page: Page, options: {
     const NativeWebSocket = window.WebSocket;
     const sockets: FakeLiveWebSocket[] = [];
     const sends: Array<{ socketId: number; message: Record<string, unknown> }> = [];
+    const received: Array<{ socketId: number; anchor: number; t: number; body: Record<string, unknown> }> = [];
     const pcm = btoa(String.fromCharCode(...new Uint8Array(8_000)));
 
     class FakeLiveWebSocket extends EventTarget {
@@ -262,6 +272,12 @@ export async function installFakeLive(page: Page, options: {
       deliver(body: Record<string, unknown>) {
         return new Promise<void>((resolve) => setTimeout(() => {
           try {
+            received.push({
+              socketId: this.socketId,
+              anchor: window.__AI_TEACHER_TEST__?.getEvents().length ?? 0,
+              t: Date.now(),
+              body: structuredClone(body),
+            });
             this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(body) }));
           } finally {
             resolve();
@@ -272,6 +288,7 @@ export async function installFakeLive(page: Page, options: {
     Object.defineProperty(window, "WebSocket", { configurable: true, value: FakeLiveWebSocket });
     Reflect.set(window, "__QA_LIVE__", {
       sends: () => structuredClone(sends),
+      received: () => structuredClone(received),
       socketCount: () => sockets.length,
       socketState: (socketId: number) => sockets[socketId]?.readyState,
       deliver: (body: Record<string, unknown>, socketId = sockets.length - 1) => sockets[socketId]?.deliver(body),
@@ -308,7 +325,7 @@ export async function installFakeLive(page: Page, options: {
         completionCriteria: ["Name the scan-cycle stages."], deliveryUnits: [{ objective: "Introduce the scan cycle.", teachingPointIndexes: [0], completionCriteriaIndexes: [0], presentationBeats: [{ teachingPointIndexes: [0] }] }], type: "procedure", importance: "core",
       },
     };
-    const lesson = {
+    const inlineLesson = {
       schemaVersion, id: lessonId, title: "PLC Fundamentals", lessonFocus: "PLC fundamentals", hasStarted: persisted || completed,
       source: { metadata: { name: "plc-notes.txt", mimeType: "text/plain", sizeBytes: 128, status: "ready" }, prepared: {
         name: "plc-notes.txt", mimeType: "text/plain", text: "A PLC is a rugged industrial computer used to control machines and processes.",
@@ -322,9 +339,19 @@ export async function installFakeLive(page: Page, options: {
       }, teachingContractProgress: { "what-is-a-plc": { nextTeachingPointIndex: persistedCursor }, ...(reviewReady || additionalConcept ? { "plc-scan-cycle": { nextTeachingPointIndex: 0 } } : {}) }, resumePoint, interruptionCount: persistedStatus === "interrupted" ? 1 : 0, lastUserTranscript: "not persisted by snapshots", lastAssistantTranscript: "not persisted by snapshots" },
       recentTeachingContext, teachingPreferences, createdAt: now, updatedAt: now, cloudOwnerId,
     };
+    const lesson = fixtureLesson ? fixtureLesson as unknown as typeof inlineLesson : inlineLesson;
     const seedMarker = `__qa_lesson_seeded__:${lessonId}`;
-    if (sessionStorage.getItem(seedMarker)) return;
+    // The seeded lesson is the Q3 evidence contract's starting state; it survives
+    // reloads in this tab so evidence can be finalized after openLessonAndStart.
+    const seededRecordKey = `__qa_seeded_record__:${lessonId}`;
+    const publishSeeded = () => {
+      const stored = sessionStorage.getItem(seededRecordKey);
+      if (stored) Reflect.set(window, "__QA_SEEDED_LESSON__", JSON.parse(stored));
+    };
+    if (sessionStorage.getItem(seedMarker)) { publishSeeded(); return; }
     sessionStorage.setItem(seedMarker, "true");
+    sessionStorage.setItem(seededRecordKey, JSON.stringify({ ...fixtureIdentity, lesson }));
+    publishSeeded();
     const request = indexedDB.open("ai-dialog-tutor", 2);
     request.onupgradeneeded = () => { const db = request.result;
       if (!db.objectStoreNames.contains("savedLessons")) db.createObjectStore("savedLessons", { keyPath: "id" }).createIndex("updatedAt", "updatedAt");
@@ -374,6 +401,16 @@ export async function installFakeLive(page: Page, options: {
     holdFirstPlayerReady: options.holdFirstPlayerReady ?? false,
     holdFirstStreamerClose: options.holdFirstStreamerClose ?? false,
     observeTutorPlayback: options.observeTutorPlayback ?? false,
+    fixtureLesson: options.lessonFixture
+      ? buildFixtureSavedLesson(options.lessonFixture, QA_LESSON_ID, {
+        now: new Date().toISOString(),
+        schemaVersion: options.schemaVersion,
+        cloudOwnerId: options.cloudOwnerId,
+      })
+      : null,
+    fixtureIdentity: options.lessonFixture
+      ? { fixtureId: options.lessonFixture.fixtureId, fixtureVersion: options.lessonFixture.fixtureVersion }
+      : { fixtureId: "q2-inline-plc", fixtureVersion: "1" },
   });
 }
 
@@ -419,6 +456,10 @@ export async function openLessonAndStart(page: Page, persisted = false) {
   await expect.poll(async () => (await getLiveSends(page)).filter((item) => item.message.realtimeInput).length).toBeGreaterThan(0);
 }
 
+export async function getLiveReceived(page: Page): Promise<LiveReceived[]> { return page.evaluate(() => Reflect.get(window, "__QA_LIVE__").received()); }
+export async function getSeededLesson(page: Page): Promise<SeededLessonRecord | undefined> {
+  return page.evaluate(() => Reflect.get(window, "__QA_SEEDED_LESSON__") as SeededLessonRecord | undefined);
+}
 export async function getLiveSends(page: Page): Promise<LiveSend[]> { return page.evaluate(() => Reflect.get(window, "__QA_LIVE__").sends()); }
 export async function deliverLive(page: Page, body: Record<string, unknown>, socketId?: number) {
   await page.evaluate(({ value, targetSocket }) =>
