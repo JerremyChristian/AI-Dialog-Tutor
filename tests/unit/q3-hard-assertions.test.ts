@@ -251,6 +251,14 @@ describe("H7 completion integrity", () => {
   it("fails when the harness waited for completion that never happened", () => {
     expectFail(checkH7(new SyntheticTrace().build("lesson-completed")), /never completed the lesson/);
   });
+
+  it("fails an inactivity completion with no observable idle or end attribution", () => {
+    const trace = new SyntheticTrace();
+    trace.app("clarification.started", { source: "typed" });
+    trace.complete("inactivity", false);
+
+    expectFail(checkH7(trace.build("lesson-completed")), /without a preceding idle or end event/);
+  });
 });
 
 describe("H8 logical interruption integrity", () => {
