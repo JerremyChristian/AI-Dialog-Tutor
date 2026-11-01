@@ -68,6 +68,15 @@ describe("aggregate verdict", () => {
     expect(evaluateHardAssertions(trace.build("aborted", { category: "provider", message: "Live 503" })).verdict).toBe("fail");
   });
 
+  it("keeps a partial open packet inconclusive instead of passing it", () => {
+    const trace = new SyntheticTrace();
+    trace.deliver("what-is-a-plc", [0]).snap("partial capture");
+
+    const evaluation = evaluateHardAssertions(trace.build("open"));
+    expect(evaluation.assertions.some(({ status }) => status === "fail")).toBe(false);
+    expect(evaluation.verdict).toBe("inconclusive");
+  });
+
   it.each([
     ["all applicable pass", ["pass", "pass", "not-applicable"], "open", "pass"],
     ["only not-applicable", ["not-applicable", "not-applicable"], "open", "pass"],
