@@ -1,7 +1,8 @@
 import { expect, test, type Page } from "@playwright/test";
 import { expectHardEvidencePass, startEvidence, statusOf } from "../helpers/evidence-recorder";
 import {
-  deliverLive, getLiveSends, installFakeLive, openLessonAndStart, readTestState,
+  deliverLive, getLiveSends, holdSavedLessonWrites, installFakeLive, openLessonAndStart, readSavedLesson,
+  readTestState, releaseSavedLessonWrites,
 } from "../helpers/fake-live";
 import { PLC_Q3_FIXTURE } from "../helpers/lesson-fixture";
 import { evaluateHardAssertions } from "../q3/assertions/hard";
@@ -171,4 +172,58 @@ test("Q3-A finalized evidence is one immutable artifact and rejects further capt
     concurrent.finalize({ endedBy: "open" }),
   ]);
   expect(settled.map(({ status }) => status).sort()).toEqual(["fulfilled", "rejected"]);
+});
+
+test.describe("Q3-A live capture boundary", () => {
+  type Saved = { lessonState: { currentNodeId: string; nodes: Record<string, { status: string }>;
+    teachingContractProgress: Record<string, { nextTeachingPointIndex: number }> } };
+  const lateCapture = /Evidence must start before canonical progress diverges/;
+
+  test("refuses when live coverage advances while persistence is held at the seed", async ({ page }) => {
+    await installFakeLive(page, { lessonFixture: PLC_Q3_FIXTURE });
+    await openLessonAndStart(page);
+    await holdSavedLessonWrites(page);
+    await sendTool(page, "skip-history-early", "lesson_state", { action: "skip", conceptId: "plc-history" });
+    expect((await readTestState(page)).snapshot.coverage).toMatchObject({ "plc-history": "skipped" });
+
+    await expect(startEvidence(page, "q3a-late-coverage")).rejects.toThrow(lateCapture);
+    await releaseSavedLessonWrites(page);
+  });
+
+  test("refuses when the live current concept changes while persistence is held at the seed", async ({ page }) => {
+    await installFakeLive(page, { lessonFixture: PLC_Q3_FIXTURE });
+    await openLessonAndStart(page);
+    await holdSavedLessonWrites(page);
+    await sendTool(page, "jump-ahead", "lesson_state", { action: "navigate", conceptId: "plc-scan-cycle" });
+    expect((await readTestState(page)).snapshot.currentNodeId).toBe("plc-scan-cycle");
+
+    await expect(startEvidence(page, "q3a-late-concept")).rejects.toThrow(lateCapture);
+    await releaseSavedLessonWrites(page);
+  });
+
+  test("still refuses once persisted progress has caught up", async ({ page }) => {
+    await installFakeLive(page, { lessonFixture: PLC_Q3_FIXTURE });
+    await openLessonAndStart(page);
+    await deliverBeat(page, "PLC means programmable logic controller.");
+    await expect.poll(async () => (await readSavedLesson<Saved>(page))?.lessonState
+      .teachingContractProgress["what-is-a-plc"].nextTeachingPointIndex, { timeout: 10_000 }).toBe(1);
+
+    await expect(startEvidence(page, "q3a-late-persisted")).rejects.toThrow(lateCapture);
+  });
+
+  test("starts during transient noncanonical activity with unchanged canonical progress", async ({ page }) => {
+    await installFakeLive(page, { lessonFixture: PLC_Q3_FIXTURE });
+    await openLessonAndStart(page);
+    await deliverLive(page, { serverContent: { modelTurn: { parts: [{
+      inlineData: { mimeType: "audio/pcm;rate=24000", data: Buffer.alloc(96_000).toString("base64") },
+    }] }, outputTranscription: { text: "PLC means" } } });
+    await page.getByLabel("Type a reply").fill("Wait, say that again?");
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await expect.poll(async () => (await readTestState(page)).events
+      .some(({ name }) => name === "interruption.accepted")).toBe(true);
+
+    const evidence = await startEvidence(page, "q3a-start-after-interruption");
+    const packet = await evidence.finalize({ endedBy: "open" });
+    expect(evaluateHardAssertions(packet).assertions.filter(({ status }) => status === "fail")).toEqual([]);
+  });
 });

@@ -7,7 +7,8 @@ import { evaluateHardAssertions, type HardEvaluation } from "../q3/assertions/ha
 import { measurePerformance } from "../q3/assertions/performance";
 import { buildEvidencePacket } from "../q3/evidence/build";
 import type { EvidenceHarness, EvidencePacket, RawHarnessEvent, RawSnapshot } from "../q3/evidence/types";
-import { getLiveReceived, getSeededLesson, readSavedLesson, readTestState } from "./fake-live";
+import { liveCaptureDivergence } from "../q3/evidence/capture-boundary";
+import { getLiveReceived, readSavedLesson, readTestState, type SeededLessonRecord } from "./fake-live";
 
 type TestState = Awaited<ReturnType<typeof readTestState>>;
 
@@ -21,14 +22,28 @@ const documentOrigin = (page: Page) => page.evaluate(() => performance.timeOrigi
 export async function startEvidence(page: Page, scenarioId: string) {
   const snapshots: RawSnapshot[] = [];
   const harnessEvents: RawHarnessEvent[] = [];
-  const origin = await documentOrigin(page);
-  const seededAtStart = await getSeededLesson(page);
+  // One browser-side read: the seed, live canonical state and the events that
+  // would prove progress are observed together, with no gap between them.
+  const start = await page.evaluate(() => ({
+    origin: performance.timeOrigin,
+    seeded: Reflect.get(window, "__QA_SEEDED_LESSON__") as SeededLessonRecord | undefined,
+    snapshot: window.__AI_TEACHER_TEST__?.getSnapshot() ?? null,
+    events: window.__AI_TEACHER_TEST__?.getEvents() ?? [],
+  }));
+  const { origin } = start;
+  const seededAtStart = start.seeded;
   if (!seededAtStart) throw new Error("Evidence requires a fake-Live seeded lesson");
+  const lateBecause = liveCaptureDivergence(seededAtStart.lesson, start.snapshot, start.events);
+  if (lateBecause) {
+    throw new Error(`Evidence must start before canonical progress diverges from the seeded lesson (${lateBecause})`);
+  }
+  // Second line of defence: persistence is debounced, so it can only lag the
+  // live check above, but a persisted divergence is still disqualifying.
   type Progress = { lessonState?: { teachingContractProgress?: Record<string, { nextTeachingPointIndex?: number }> } };
   const cursors = (lesson: Progress | undefined) => JSON.stringify(Object.entries(lesson?.lessonState?.teachingContractProgress ?? {})
     .map(([id, progress]) => [id, progress?.nextTeachingPointIndex ?? 0]).sort());
   if (cursors(await readSavedLesson<Progress>(page)) !== cursors(seededAtStart.lesson as Progress)) {
-    throw new Error("Evidence must start before canonical progress diverges from the seeded lesson");
+    throw new Error("Evidence must start before canonical progress diverges from the seeded lesson (persisted cursors moved)");
   }
 
   // One lifecycle: capturing -> finalized. finalize claims the transition
