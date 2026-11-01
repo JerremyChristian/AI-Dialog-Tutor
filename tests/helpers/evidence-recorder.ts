@@ -31,6 +31,18 @@ export async function startEvidence(page: Page, scenarioId: string) {
     throw new Error("Evidence must start before canonical progress diverges from the seeded lesson");
   }
 
+  // One lifecycle: capturing -> finalized. finalize claims the transition
+  // before its first await, so even concurrent calls yield exactly one packet;
+  // afterwards every mutation is rejected rather than silently accepted.
+  let lifecycle: "capturing" | "finalized" = "capturing";
+  const assertCapturing = (action: string) => {
+    if (lifecycle === "finalized") throw new Error(`Evidence capture already finalized; cannot ${action}`);
+  };
+  const recordSnapshot = (label: string, state: TestState) => {
+    snapshots.push({ label, anchor: state.events.length, snapshot: state.snapshot });
+    return state;
+  };
+
   const pageClock = () => page.evaluate(() => ({
     anchor: window.__AI_TEACHER_TEST__?.getEvents().length ?? 0,
     t: Date.now(),
@@ -39,27 +51,39 @@ export async function startEvidence(page: Page, scenarioId: string) {
   return {
     /** Records a state the test already read; its anchor is the event count it saw. */
     observe(label: string, state: TestState) {
-      snapshots.push({ label, anchor: state.events.length, snapshot: state.snapshot });
-      return state;
+      assertCapturing(`observe "${label}"`);
+      return recordSnapshot(label, state);
     },
     async snapshot(label: string) {
-      return this.observe(label, await readTestState(page));
+      assertCapturing(`snapshot "${label}"`);
+      const state = await readTestState(page);
+      assertCapturing(`snapshot "${label}"`);
+      return recordSnapshot(label, state);
     },
     /** Call immediately before the UI send, so app events it causes sort after it. */
     async learnerTyped(text: string, options: { duringTutorOutput: boolean }) {
-      harnessEvents.push({ ...(await pageClock()), name: "harness.learner-text", detail: { text, ...options } });
+      assertCapturing("record a learner turn");
+      const clock = await pageClock();
+      assertCapturing("record a learner turn");
+      harnessEvents.push({ ...clock, name: "harness.learner-text", detail: { text, ...options } });
     },
     async stopRequested() {
-      harnessEvents.push({ ...(await pageClock()), name: "harness.stop-requested" });
+      assertCapturing("record a stop request");
+      const clock = await pageClock();
+      assertCapturing("record a stop request");
+      harnessEvents.push({ ...clock, name: "harness.stop-requested" });
     },
+    /** Produces the single packet for this capture; any later call rejects. */
     async finalize(harness: { endedBy: EvidenceHarness["endedBy"]; abort?: EvidenceHarness["abort"]; notes?: string[] }) {
+      assertCapturing("finalize again");
+      lifecycle = "finalized";
       if (await documentOrigin(page) !== origin) {
         throw new Error("The page reloaded during evidence capture; app events no longer cover the session");
       }
       const seeded = seededAtStart;
       // One read supplies both the final snapshot and the events, so the
       // snapshot is always anchored after the last app event in the packet.
-      const state = this.observe("finalize", await readTestState(page));
+      const state = recordSnapshot("finalize", await readTestState(page));
       return buildEvidencePacket({
         seeded,
         appEvents: state.events,

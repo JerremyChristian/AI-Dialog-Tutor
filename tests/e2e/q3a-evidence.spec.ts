@@ -4,7 +4,9 @@ import {
   deliverLive, getLiveSends, installFakeLive, openLessonAndStart, readTestState,
 } from "../helpers/fake-live";
 import { PLC_Q3_FIXTURE } from "../helpers/lesson-fixture";
+import { evaluateHardAssertions } from "../q3/assertions/hard";
 import { measurePerformance } from "../q3/assertions/performance";
+import { verifyPacketHash } from "../q3/evidence/build";
 
 const pcmOf = (page: Page) => page.evaluate(() => Reflect.get(window, "__QA_LIVE__").pcm as string);
 const eventCount = async (page: Page, name: string) =>
@@ -123,4 +125,41 @@ test("Q3-A evidence capture refuses duplicate finalization", async ({ page }) =>
   await evidence.finalize({ endedBy: "open" });
 
   await expect(evidence.finalize({ endedBy: "open" })).rejects.toThrow(/already finalized/i);
+});
+
+test("Q3-A finalized evidence is one immutable artifact and rejects further capture", async ({ page }) => {
+  await installFakeLive(page, { lessonFixture: PLC_Q3_FIXTURE });
+  await openLessonAndStart(page);
+  const evidence = await startEvidence(page, "q3a-finalize-once");
+  evidence.observe("before finalize", await readTestState(page));
+
+  const packet = await evidence.finalize({ endedBy: "open" });
+  const serialized = JSON.stringify(packet);
+  const { packetId, packetHash } = packet;
+  expect(packet.snapshots.filter(({ label }) => label === "finalize")).toHaveLength(1);
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await expect(evidence.finalize({ endedBy: "open" })).rejects.toThrow(/already finalized/i);
+    await expect(evidence.finalize({ endedBy: "lesson-completed" })).rejects.toThrow(/already finalized/i);
+  }
+  const state = await readTestState(page);
+  expect(() => evidence.observe("late", state)).toThrow(/already finalized/i);
+  await expect(evidence.snapshot("late")).rejects.toThrow(/already finalized/i);
+  await expect(evidence.learnerTyped("late", { duringTutorOutput: false })).rejects.toThrow(/already finalized/i);
+  await expect(evidence.stopRequested()).rejects.toThrow(/already finalized/i);
+
+  expect(JSON.stringify(packet)).toBe(serialized);
+  expect(packet.packetId).toBe(packetId);
+  expect(packet.packetHash).toBe(packetHash);
+  expect(verifyPacketHash(packet)).toBe(true);
+  expect(Object.isFrozen(packet.snapshots)).toBe(true);
+  expect(evaluateHardAssertions(packet).verdict).toBe("inconclusive");
+
+  // Concurrent finalize calls on a fresh capture still produce exactly one packet.
+  const concurrent = await startEvidence(page, "q3a-finalize-concurrent");
+  const settled = await Promise.allSettled([
+    concurrent.finalize({ endedBy: "open" }),
+    concurrent.finalize({ endedBy: "open" }),
+  ]);
+  expect(settled.map(({ status }) => status).sort()).toEqual(["fulfilled", "rejected"]);
 });
