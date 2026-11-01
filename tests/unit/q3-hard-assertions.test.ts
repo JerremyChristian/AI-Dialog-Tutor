@@ -78,11 +78,15 @@ describe("aggregate verdict", () => {
   });
 
   it.each([
-    ["all applicable pass", ["pass", "pass", "not-applicable"], "open", "pass"],
-    ["only not-applicable", ["not-applicable", "not-applicable"], "open", "pass"],
-    ["one unsupported", ["pass", "unsupported", "not-applicable"], "open", "inconclusive"],
+    ["finished, all applicable pass", ["pass", "pass", "not-applicable"], "lesson-completed", "pass"],
+    ["harness-stopped, all applicable pass", ["pass", "pass"], "harness-stop", "pass"],
+    ["finished, only not-applicable", ["not-applicable", "not-applicable"], "lesson-completed", "pass"],
+    ["one unsupported", ["pass", "unsupported", "not-applicable"], "lesson-completed", "inconclusive"],
     ["multiple unsupported", ["unsupported", "pass", "unsupported"], "lesson-completed", "inconclusive"],
-    ["unsupported plus fail", ["unsupported", "fail", "pass"], "open", "fail"],
+    ["unsupported plus fail", ["unsupported", "fail", "pass"], "lesson-completed", "fail"],
+    ["open without fail", ["pass", "not-applicable"], "open", "inconclusive"],
+    ["open with unsupported", ["pass", "unsupported"], "open", "inconclusive"],
+    ["open with fail", ["pass", "fail"], "open", "fail"],
     ["aborted without fail", ["pass", "not-applicable"], "aborted", "inconclusive"],
     ["aborted with unsupported", ["unsupported"], "aborted", "inconclusive"],
     ["aborted with fail", ["pass", "fail"], "aborted", "fail"],

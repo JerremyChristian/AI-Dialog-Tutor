@@ -71,7 +71,11 @@ export async function startEvidence(page: Page, scenarioId: string) {
   };
 }
 
-/** Attaches packet + evaluation to the test report and asserts no hard violation. */
+/**
+ * Attaches packet + evaluation to the test report and asserts that no hard
+ * assertion failed or was unsupported. A finished capture must then pass; an
+ * open (mid-session) capture is partial evidence, so its verdict is inconclusive.
+ */
 export async function expectHardEvidencePass(packet: EvidencePacket, testInfo: TestInfo): Promise<HardEvaluation> {
   const evaluation = evaluateHardAssertions(packet);
   const performance = measurePerformance(packet);
@@ -81,7 +85,9 @@ export async function expectHardEvidencePass(packet: EvidencePacket, testInfo: T
   });
   const failures = evaluation.assertions.filter(({ status }) => status === "fail");
   expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
-  expect(evaluation.verdict).toBe("pass");
+  const unsupported = evaluation.assertions.filter(({ status }) => status === "unsupported");
+  expect(unsupported, JSON.stringify(unsupported, null, 2)).toEqual([]);
+  expect(evaluation.verdict).toBe(packet.harness.endedBy === "open" ? "inconclusive" : "pass");
   return evaluation;
 }
 

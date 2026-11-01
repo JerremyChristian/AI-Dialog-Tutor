@@ -34,8 +34,9 @@ export type HardEvaluation = {
   packetHash: string;
   /**
    * fail: any hard violation. inconclusive: no violation, but an applicable
-   * assertion was unsupported or the harness aborted. pass: every applicable
-   * assertion was proven. not-applicable assertions never affect the verdict.
+   * assertion was unsupported or the capture is partial (open or aborted).
+   * pass: a finished capture where every applicable assertion was proven.
+   * not-applicable assertions never affect the verdict.
    */
   verdict: "pass" | "fail" | "inconclusive";
   assertions: HardAssertionResult[];
@@ -637,13 +638,21 @@ export function checkH10(packet: EvidencePacket): HardAssertionResult {
 
 export const HARD_ASSERTIONS = [checkH1, checkH2, checkH3, checkH4, checkH5, checkH6, checkH7, checkH8, checkH10];
 
-/** Precedence: fail, then unsupported or aborted (inconclusive), then pass. */
+/** Captures that ended with the session; open (cut mid-session) and aborted ones are partial. */
+const FINAL_CAPTURE_ENDINGS: ReadonlySet<EvidencePacket["harness"]["endedBy"]> =
+  new Set(["lesson-completed", "harness-stop"]);
+
+/**
+ * Precedence: any fail -> fail; otherwise an unsupported assertion or a
+ * partial capture (open or aborted) -> inconclusive; otherwise pass.
+ */
 export function aggregateVerdict(
   assertions: Pick<HardAssertionResult, "status">[],
   endedBy: EvidencePacket["harness"]["endedBy"],
 ): HardEvaluation["verdict"] {
   if (assertions.some(({ status }) => status === "fail")) return "fail";
-  if (assertions.some(({ status }) => status === "unsupported") || endedBy === "aborted") return "inconclusive";
+  if (assertions.some(({ status }) => status === "unsupported")) return "inconclusive";
+  if (!FINAL_CAPTURE_ENDINGS.has(endedBy)) return "inconclusive";
   return "pass";
 }
 
