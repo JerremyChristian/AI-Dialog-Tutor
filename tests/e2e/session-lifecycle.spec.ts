@@ -191,3 +191,109 @@ test("Q2-B confused learner response preserves canonical progress until explicit
   expect(textOf(continueResponse!.message)).toContain("A PLC repeatedly reads inputs, executes logic, and updates outputs.");
   expect(textOf(continueResponse!.message)).toContain("APP_CONTROL:TEACH_PRESENTATION_BEAT");
 });
+
+test("Q2-F rapid double interruption follows the latest clarification then resumes the original beat once", async ({ page }) => {
+  await installFakeLive(page);
+  await openLessonAndStart(page);
+  const pcm = await page.evaluate(() => Reflect.get(window, "__QA_LIVE__").pcm as string);
+  const original = await readTestState(page);
+  const originalBeat = original.snapshot.activePresentationBeat;
+  expect(originalBeat).toMatchObject({ index: 0, teachingPointIndexes: [0], mode: "lesson" });
+  expect(original.snapshot.deliveryCursor).toBe(0);
+
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "A PLC is a rugged industrial computer." },
+  } });
+  await page.getByLabel("Type a reply").fill("Wait, what does that mean?");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(async () => (await readTestState(page)).snapshot.interruptionCount).toBe(1);
+  const afterFirstInterruption = await readTestState(page);
+  expect(afterFirstInterruption.snapshot.interruptionCount).toBe(1);
+  expect(afterFirstInterruption.snapshot.deliveryCursor).toBe(0);
+  expect(afterFirstInterruption.snapshot.activePresentationBeat).toBeNull();
+  expect(afterFirstInterruption.events.filter((event) => event.name === "interruption.accepted")).toHaveLength(1);
+  expect(afterFirstInterruption.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+
+  await deliverLive(page, { serverContent: { interrupted: true } });
+  await deliverLive(page, { serverContent: { turnComplete: true } });
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "It means the controller is designed for harsh factory conditions." },
+  } });
+  const firstClarification = await readTestState(page);
+  expect(firstClarification.snapshot.tutorAudioPlaying).toBe(true);
+  expect(firstClarification.snapshot.deliveryCursor).toBe(0);
+  expect(firstClarification.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+
+  await deliverLive(page, {
+    voiceActivity: { voiceActivityType: "ACTIVITY_START" },
+    serverContent: { interrupted: true },
+  });
+  const afterSecondInterruption = await readTestState(page);
+  expect(afterSecondInterruption.snapshot.interruptionCount).toBe(2);
+  expect(afterSecondInterruption.snapshot.tutorAudioPlaying).toBe(false);
+  expect(afterSecondInterruption.snapshot.deliveryCursor).toBe(0);
+  expect((afterSecondInterruption.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("teaching");
+  expect(afterSecondInterruption.events.filter((event) => event.name === "interruption.accepted")).toHaveLength(2);
+  expect(afterSecondInterruption.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+
+  await deliverLive(page, { serverContent: {
+    inputTranscription: { text: "Actually, I mean why is that important?", finished: true },
+    turnComplete: true,
+  } });
+  await deliverLive(page, { voiceActivity: { voiceActivityType: "ACTIVITY_END" } });
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "It matters because reliable control keeps industrial machinery operating safely." },
+    generationComplete: true,
+  } });
+  await deliverLive(page, { serverContent: { turnComplete: true } });
+
+  const afterSecondClarification = await readTestState(page);
+  expect(afterSecondClarification.snapshot.deliveryCursor).toBe(0);
+  expect((afterSecondClarification.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("teaching");
+  expect(afterSecondClarification.snapshot.activePresentationBeat).toBeNull();
+  expect(afterSecondClarification.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+  const visibleConversation = page.locator(".conversation-transcript-body");
+  await expect(visibleConversation).toContainText("Actually, I mean why is that important?");
+  await expect(visibleConversation).toContainText("It matters because reliable control keeps industrial machinery operating safely.");
+  await expect(visibleConversation).not.toContainText("designed for harsh factory conditions");
+
+  await deliverLive(page, { serverContent: {
+    inputTranscription: { text: "Okay, continue.", finished: true },
+  } });
+  await deliverLive(page, { toolCall: { functionCalls: [{
+    id: "continue-after-double-interruption",
+    name: "lesson_state",
+    args: { action: "query", purpose: "continue" },
+  }] } });
+  await expect.poll(async () => (await getLiveSends(page))
+    .filter(({ message }) => Boolean(message.toolResponse)).length).toBe(1);
+
+  const resumed = await readTestState(page);
+  expect(resumed.snapshot.activePresentationBeat).toEqual(originalBeat);
+  expect(resumed.snapshot.deliveryCursor).toBe(0);
+  expect((resumed.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("teaching");
+  expect(resumed.events.filter((event) => event.name === "beat.commit")).toHaveLength(0);
+  const continueResponse = (await getLiveSends(page)).find(({ message }) => Boolean(message.toolResponse));
+  expect(textOf(continueResponse!.message)).toContain("PLC means programmable logic controller");
+  expect(textOf(continueResponse!.message)).toContain("APP_CONTROL:TEACH_PRESENTATION_BEAT");
+
+  await deliverLive(page, { serverContent: {
+    modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: pcm } }] },
+    outputTranscription: { text: "A PLC means programmable logic controller." },
+    generationComplete: true,
+  } });
+  await expect.poll(async () => (await readTestState(page)).snapshot.deliveryCursor).toBe(1);
+
+  const completed = await readTestState(page);
+  expect(completed.events.filter((event) => event.name === "beat.commit")).toHaveLength(1);
+  expect(completed.events.filter((event) => event.name === "beat.commit")[0]).toMatchObject({
+    detail: { mode: "lesson", conceptId: "what-is-a-plc", nextIndex: 1 },
+  });
+  expect(completed.snapshot.deliveryCursor).toBe(1);
+  expect((completed.snapshot.coverage as Record<string, string>)["what-is-a-plc"]).toBe("teaching");
+  expect(completed.snapshot.activePresentationBeat).toMatchObject({ index: 1, mode: "lesson" });
+  expect(completed.snapshot.lessonActive).toBe(true);
+});
