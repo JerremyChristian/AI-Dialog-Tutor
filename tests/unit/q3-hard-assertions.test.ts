@@ -77,6 +77,15 @@ describe("aggregate verdict", () => {
     expect(evaluation.verdict).toBe("inconclusive");
   });
 
+  it("does not pass a finished packet with no canonical snapshots", () => {
+    const trace = validFullSession();
+    trace.snapshots.length = 0;
+
+    const evaluation = evaluateHardAssertions(trace.build("lesson-completed"));
+    expect(evaluation.assertions.some(({ status }) => status === "fail")).toBe(false);
+    expect(evaluation.verdict).toBe("inconclusive");
+  });
+
   it.each([
     ["finished, all applicable pass", ["pass", "pass", "not-applicable"], "lesson-completed", "pass"],
     ["harness-stopped, all applicable pass", ["pass", "pass"], "harness-stop", "pass"],
