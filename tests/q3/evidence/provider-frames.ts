@@ -5,23 +5,36 @@
 export type NormalizedProviderEvent = { name: string; detail?: Record<string, unknown> };
 
 const SECRET_KEY_PATTERN = /^(access_?token|token|api_?key|key|authorization|secret|password)$/i;
+// Header-style names whose last `-`/`_` segment is sensitive, e.g. X-Custom-Auth, x-goog-api-key.
+const SECRET_KEY_SUFFIX_PATTERN = /[-_](auth|authorization|api[-_]?key|token|secret|password|cookie|credentials?)$/i;
 const SECRET_QUERY_PATTERN = /([?&](?:access_token|key|token)=)[^&\s"]+/gi;
 const EPHEMERAL_TOKEN_PATTERN = /\bauth_tokens\/[A-Za-z0-9._-]+/g;
+// An HTTP auth scheme followed by a credential-shaped value: 8+ token chars that
+// include a digit, or 20+ token chars. Prose such as "Bearer tokens are used
+// for authorization" has no such value and is left intact.
+const AUTH_SCHEME_CREDENTIAL_PATTERN =
+  /\b(Bearer|Basic)\s+(?:(?=[A-Za-z0-9._~+/-]*\d)[A-Za-z0-9._~+/-]{8,}|[A-Za-z0-9._~+/-]{20,})=*/gi;
 
 export const REDACTED = "[redacted]";
 
-/** Deep-copies a JSON value, redacting secret-named fields and secret query parameters. */
+const isSecretKey = (key: string) => SECRET_KEY_PATTERN.test(key) || SECRET_KEY_SUFFIX_PATTERN.test(key);
+
+/**
+ * Deep-copies a JSON value, redacting secret-named fields, secret query
+ * parameters and auth-scheme credentials wherever they appear as values.
+ */
 export function redactSecrets<T>(value: T): T {
   if (typeof value === "string") {
     return value
       .replace(SECRET_QUERY_PATTERN, `$1${REDACTED}`)
-      .replace(EPHEMERAL_TOKEN_PATTERN, `auth_tokens/${REDACTED}`) as T;
+      .replace(EPHEMERAL_TOKEN_PATTERN, `auth_tokens/${REDACTED}`)
+      .replace(AUTH_SCHEME_CREDENTIAL_PATTERN, `$1 ${REDACTED}`) as T;
   }
   if (Array.isArray(value)) return value.map((item) => redactSecrets(item)) as T;
   if (value && typeof value === "object") {
     return Object.fromEntries(Object.entries(value).map(([key, item]) => [
       key,
-      SECRET_KEY_PATTERN.test(key) ? REDACTED : redactSecrets(item),
+      isSecretKey(key) ? REDACTED : redactSecrets(item),
     ])) as T;
   }
   return value;

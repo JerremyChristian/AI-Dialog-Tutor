@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { measurePerformance } from "../q3/assertions/performance";
 import { buildContract, buildEvidencePacket, verifyPacketHash } from "../q3/evidence/build";
-import { normalizeProviderFrame, redactSecrets } from "../q3/evidence/provider-frames";
+import { normalizeProviderFrame, REDACTED, redactSecrets } from "../q3/evidence/provider-frames";
 import { SyntheticTrace, validFullSession } from "../q3/evidence/synthetic-trace";
 import { EVIDENCE_PACKET_SCHEMA, EVIDENCE_PACKET_SCHEMA_VERSION, type EvidencePacket } from "../q3/evidence/types";
 import { buildFixtureSavedLesson, countFixtureBeats, PLC_Q3_FIXTURE } from "../helpers/lesson-fixture";
@@ -79,6 +79,76 @@ describe("provider frame normalization", () => {
     expect(json).not.toContain("q3-provider-secret");
     expect(json).toContain("lesson_state");
     expect(json).toContain("query");
+  });
+
+  describe("credential redaction by key and by value", () => {
+    it("redacts standard sensitive keys", () => {
+      const redacted = redactSecrets({
+        Authorization: "Bearer abc123def456", api_key: "k-1", token: "t-1", password: "p", "x-goog-api-key": "AIza-1",
+      });
+      expect(Object.values(redacted)).toEqual(Array(5).fill(REDACTED));
+    });
+
+    it("redacts a bearer credential by value under a key that is not sensitive", () => {
+      const redacted = redactSecrets({ meta: { forwarded: "Bearer sk-live-9f8e7d6c5b" } });
+      expect(redacted.meta.forwarded).toBe(`Bearer ${REDACTED}`);
+    });
+
+    it("redacts auth-scheme credentials inside nested arrays and embedded text", () => {
+      const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJxMyJ9.c2lnbmF0dXJlLXZhbHVl";
+      const redacted = redactSecrets({
+        calls: [{ args: { lines: ["curl -H 'Authorization: Bearer abc123def456' https://x", `Basic ${jwt}`] } }],
+      });
+      const json = JSON.stringify(redacted);
+      for (const secret of ["abc123def456", jwt]) expect(json).not.toContain(secret);
+      expect(redacted.calls[0].args.lines[0]).toBe(`curl -H 'Authorization: Bearer ${REDACTED}' https://x`);
+    });
+
+    it("removes URL credentials while keeping the rest of the URL", () => {
+      const url = redactSecrets("https://generativelanguage.googleapis.com/ws/Live?key=AIza-q3&alt=json");
+      expect(url).toBe(`https://generativelanguage.googleapis.com/ws/Live?key=${REDACTED}&alt=json`);
+    });
+
+    it("keeps educational text and ordinary fields that only mention auth words", () => {
+      const prose = "Bearer tokens are commonly used for HTTP authorization; an API key or auth token proves identity.";
+      const value = {
+        text: prose,
+        topic: "Bearer authentication",
+        author: "Ada",
+        maxTokens: 3,
+        token_count: 12,
+        action: "query",
+        conceptId: "what-is-a-plc",
+      };
+      expect(redactSecrets(value)).toEqual(value);
+      const events = normalizeProviderFrame({ serverContent: { outputTranscription: { text: prose } } });
+      expect(events[0].detail).toEqual({ text: prose });
+    });
+
+    it("keeps tool identity and arguments while redacting the credential inside them", () => {
+      const [event] = normalizeProviderFrame({ toolCall: { functionCalls: [{
+        id: "call-7", name: "lesson_state",
+        args: { action: "navigate", conceptId: "plc-scan-cycle", note: "Bearer q3secret12345" },
+      }] } });
+      expect(event.detail).toEqual({ calls: [{
+        id: "call-7", name: "lesson_state",
+        args: { action: "navigate", conceptId: "plc-scan-cycle", note: `Bearer ${REDACTED}` },
+      }] });
+    });
+
+    it("redacts credentials in app and harness details on the packet path", () => {
+      const packet = buildEvidencePacket({
+        seeded: new SyntheticTrace().seeded,
+        appEvents: [{ name: "tool.decision", timestamp: 1, detail: { name: "lesson_state", note: "Bearer abc123def456" } }],
+        providerFrames: [],
+        harnessEvents: [{ anchor: 0, t: 1, name: "harness.learner-text", detail: { text: "my key is Bearer zz9-secret-77" } }],
+        snapshots: [],
+        harness: { kind: "q2-scripted", scenarioId: "redaction", endedBy: "open" },
+      });
+      const json = JSON.stringify(packet);
+      for (const secret of ["abc123def456", "zz9-secret-77"]) expect(json).not.toContain(secret);
+      expect(json).toContain("lesson_state");
+    });
   });
 });
 
