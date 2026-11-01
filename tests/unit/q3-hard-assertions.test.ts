@@ -245,6 +245,21 @@ describe("H3 interrupted beats never commit; commits follow natural drain", () =
     trace.commit({ conceptId: beat.conceptId, teachingPointIndexes: beat.teachingPointIndexes });
     expectFail(checkH3(trace.build()), /no generationEpoch correlation/);
   });
+
+  it("fails when a generation epoch is reused by a newer assignment", () => {
+    const trace = new SyntheticTrace();
+    const beat = trace.assign("what-is-a-plc", [0]);
+    trace.speak(beat.generationEpoch, "First owner").drain(beat.generationEpoch);
+    trace.app("lesson.generation-started", {
+      conceptId: "what-is-a-plc",
+      generationEpoch: beat.generationEpoch,
+      deliveryUnitIndex: 0,
+      beatIndex: 1,
+    });
+    trace.speak(beat.generationEpoch, "Second owner").drain(beat.generationEpoch).commit(beat);
+
+    expectFail(checkH3(trace.build()), /generation epoch 1 was assigned more than once/);
+  });
 });
 
 describe("H4 Review isolation", () => {
