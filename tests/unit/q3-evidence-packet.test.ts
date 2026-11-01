@@ -80,6 +80,15 @@ describe("EvidencePacket construction", () => {
     expect(verifyPacketHash(tampered)).toBe(false);
   });
 
+  it("rejects a packet whose finalized packet identity was changed", () => {
+    const packet = validFullSession().build("lesson-completed");
+    const tampered = structuredClone(packet);
+
+    tampered.packetId = "different-finalized-packet";
+
+    expect(verifyPacketHash(tampered)).toBe(false);
+  });
+
   it("orders frames and harness events exactly against app events by anchor", () => {
     const trace = new SyntheticTrace();
     const beat = trace.assign("what-is-a-plc", [0]);
