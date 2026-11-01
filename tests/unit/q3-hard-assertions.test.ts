@@ -384,6 +384,75 @@ describe("H8 logical interruption integrity", () => {
     trace.frame({ voiceActivity: { voiceActivityType: "ACTIVITY_START" }, serverContent: { interrupted: true } });
     expectFail(checkH8(trace.build()), /voice barge-in during tutor output was not accepted/);
   });
+
+  describe("acceptance cardinality per learner trigger", () => {
+    it("passes two genuine triggers that are each accepted exactly once", () => {
+      const trace = new SyntheticTrace();
+      const first = trace.assign("what-is-a-plc", [0]);
+      trace.speak(first.generationEpoch, "PLC means").typedInterrupt(first.generationEpoch, "wait");
+      const second = trace.assign("what-is-a-plc", [0]);
+      trace.speak(second.generationEpoch, "PLC means").typedInterrupt(second.generationEpoch, "hold on");
+      const result = checkH8(trace.build());
+      expect(result.status).toBe("pass");
+      expect(result.violations).toEqual([]);
+    });
+
+    it("gives a later learner trigger its own acceptance instead of counting it twice", () => {
+      // Typed barge-in, then a voice trigger before any new tutor output (the
+      // Q1-F shape): the second acceptance belongs to the second trigger.
+      const trace = new SyntheticTrace();
+      const beat = trace.assign("what-is-a-plc", [0]);
+      trace.speak(beat.generationEpoch, "PLC means").typedInterrupt(beat.generationEpoch, "wait");
+      trace.frame({ voiceActivity: { voiceActivityType: "ACTIVITY_START" }, serverContent: { interrupted: true } });
+      trace.app("interruption.accepted", { conceptId: "what-is-a-plc", interruptionCount: 2 });
+      expect(checkH8(trace.build()).status).toBe("pass");
+    });
+
+    it("fails when the acceptance invalidates the wrong epoch", () => {
+      const trace = new SyntheticTrace();
+      const beat = trace.assign("what-is-a-plc", [0]);
+      trace.speak(beat.generationEpoch, "PLC means").typed("wait", true);
+      trace.app("audio.epoch-invalidated", { reason: "barge-in", invalidatedEpoch: 99, generationEpoch: 2 });
+      trace.app("interruption.accepted", { conceptId: "what-is-a-plc", interruptionCount: 1 });
+      expectFail(checkH8(trace.build()), /did not invalidate the interrupted beat epoch 1/);
+    });
+
+    it("fails when the interrupted canonical epoch later commits", () => {
+      const trace = new SyntheticTrace();
+      const beat = trace.assign("what-is-a-plc", [0]);
+      trace.speak(beat.generationEpoch, "PLC means").typedInterrupt(beat.generationEpoch, "wait");
+      trace.drain(beat.generationEpoch).commit(beat);
+      expectFail(checkH8(trace.build()), /interrupted beat epoch 1 committed after typed learner turn/);
+    });
+
+    it("does not treat a learner turn after a natural drain as a barge-in", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]);
+      trace.typed("Okay, makes sense.", true);
+      const result = checkH8(trace.build());
+      expect(result.status).toBe("not-applicable");
+      expect(result.notes.join(" ")).toMatch(/no open tutor output is evidenced/);
+    });
+
+    it("accepts a noncanonical Review interruption once, without interruption.accepted", () => {
+      const trace = new SyntheticTrace();
+      trace.app("review.started", { nodeId: "what-is-a-plc" });
+      trace.speak(++trace.epoch, "Reviewing: PLC means");
+      trace.typed("wait", true);
+      trace.app("audio.epoch-invalidated", { reason: "barge-in", invalidatedEpoch: trace.epoch, generationEpoch: trace.epoch + 1 });
+      expect(checkH8(trace.build()).status).toBe("pass");
+    });
+
+    it("fails when a Review interruption is accepted twice", () => {
+      const trace = new SyntheticTrace();
+      trace.app("review.started", { nodeId: "what-is-a-plc" });
+      trace.speak(++trace.epoch, "Reviewing: PLC means");
+      trace.typed("wait", true);
+      trace.app("audio.epoch-invalidated", { reason: "barge-in", invalidatedEpoch: trace.epoch, generationEpoch: trace.epoch + 1 });
+      trace.app("audio.epoch-invalidated", { reason: "barge-in", invalidatedEpoch: trace.epoch + 1, generationEpoch: trace.epoch + 2 });
+      expectFail(checkH8(trace.build()), /learner interruption was accepted 2 times/);
+    });
+  });
 });
 
 describe("H10 internal-control leakage", () => {

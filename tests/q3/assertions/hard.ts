@@ -535,6 +535,16 @@ export function checkH8(packet: EvidencePacket): HardAssertionResult {
     return closed ? null : { start, epoch };
   };
 
+  // Every learner trigger, evaluated or not, owns the events up to the next one.
+  const isLearnerTrigger = (event: EvidenceEvent) =>
+    (event.source === "harness" && event.name === "harness.learner-text") ||
+    (event.name === "provider.voice-activity" && event.detail?.type === "ACTIVITY_START");
+  const reviewActiveAt = (seq: number) => {
+    const latest = events.findLast((event) => event.seq < seq &&
+      (app(event, "review.started") || app(event, "review.ended")));
+    return Boolean(latest && latest.name === "review.started");
+  };
+
   const verify = (trigger: EvidenceEvent, label: string, claimed: boolean) => {
     const open = openEpochBefore(trigger.seq);
     if (!open) {
@@ -542,12 +552,23 @@ export function checkH8(packet: EvidencePacket): HardAssertionResult {
       return;
     }
     checked += 1;
-    const nextOutput = events.find((event) => event.seq > trigger.seq && app(event, "tutor.audio-started"));
-    const window = events.filter((event) => event.seq > trigger.seq && event.seq < (nextOutput?.seq ?? Number.POSITIVE_INFINITY));
-    const accepted = window.some((event) => app(event, "interruption.accepted") ||
-      (app(event, "audio.epoch-invalidated") && event.detail?.reason === "barge-in"));
-    if (!accepted) {
+    const windowEnd = events.find((event) => event.seq > trigger.seq &&
+      (app(event, "tutor.audio-started") || isLearnerTrigger(event)))?.seq ?? Number.POSITIVE_INFINITY;
+    const window = events.filter((event) => event.seq > trigger.seq && event.seq < windowEnd);
+    // Review interruptions are deliberately noncanonical: the runtime invalidates
+    // the Review beat but emits no interruption.accepted. Elsewhere acceptance
+    // is interruption.accepted. Either way, exactly one per learner trigger.
+    const review = reviewActiveAt(trigger.seq);
+    const acceptances = window.filter((event) => review
+      ? app(event, "audio.epoch-invalidated") && event.detail?.reason === "barge-in"
+      : app(event, "interruption.accepted"));
+    if (acceptances.length === 0) {
       violations.push({ message: `${label} during tutor output was not accepted as an interruption`, evidence: [trigger.id, open.start.id] });
+    } else if (acceptances.length > 1) {
+      violations.push({
+        message: `learner interruption was accepted ${acceptances.length} times for one ${label}`,
+        evidence: [trigger.id, ...acceptances.map(({ id }) => id)],
+      });
     }
     if (open.epoch !== null && beatEpochs.has(open.epoch)) {
       const invalidated = window.some((event) => app(event, "audio.epoch-invalidated") &&
@@ -573,7 +594,7 @@ export function checkH8(packet: EvidencePacket): HardAssertionResult {
       if (sameFrameInterrupted) verify(event, "voice barge-in", false);
     }
   }
-  return result("H8", "Learner interruption during tutor output is accepted and invalidates the beat", violations, checked > 0, notes);
+  return result("H8", "Each learner interruption during tutor output is accepted exactly once and invalidates the beat", violations, checked > 0, notes);
 }
 
 // ---- H10: internal-control leakage ----
