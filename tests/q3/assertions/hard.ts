@@ -242,21 +242,35 @@ export function checkH2(packet: EvidencePacket): HardAssertionResult {
 
 export function checkH3(packet: EvidencePacket): HardAssertionResult {
   const violations: Violation[] = [];
+  // Every generation (lesson beat, Review beat, farewell) is allocated a fresh
+  // epoch by the runtime, so an epoch has exactly one owner: at most one
+  // assignment, one natural drain and one commit. Repeats are never replays;
+  // the first owner is kept and every repeat is a violation, never an overwrite.
   const started = new Map<number, EvidenceEvent>();
   const drained = new Map<number, EvidenceEvent>();
+  const committed = new Map<number, EvidenceEvent>();
   const invalidated = new Map<number, EvidenceEvent>();
+  const recordOwner = (owners: Map<number, EvidenceEvent>, epoch: number, event: EvidenceEvent, what: string) => {
+    const first = owners.get(epoch);
+    if (first) {
+      violations.push({ message: `generation epoch ${epoch} was ${what} more than once`, evidence: [first.id, event.id] });
+      return false;
+    }
+    owners.set(epoch, event);
+    return true;
+  };
   let applicable = false;
   for (const event of packet.events) {
     if (app(event, "lesson.generation-started")) {
       const epoch = num(event, "generationEpoch");
-      if (epoch !== null) started.set(epoch, event);
+      if (epoch !== null) recordOwner(started, epoch, event, "assigned");
     } else if (app(event, "tutor.audio-ended") && event.detail?.natural === true) {
       const epoch = num(event, "generationEpoch");
-      if (epoch !== null) drained.set(epoch, event);
+      if (epoch !== null) recordOwner(drained, epoch, event, "naturally drained");
     } else if (app(event, "audio.epoch-invalidated")) {
       applicable = true;
       const epoch = num(event, "invalidatedEpoch");
-      if (epoch !== null) invalidated.set(epoch, event);
+      if (epoch !== null && !invalidated.has(epoch)) invalidated.set(epoch, event);
     } else if (app(event, "beat.commit")) {
       applicable = true;
       const epoch = num(event, "generationEpoch");
@@ -264,12 +278,18 @@ export function checkH3(packet: EvidencePacket): HardAssertionResult {
         violations.push({ message: "beat.commit has no generationEpoch correlation", evidence: [event.id] });
         continue;
       }
+      recordOwner(committed, epoch, event, "committed");
       const invalidation = invalidated.get(epoch);
       if (invalidation) {
         violations.push({ message: `epoch ${epoch} committed after it was invalidated (${str(invalidation, "reason")})`, evidence: [invalidation.id, event.id] });
       }
-      if (isReviewCommit(event)) continue;
       const start = started.get(epoch);
+      if (isReviewCommit(event)) {
+        if (start) {
+          violations.push({ message: `Review commit reuses canonical lesson epoch ${epoch}`, evidence: [start.id, event.id] });
+        }
+        continue;
+      }
       if (!start) {
         violations.push({ message: `lesson commit for epoch ${epoch} has no teaching assignment`, evidence: [event.id] });
       } else if (str(start, "conceptId") !== str(event, "conceptId")) {
@@ -281,7 +301,15 @@ export function checkH3(packet: EvidencePacket): HardAssertionResult {
       }
     }
   }
-  return result("H3", "Interrupted beats never commit; commits follow natural drain", violations, applicable);
+  // A lesson assignment made after a Review commit already owned the epoch.
+  for (const [epoch, start] of started) {
+    const prior = committed.get(epoch);
+    if (prior && isReviewCommit(prior) && prior.seq < start.seq) {
+      violations.push({ message: `lesson assignment reuses Review epoch ${epoch}`, evidence: [prior.id, start.id] });
+    }
+  }
+  return result("H3", "Each epoch has one owner; interrupted beats never commit; commits follow natural drain",
+    violations, applicable);
 }
 
 // ---- H4: Review isolation ----

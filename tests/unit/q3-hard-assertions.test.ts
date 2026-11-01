@@ -260,6 +260,85 @@ describe("H3 interrupted beats never commit; commits follow natural drain", () =
 
     expectFail(checkH3(trace.build()), /generation epoch 1 was assigned more than once/);
   });
+
+  describe("generation epoch ownership", () => {
+    const assignment = (trace: SyntheticTrace, conceptId: string, generationEpoch: number, beatIndex = 0) =>
+      trace.app("lesson.generation-started", { conceptId, generationEpoch, deliveryUnitIndex: 0, beatIndex });
+
+    it("passes distinct epochs for distinct beats, including a retried beat on a new epoch", () => {
+      const trace = new SyntheticTrace();
+      const first = trace.assign("what-is-a-plc", [0]);
+      trace.speak(first.generationEpoch, "PLC means").typedInterrupt(first.generationEpoch, "wait");
+      trace.deliver("what-is-a-plc", [0]).deliver("what-is-a-plc", [1]);
+      const result = checkH3(trace.build());
+      expect(result.status).toBe("pass");
+      expect(new Set(trace.appEvents.filter(({ name }) => name === "lesson.generation-started")
+        .map(({ detail }) => detail?.generationEpoch)).size).toBe(3);
+    });
+
+    it("fails when one epoch is assigned to two different concepts", () => {
+      const trace = new SyntheticTrace();
+      const beat = trace.assign("what-is-a-plc", [0]);
+      assignment(trace, "plc-scan-cycle", beat.generationEpoch);
+      trace.speak(beat.generationEpoch, "Scan cycle").drain(beat.generationEpoch).commit(beat);
+      expectFail(checkH3(trace.build()), /generation epoch 1 was assigned more than once/);
+    });
+
+    it("rejects a duplicate assignment even to the identical owner (no replay mechanism exists)", () => {
+      const trace = new SyntheticTrace();
+      const beat = trace.assign("what-is-a-plc", [0]);
+      assignment(trace, "what-is-a-plc", beat.generationEpoch);
+      trace.speak(beat.generationEpoch, "PLC means").drain(beat.generationEpoch).commit(beat);
+      expectFail(checkH3(trace.build()), /generation epoch 1 was assigned more than once/);
+    });
+
+    it("fails when a Review commit reuses a canonical lesson epoch", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]).deliver("what-is-a-plc", [1]);
+      trace.app("review.started", { nodeId: "what-is-a-plc" });
+      trace.commit({ conceptId: "what-is-a-plc", teachingPointIndexes: [0], generationEpoch: 1 }, "review");
+      expectFail(checkH3(trace.build()), /Review commit reuses canonical lesson epoch 1/);
+    });
+
+    it("fails when a lesson assignment reuses an epoch a Review commit already owned", () => {
+      const trace = new SyntheticTrace();
+      trace.app("review.started", { nodeId: "what-is-a-plc" });
+      trace.commit({ conceptId: "what-is-a-plc", teachingPointIndexes: [0], generationEpoch: 5 }, "review");
+      trace.app("review.ended", { nodeId: "what-is-a-plc", reason: "manual" });
+      assignment(trace, "what-is-a-plc", 5);
+      expectFail(checkH3(trace.build()), /lesson assignment reuses Review epoch 5/);
+    });
+
+    it("fails when the drain belongs to a different epoch than the commit", () => {
+      const trace = new SyntheticTrace();
+      const beat = trace.assign("what-is-a-plc", [0]);
+      const other = trace.assign("what-is-a-plc", [1]);
+      trace.speak(other.generationEpoch, "Second point").drain(other.generationEpoch).commit(beat);
+      expectFail(checkH3(trace.build()), /lesson commit for epoch 1 without a natural audio drain of that epoch/);
+    });
+
+    it("fails when one epoch's lifecycle is combined with another epoch's commit", () => {
+      // Epoch 1 is assigned and drains; the commit claims epoch 2, assigned later
+      // and never drained, while citing epoch 1's beat.
+      const trace = new SyntheticTrace();
+      const beat = trace.assign("what-is-a-plc", [0]);
+      trace.speak(beat.generationEpoch, "PLC means").drain(beat.generationEpoch);
+      const later = trace.assign("what-is-a-plc", [0]);
+      trace.commit({ ...beat, generationEpoch: later.generationEpoch });
+      expectFail(checkH3(trace.build()), /lesson commit for epoch 2 without a natural audio drain of that epoch/);
+    });
+
+    it("fails when one epoch commits twice or drains twice", () => {
+      const trace = new SyntheticTrace();
+      const beat = trace.assign("what-is-a-plc", [0]);
+      trace.speak(beat.generationEpoch, "PLC means").drain(beat.generationEpoch).drain(beat.generationEpoch);
+      trace.commit(beat);
+      trace.app("beat.commit", { mode: "lesson", conceptId: "what-is-a-plc", nextIndex: 2, teachingPointIndexes: [1], generationEpoch: 1 });
+      const result = checkH3(trace.build());
+      expectFail(result, /generation epoch 1 was naturally drained more than once/);
+      expectFail(result, /generation epoch 1 was committed more than once/);
+    });
+  });
 });
 
 describe("H4 Review isolation", () => {
