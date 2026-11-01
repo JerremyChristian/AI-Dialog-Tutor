@@ -3,7 +3,7 @@ import { measurePerformance } from "../q3/assertions/performance";
 import { buildContract, buildEvidencePacket, verifyPacketHash } from "../q3/evidence/build";
 import { normalizeProviderFrame, redactSecrets } from "../q3/evidence/provider-frames";
 import { SyntheticTrace, validFullSession } from "../q3/evidence/synthetic-trace";
-import { EVIDENCE_PACKET_SCHEMA, EVIDENCE_PACKET_SCHEMA_VERSION } from "../q3/evidence/types";
+import { EVIDENCE_PACKET_SCHEMA, EVIDENCE_PACKET_SCHEMA_VERSION, type EvidencePacket } from "../q3/evidence/types";
 import { buildFixtureSavedLesson, countFixtureBeats, PLC_Q3_FIXTURE } from "../helpers/lesson-fixture";
 import { parseSavedLesson } from "../../lib/local-persistence";
 
@@ -87,6 +87,58 @@ describe("EvidencePacket construction", () => {
     tampered.packetId = "different-finalized-packet";
 
     expect(verifyPacketHash(tampered)).toBe(false);
+  });
+
+  describe("packetHash authenticates every finalized field except itself", () => {
+    type Mutable = EvidencePacket;
+    const finalized = () => validFullSession().build("lesson-completed");
+    const tamper = (mutate: (packet: Mutable) => void) => {
+      const copy = structuredClone(finalized());
+      mutate(copy);
+      return verifyPacketHash(copy);
+    };
+
+    it("verifies an unchanged packet, including after JSON serialize and parse", () => {
+      const packet = finalized();
+      expect(verifyPacketHash(packet)).toBe(true);
+      expect(verifyPacketHash(JSON.parse(JSON.stringify(packet)))).toBe(true);
+    });
+
+    it("is deterministic and covers the default content-derived packetId", () => {
+      const first = finalized();
+      const second = finalized();
+      expect(second.packetId).toBe(first.packetId);
+      expect(second.packetHash).toBe(first.packetHash);
+      expect(first.packetId).toMatch(/^synthetic-[0-9a-f]{12}$/);
+    });
+
+    it.each([
+      ["packetHash", (packet: Mutable) => { packet.packetHash = "0".repeat(64); }],
+      ["packetId", (packet: Mutable) => { packet.packetId = "different-finalized-packet"; }],
+      ["schemaVersion", (packet: Mutable) => { (packet as { schemaVersion: number }).schemaVersion = 2; }],
+      ["event name", (packet: Mutable) => { packet.events[0].name = "edited"; }],
+      ["nested event detail", (packet: Mutable) => {
+        const commit = packet.events.find(({ name }) => name === "beat.commit")!;
+        (commit.detail!.teachingPointIndexes as number[])[0] = 9;
+      }],
+      ["event removal", (packet: Mutable) => { packet.events.splice(3, 1); }],
+      ["event reordering", (packet: Mutable) => { [packet.events[1], packet.events[2]] = [packet.events[2], packet.events[1]]; }],
+      ["contract", (packet: Mutable) => { packet.contract.initial.cursors["what-is-a-plc"] = 1; }],
+      ["nested contract beat", (packet: Mutable) => { packet.contract.concepts[0].beats[0][0] = 1; }],
+      ["snapshot canonical coverage", (packet: Mutable) => { packet.snapshots[0].canonical.coverage["plc-history"] = "skipped"; }],
+      ["turn text", (packet: Mutable) => { packet.turns[0].text = "rewritten"; }],
+      ["audio summary", (packet: Mutable) => { packet.audioSummary.naturalDrains += 1; }],
+      ["harness endedBy", (packet: Mutable) => { packet.harness.endedBy = "open"; }],
+      ["added field", (packet: Mutable) => { (packet as Record<string, unknown>).extra = true; }],
+    ])("fails verification after %s mutation", (_label, mutate) => {
+      expect(tamper(mutate)).toBe(false);
+    });
+
+    it("stays immutable after finalization", () => {
+      const packet = finalized();
+      expect(Object.isFrozen(packet.contract.concepts[0].beats[0])).toBe(true);
+      expect(() => { (packet as { packetId: string }).packetId = "x"; }).toThrow();
+    });
   });
 
   it("orders frames and harness events exactly against app events by anchor", () => {

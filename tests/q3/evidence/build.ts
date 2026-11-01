@@ -270,13 +270,15 @@ export function buildEvidencePacket(raw: RawEvidence): EvidencePacket {
       notes: raw.harness.notes ?? [],
     },
   };
-  const packetHash = sha256(body);
-  const packetId = raw.packetId ?? `${raw.harness.scenarioId}-${packetHash.slice(0, 12)}`;
-  return deepFreeze({ ...body, packetId, packetHash });
+  // The default id comes from a content digest, not from packetHash, so the
+  // hash can cover the id without circularity.
+  const packetId = raw.packetId ?? `${raw.harness.scenarioId}-${sha256(body).slice(0, 12)}`;
+  const finalized = { ...body, packetId };
+  return deepFreeze({ ...finalized, packetHash: sha256(finalized) });
 }
 
-/** True when the packet still matches the hash recorded at finalization. */
+/** True when every finalized field except packetHash still matches packetHash. */
 export function verifyPacketHash(packet: EvidencePacket) {
-  const { packetHash, packetId: _packetId, ...body } = packet;
-  return sha256(body) === packetHash;
+  const { packetHash, ...finalized } = packet;
+  return sha256(finalized) === packetHash;
 }
