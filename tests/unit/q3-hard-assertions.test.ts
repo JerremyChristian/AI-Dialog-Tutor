@@ -202,6 +202,91 @@ describe("H1 canonical cursor and navigation integrity", () => {
     expectFail(checkH1(trace.build()), /current concept changed what-is-a-plc -> plc-scan-cycle/);
   });
 
+  describe("navigation destination attribution", () => {
+    it("passes when the snapshot shows the navigation target", () => {
+      const trace = new SyntheticTrace();
+      trace.snap("start").navigate("plc-scan-cycle").snap("at target");
+      expect(checkH1(trace.build()).status).toBe("pass");
+    });
+
+    it("fails when navigation to B is followed by a snapshot at C", () => {
+      const trace = new SyntheticTrace();
+      trace.snap("start").navigate("plc-scan-cycle").snap("elsewhere", { currentNodeId: "plc-io-modules", deliveryCursor: 0 });
+      expectFail(checkH1(trace.build()),
+        /current concept changed what-is-a-plc -> plc-io-modules; the latest navigation or assignment targets plc-scan-cycle/);
+    });
+
+    it("passes backward navigation to an earlier concept", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]).navigate("plc-scan-cycle").snap("forward");
+      trace.navigate("what-is-a-plc").snap("back");
+      expect(checkH1(trace.build()).status).toBe("pass");
+    });
+
+    it("passes forward navigation across concepts", () => {
+      const trace = new SyntheticTrace();
+      trace.snap("start").navigate("plc-io-modules").snap("jumped ahead");
+      expect(checkH1(trace.build()).status).toBe("pass");
+    });
+
+    it("correlates multiple navigations with the latest target", () => {
+      const trace = new SyntheticTrace();
+      trace.snap("start").navigate("plc-scan-cycle").navigate("plc-io-modules").snap("at second target");
+      expect(checkH1(trace.build()).status).toBe("pass");
+
+      const stale = new SyntheticTrace();
+      stale.snap("start").navigate("plc-scan-cycle").navigate("plc-io-modules")
+        .snap("at first target", { currentNodeId: "plc-scan-cycle", deliveryCursor: 0 });
+      expectFail(checkH1(stale.build()),
+        /changed what-is-a-plc -> plc-scan-cycle; the latest navigation or assignment targets plc-io-modules/);
+    });
+
+    it("does not let an earlier navigation explain a later unrelated change", () => {
+      const trace = new SyntheticTrace();
+      trace.snap("start").navigate("plc-scan-cycle").snap("at target");
+      trace.snap("moved again", { currentNodeId: "plc-io-modules", deliveryCursor: 0 });
+      expectFail(checkH1(trace.build()),
+        /current concept changed plc-scan-cycle -> plc-io-modules without an applied navigation or teaching assignment/);
+    });
+
+    it("passes automatic advancement supported by commits and the next assignment", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]).deliver("what-is-a-plc", [1]).snap("first finished");
+      trace.deliver("plc-scan-cycle", [0]).snap("advanced");
+      expect(checkH1(trace.build()).status).toBe("pass");
+    });
+
+    it("passes Q2-C skip then navigate in runtime order", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]).snap("teaching");
+      trace.frame({ toolCall: { functionCalls: [
+        { id: "s1", name: "lesson_state", args: { action: "skip", conceptId: "what-is-a-plc" } },
+        { id: "n1", name: "lesson_state", args: { action: "navigate", conceptId: "plc-scan-cycle" } },
+      ] } });
+      trace.skip("what-is-a-plc");
+      trace.assign("plc-scan-cycle", [0]);
+      trace.navigate("plc-scan-cycle").snap("after skip and navigate");
+      expect(checkH1(trace.build()).status).toBe("pass");
+    });
+
+    it("passes go-back then resume at the first uncommitted beat", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]).navigate("plc-scan-cycle");
+      trace.deliver("plc-scan-cycle", [0]).snap("ahead");
+      trace.navigate("what-is-a-plc").snap("went back");
+      trace.deliver("what-is-a-plc", [1]).snap("finished first");
+      trace.navigate("plc-scan-cycle").deliver("plc-scan-cycle", [1, 2]).snap("resumed at first uncommitted");
+      expect(checkH1(trace.build()).status).toBe("pass");
+    });
+
+    it("fails when the snapshot disagrees with an applied navigation by staying put", () => {
+      const trace = new SyntheticTrace();
+      trace.snap("start").navigate("plc-scan-cycle").snap("unmoved", { currentNodeId: "what-is-a-plc", deliveryCursor: 0 });
+      expectFail(checkH1(trace.build()),
+        /current concept stayed what-is-a-plc; the latest navigation or assignment targets plc-scan-cycle/);
+    });
+  });
+
   it("fails when a cursor change is not paired with a lesson commit", () => {
     const trace = new SyntheticTrace();
     trace.app("delivery.cursor-changed", { conceptId: "what-is-a-plc", from: 0, to: 1 });

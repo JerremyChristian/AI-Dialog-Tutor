@@ -218,17 +218,33 @@ export function checkH1(packet: EvidencePacket): HardAssertionResult {
         });
       }
     }
-    if (currentNodeId && currentNodeId !== previousNode) {
+    // The destination is set, in order, by each applied navigate (its target)
+    // and each lesson assignment (its concept); the latest one wins, so a
+    // navigation never explains a move anywhere but its own target.
+    const between = events.filter(({ seq }) => seq > previousSeq && seq <= snapshot.afterSeq);
+    let destination: { conceptId: string; eventId: string } | null = null;
+    for (const event of between) {
+      const conceptId = str(event, "conceptId");
+      if (!conceptId) continue;
+      if ((isAppliedTransition(event) && event.detail?.action === "navigate") ||
+          app(event, "lesson.generation-started")) destination = { conceptId, eventId: event.id };
+    }
+    if (currentNodeId && currentNodeId !== previousNode && !destination) {
       applicable = true;
-      const between = events.filter(({ seq }) => seq > previousSeq && seq <= snapshot.afterSeq);
-      const explained = between.some((event) => isAppliedTransition(event) ||
-        (app(event, "lesson.generation-started") && str(event, "conceptId") === currentNodeId));
-      if (!explained) {
-        violations.push({
-          message: `current concept changed ${previousNode} -> ${currentNodeId} without an applied navigation or teaching assignment`,
-          evidence: [snapshot.id],
-        });
-      }
+      violations.push({
+        message: `current concept changed ${previousNode} -> ${currentNodeId} without an applied navigation or teaching assignment`,
+        evidence: [snapshot.id],
+      });
+    } else if (currentNodeId && destination && currentNodeId !== destination.conceptId) {
+      applicable = true;
+      violations.push({
+        message: currentNodeId === previousNode
+          ? `current concept stayed ${currentNodeId}; the latest navigation or assignment targets ${destination.conceptId}`
+          : `current concept changed ${previousNode} -> ${currentNodeId}; the latest navigation or assignment targets ${destination.conceptId}`,
+        evidence: [snapshot.id, destination.eventId],
+      });
+    } else if (currentNodeId && currentNodeId !== previousNode) {
+      applicable = true;
     }
     if (currentNodeId) previousNode = currentNodeId;
     previousSeq = snapshot.afterSeq;
