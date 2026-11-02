@@ -193,6 +193,15 @@ describe("H1 canonical cursor and navigation integrity", () => {
     expectFail(checkH1(trace.build()), /current concept changed what-is-a-plc -> plc-scan-cycle/);
   });
 
+  it("does not let navigation to one concept explain a jump to another", () => {
+    const trace = new SyntheticTrace();
+    trace.snap("start");
+    trace.decision("lesson_state", "navigate", "plc-history", "transition-applied");
+    trace.snap("wrong destination", { currentNodeId: "plc-scan-cycle", deliveryCursor: 0 });
+
+    expectFail(checkH1(trace.build()), /current concept changed what-is-a-plc -> plc-scan-cycle/);
+  });
+
   it("fails when a cursor change is not paired with a lesson commit", () => {
     const trace = new SyntheticTrace();
     trace.app("delivery.cursor-changed", { conceptId: "what-is-a-plc", from: 0, to: 1 });
