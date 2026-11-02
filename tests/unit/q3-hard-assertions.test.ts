@@ -499,6 +499,104 @@ describe("H5 Core Path integrity", () => {
 
     expectFail(checkH5(trace.build("lesson-completed")), /core concept plc-scan-cycle left at 0\/3/);
   });
+
+  describe("concept-specific attribution", () => {
+    const attributionOf = (packet: ReturnType<SyntheticTrace["build"]>, conceptId: string) =>
+      evaluateHardAssertions(packet).corePath.incompleteCoreConcepts.find((concept) => concept.conceptId === conceptId)?.attributedTo;
+    const eventId = (packet: ReturnType<SyntheticTrace["build"]>, action: string, conceptId: string) =>
+      packet.events.find(({ name, detail }) => name === "tool.decision" && detail?.action === action && detail?.conceptId === conceptId)!.id;
+
+    it("completes the Core Path when only the optional concept is never touched", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]).deliver("what-is-a-plc", [1]);
+      trace.deliver("plc-scan-cycle", [0]).deliver("plc-scan-cycle", [1, 2]);
+      trace.deliver("plc-io-modules", [0]).deliver("plc-io-modules", [1]).snap("final");
+      const packet = trace.build("lesson-completed");
+      expect(checkH5(packet).status).toBe("pass");
+      expect(evaluateHardAssertions(packet).corePath).toMatchObject({ status: "complete", incompleteCoreConcepts: [] });
+    });
+
+    it("attributes a skipped required concept to that skip only", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]).deliver("what-is-a-plc", [1]);
+      trace.skip("plc-scan-cycle");
+      trace.deliver("plc-io-modules", [0]).deliver("plc-io-modules", [1]).snap("final");
+      const packet = trace.build("lesson-completed");
+      expect(checkH5(packet).status).toBe("pass");
+      expect(attributionOf(packet, "plc-scan-cycle")).toEqual([eventId(packet, "skip", "plc-scan-cycle")]);
+    });
+
+    it("fails when a skip of one Core concept is the only explanation for another missing one", () => {
+      const trace = new SyntheticTrace();
+      trace.skip("what-is-a-plc");
+      trace.deliver("plc-scan-cycle", [0]).deliver("plc-scan-cycle", [1, 2]);
+      const packet = trace.build("lesson-completed");
+      const result = checkH5(packet);
+      expectFail(result, /core concept plc-io-modules left at 0\/2 with no skip, navigation, early end, or harness cut/);
+      expect(result.violations.some(({ message }) => message.includes("what-is-a-plc left"))).toBe(false);
+      expect(attributionOf(packet, "what-is-a-plc")).toEqual([eventId(packet, "skip", "what-is-a-plc")]);
+    });
+
+    it("attributes forward navigation to the departed concept and the concepts it jumped over", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]);
+      trace.navigate("plc-io-modules");
+      trace.deliver("plc-io-modules", [0]).deliver("plc-io-modules", [1]).snap("final");
+      const packet = trace.build("lesson-completed");
+      const navigation = eventId(packet, "navigate", "plc-io-modules");
+      expect(attributionOf(packet, "what-is-a-plc")).toEqual([navigation]);
+      expect(attributionOf(packet, "plc-scan-cycle")).toEqual([navigation]);
+      expect(checkH5(packet).status).toBe("pass");
+    });
+
+    it("uses the concept current when the tool call arrived, as the runtime assigns before deciding", () => {
+      // Runtime order: provider tool-call frame, the target's assignment, then
+      // tool.decision. The navigation departs what-is-a-plc, not its own target.
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]);
+      trace.frame({ toolCall: { functionCalls: [{ id: "n1", name: "lesson_state", args: { action: "navigate", conceptId: "plc-scan-cycle" } }] } });
+      trace.coverage["what-is-a-plc"] = "partial";
+      trace.assign("plc-scan-cycle", [0]);
+      trace.decision("lesson_state", "navigate", "plc-scan-cycle", "transition-applied");
+      trace.snap("after navigation");
+      const packet = trace.build();
+      expect(checkH5(packet).status).toBe("pass");
+      expect(attributionOf(packet, "what-is-a-plc")).toEqual([eventId(packet, "navigate", "plc-scan-cycle"), "harness:open"]);
+    });
+
+    it("does not let navigating back explain a later Core concept that was never reached", () => {
+      const trace = new SyntheticTrace();
+      trace.deliver("what-is-a-plc", [0]).deliver("what-is-a-plc", [1]);
+      trace.deliver("plc-scan-cycle", [0]);
+      trace.navigate("what-is-a-plc");
+      const packet = trace.build("lesson-completed");
+      expect(attributionOf(packet, "plc-scan-cycle")).toEqual([eventId(packet, "navigate", "what-is-a-plc")]);
+      expectFail(checkH5(packet), /core concept plc-io-modules left at 0\/2/);
+    });
+
+    it("fails when a concept becomes skipped after an unrelated skip", () => {
+      const trace = new SyntheticTrace();
+      trace.skip("plc-history");
+      trace.snap("wrong concept skipped", { coverage: { ...trace.coverage, "plc-scan-cycle": "skipped" } });
+      expectFail(checkH5(trace.build()), /plc-scan-cycle became skipped without an applied skip\/navigation or session end/);
+    });
+
+    it("keeps an evidenced early end and an abort as global attribution", () => {
+      const ended = new SyntheticTrace();
+      ended.deliver("what-is-a-plc", [0]);
+      ended.stopRequested().complete("stopped", false);
+      const endedPacket = ended.build("lesson-completed");
+      expect(checkH5(endedPacket).status).toBe("pass");
+      const stop = endedPacket.events.find(({ name }) => name === "harness.stop-requested")!.id;
+      expect(attributionOf(endedPacket, "plc-io-modules")).toEqual([stop]);
+
+      const aborted = new SyntheticTrace();
+      aborted.deliver("what-is-a-plc", [0]);
+      const abortedPacket = aborted.build("aborted", { category: "infrastructure", message: "browser crashed" });
+      expect(checkH5(abortedPacket).status).toBe("pass");
+      expect(attributionOf(abortedPacket, "plc-io-modules")).toEqual(["harness:aborted"]);
+    });
+  });
 });
 
 describe("H6 clarification and off-path coverage isolation", () => {

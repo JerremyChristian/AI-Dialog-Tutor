@@ -430,16 +430,59 @@ const attributedCompletions = (packet: EvidencePacket) => packet.events
 
 // ---- H5: Core Path integrity ----
 
+/**
+ * Applied skip/navigation with the concepts each one actually affected, per
+ * lib/lesson-state.ts: skip X affects only X; navigate T leaves the departed
+ * current concept partial and skips concepts strictly between it and T going
+ * forward. The current concept is tracked through assignments and transitions.
+ */
+export function transitionEffects(packet: EvidencePacket) {
+  const order = packet.contract.concepts.map(({ id }) => id);
+  let current = packet.contract.initial.currentNodeId;
+  // The runtime emits a call's assignment before its tool.decision, so the
+  // concept a call departs from is the one current when its handling began:
+  // at the provider tool-call frame, then after each earlier decision in it.
+  let handlingBase: string | null | undefined;
+  const effects: Array<{ event: EvidenceEvent; affected: Set<string> }> = [];
+  for (const event of packet.events) {
+    if (event.name === "provider.tool-call") handlingBase = current;
+    if (app(event, "lesson.generation-started")) current = str(event, "conceptId") ?? current;
+    if (!app(event, "tool.decision")) continue;
+    const base = handlingBase === undefined ? current : handlingBase;
+    if (isAppliedTransition(event)) {
+      const target = str(event, "conceptId");
+      const affected = new Set<string>();
+      if (event.detail?.action === "skip") {
+        if (target) affected.add(target);
+        if (target && target === base && current === base) current = null;
+      } else if (event.detail?.action === "navigate" && target) {
+        if (base && base !== target) {
+          affected.add(base);
+          const from = order.indexOf(base);
+          const to = order.indexOf(target);
+          if (from >= 0 && to > from) order.slice(from + 1, to).forEach((id) => affected.add(id));
+        }
+        current = target;
+      }
+      effects.push({ event, affected });
+    }
+    if (handlingBase !== undefined) handlingBase = current;
+  }
+  return effects;
+}
+
 export function corePathSummary(packet: EvidencePacket): CorePathSummary {
   const replay = cursorReplay(packet);
-  const transitions = packet.events.filter(isAppliedTransition);
+  const transitions = transitionEffects(packet);
   const earlyEnds = attributedCompletions(packet)
     .filter(({ completion }) => completion.detail?.planComplete !== true);
   const core = packet.contract.concepts.filter(({ importance }) => importance === "core");
   const incomplete = core.filter(({ id, teachingPoints }) => (replay.final[id] ?? 0) < teachingPoints.length)
     .map(({ id, teachingPoints }) => {
       const attributedTo: string[] = [];
-      if (transitions.length) attributedTo.push(...transitions.map(({ id: eventId }) => eventId));
+      // Local: only transitions that affected this concept. Global: an
+      // evidenced early end, or a capture that did not end with the lesson.
+      attributedTo.push(...transitions.filter(({ affected }) => affected.has(id)).map(({ event }) => event.id));
       attributedTo.push(...earlyEnds.map(({ cause }) => cause.id));
       if (packet.harness.endedBy !== "lesson-completed") attributedTo.push(`harness:${packet.harness.endedBy}`);
       return { conceptId: id, cursor: replay.final[id] ?? 0, required: teachingPoints.length, attributedTo };
@@ -479,6 +522,7 @@ export function checkH5(packet: EvidencePacket): HardAssertionResult {
     }
   }
   const seenStatus = new Map(Object.entries(initial.coverage));
+  const transitions = transitionEffects(packet);
   for (const snapshot of packet.snapshots) {
     for (const [conceptId, status] of Object.entries(snapshot.canonical.coverage)) {
       if (!conceptById(packet, conceptId)) continue;
@@ -492,7 +536,7 @@ export function checkH5(packet: EvidencePacket): HardAssertionResult {
       if ((status === "skipped" || status === "partial") && seenStatus.get(conceptId) !== status) {
         // Skip/navigation produce skipped/partial; ending a session pauses the
         // current concept as partial. Nothing else may.
-        const attributed = packet.events.some((event) => event.seq <= snapshot.afterSeq && isAppliedTransition(event)) ||
+        const attributed = transitions.some(({ event, affected }) => event.seq <= snapshot.afterSeq && affected.has(conceptId)) ||
           (status === "partial" && attributedCompletions(packet)
             .some(({ completion }) => completion.seq <= snapshot.afterSeq));
         if (!attributed) {
