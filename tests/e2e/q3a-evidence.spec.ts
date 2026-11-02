@@ -211,6 +211,28 @@ test.describe("Q3-A live capture boundary", () => {
     await expect(startEvidence(page, "q3a-late-persisted")).rejects.toThrow(lateCapture);
   });
 
+  test("refuses when persisted coverage moved but the live runtime still matches the seed", async ({ page }) => {
+    await installFakeLive(page, { lessonFixture: PLC_Q3_FIXTURE });
+    await openLessonAndStart(page);
+    const saved = await readSavedLesson<Saved>(page);
+    expect(saved).toBeDefined();
+    saved!.lessonState.nodes["plc-history"].status = "skipped";
+    await page.evaluate((lesson) => new Promise<void>((resolve, reject) => {
+      const open = indexedDB.open("ai-dialog-tutor", 2);
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const db = open.result;
+        const put = db.transaction("savedLessons", "readwrite").objectStore("savedLessons").put(lesson);
+        put.onerror = () => { db.close(); reject(put.error); };
+        put.onsuccess = () => { db.close(); resolve(); };
+      };
+    }), saved);
+    expect((await readTestState(page)).snapshot.coverage).toMatchObject({ "plc-history": "not-started" });
+    expect((await readSavedLesson<Saved>(page))!.lessonState.nodes["plc-history"].status).toBe("skipped");
+
+    await expect(startEvidence(page, "q3a-persisted-coverage-ahead")).rejects.toThrow(lateCapture);
+  });
+
   test("starts during transient noncanonical activity with unchanged canonical progress", async ({ page }) => {
     await installFakeLive(page, { lessonFixture: PLC_Q3_FIXTURE });
     await openLessonAndStart(page);
