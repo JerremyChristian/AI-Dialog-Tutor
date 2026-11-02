@@ -491,6 +491,14 @@ describe("H5 Core Path integrity", () => {
     trace.complete("confirmed", true);
     expectFail(checkH5(trace.build("lesson-completed")), /core concept plc-scan-cycle left at 0\/3/);
   });
+
+  it("does not let an optional-concept skip explain an unrelated missing Core concept", () => {
+    const trace = new SyntheticTrace();
+    trace.deliver("what-is-a-plc", [0]).deliver("what-is-a-plc", [1]);
+    trace.skip("plc-history");
+
+    expectFail(checkH5(trace.build("lesson-completed")), /core concept plc-scan-cycle left at 0\/3/);
+  });
 });
 
 describe("H6 clarification and off-path coverage isolation", () => {
