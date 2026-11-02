@@ -7,7 +7,7 @@ import { evaluateHardAssertions, type HardEvaluation } from "../q3/assertions/ha
 import { measurePerformance } from "../q3/assertions/performance";
 import { buildEvidencePacket } from "../q3/evidence/build";
 import type { EvidenceHarness, EvidencePacket, RawHarnessEvent, RawSnapshot } from "../q3/evidence/types";
-import { liveCaptureDivergence } from "../q3/evidence/capture-boundary";
+import { liveCaptureDivergence, persistedCaptureDivergence } from "../q3/evidence/capture-boundary";
 import { getLiveReceived, readSavedLesson, readTestState, type SeededLessonRecord } from "./fake-live";
 
 type TestState = Awaited<ReturnType<typeof readTestState>>;
@@ -37,13 +37,11 @@ export async function startEvidence(page: Page, scenarioId: string) {
   if (lateBecause) {
     throw new Error(`Evidence must start before canonical progress diverges from the seeded lesson (${lateBecause})`);
   }
-  // Second line of defence: persistence is debounced, so it can only lag the
-  // live check above, but a persisted divergence is still disqualifying.
-  type Progress = { lessonState?: { teachingContractProgress?: Record<string, { nextTeachingPointIndex?: number }> } };
-  const cursors = (lesson: Progress | undefined) => JSON.stringify(Object.entries(lesson?.lessonState?.teachingContractProgress ?? {})
-    .map(([id, progress]) => [id, progress?.nextTeachingPointIndex ?? 0]).sort());
-  if (cursors(await readSavedLesson<Progress>(page)) !== cursors(seededAtStart.lesson as Progress)) {
-    throw new Error("Evidence must start before canonical progress diverges from the seeded lesson (persisted cursors moved)");
+  // Persisted canonical state (current concept, coverage, cursors) must match
+  // the seed too: it may hold progress the live runtime never showed.
+  const persistedBecause = persistedCaptureDivergence(seededAtStart.lesson, await readSavedLesson(page));
+  if (persistedBecause) {
+    throw new Error(`Evidence must start before canonical progress diverges from the seeded lesson (${persistedBecause})`);
   }
 
   // One lifecycle: capturing -> finalized. finalize claims the transition
